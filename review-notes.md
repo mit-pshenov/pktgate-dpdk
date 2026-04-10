@@ -1266,4 +1266,94 @@ All applied in-place to design.v2.md:
   decomposition, CMake skeleton bootstrap, gtest harness
   bootstrap, initial parser/validator scaffolding.
 
-*Last updated: 2026-04-10 (touch-up pass complete, D21–D25 resolved)*
+## External review pass (2026-04-10)
+
+Six points + one bonus question received from an external reviewer
+of design.md (post-promotion). Triage:
+
+- **5 points + bonus: based on incomplete reading of design.md.**
+  The proposed fixes are already in the design as written:
+  - "per-rule counter cache-line bouncing" → §4.3:454-513,
+    `PerLcoreCounters` is per-lcore, zero atomics, ruleset author
+    quoted verbatim what the reviewer recommends as the only fix.
+  - "VLAN should be a direct array" → §5.2:821, `l2_vlan_lut[vlan]`,
+    direct LUT on 4096 entries.
+  - "MAC should be packed in u64" → §5.2:804, `mac_to_u64()`.
+  - "EtherType should not be hashed" → reviewer misread the
+    compound primary + filter_mask pattern (D15); EtherType is a
+    secondary equality filter inside the L2 compound entry, not
+    a hash key.
+  - "no NUMA in design" → §3, §4 (Ruleset NUMA-local), §6 init,
+    §7:1404-1406, §8.2 (per-socket mempools), §8.3 (per-lcore
+    structs all NUMA-local), §13 reserved `numa.h` header.
+  - "dry-run reload to avoid hugepage exhaustion" → conflicts
+    with M1 (5.6 GB is dev VM, production target is 2-4 GiB
+    headroom in §8.1), and validate-before-swap is already the
+    §9.2 RCU reload contract.
+  - "pipeline flattening / dynfield metadata" → mbuf dynfield
+    pipeline is already in §5.2-§5.3 (D13). Flattening would
+    change first-match-wins semantics required by F1 in input.md.
+  - bonus "IPv4 fragments should be checked early" → §5.3:866-888,
+    fragment policy is the first check after the IP header is
+    touched, well before FIB lookup. D17 / P9 already resolved.
+
+- **1 point (mirror + payload-mutating actions): legitimate.** The
+  reviewer correctly identified that an existing latent invariant
+  was not documented. Resolved as **D26**.
+
+### D26 — Mirror refcnt-zero-copy compile-time gate
+
+**Decision.** When the active Ruleset contains any rule with a
+payload-mutating verb, the compiler MUST select the deep-copy
+mirror strategy (`rte_pktmbuf_copy`) — the refcnt zero-copy path
+(`rte_mbuf_refcnt_update`) is unsafe in that case. Today the only
+mutating verb is TAG (DSCP / PCP rewrite). The gate is a
+whole-ruleset property in `ruleset_builder`, evaluated once per
+build, no per-packet branching.
+
+**Why it matters.** Refcnt-mirror creates a clone that shares the
+mbuf data buffer with the original. Anything that modifies the
+shared bytes between clone creation and DMA completion will
+corrupt one or both copies. Three sources of mutation must be
+considered:
+
+1. **Action verbs.** The current dispatch (§5.5) is verb-exclusive
+   per packet — a packet hit by MIRROR is never hit by TAG in the
+   same dispatch — but a single Ruleset can carry both rules. The
+   strategy choice is per-ruleset, not per-packet, because refcnt
+   sharing extends past dispatch into TX/driver paths.
+2. **TX prepare.** Drivers may rewrite headers in place (software
+   VLAN insert, software cksum). Refcnt-mirror requires a
+   per-driver capability flag `tx_non_mutating` set in the driver
+   capability table; if absent, deep-copy is forced.
+3. **Future mutating verbs.** Adding NAT, header rewrite, or any
+   other byte-level rewrite verb expands `MUTATING_VERBS`. The
+   D26 gate must be updated in lockstep — enforced by
+   `-Wswitch-enum` coverage of the verb enum (§13) plus a unit
+   test that scans the verb enum and asserts every value is
+   classified mutating / non-mutating.
+
+**Compiler gate (in `ruleset_builder`):**
+
+```
+use_refcnt_mirror :=
+      config_requests_zero_copy
+    ∧ ∀ rule ∈ ruleset : rule.verb ∉ MUTATING_VERBS
+    ∧ driver_caps[mirror_port].tx_non_mutating
+else strategy := deep_copy
+```
+
+`MUTATING_VERBS = { TAG }` for D26 baseline.
+
+**Coverage in design.md:**
+- §5.5 MIRROR case — full gate documented in the case comment
+- §15 risk register row #6 — explicit invariant + mitigation
+- D7 (mirror Phase 2 schedule) is unchanged; D26 governs HOW
+  mirror ships in Phase 2, not whether
+
+**Failure mode covered.** A live ruleset with refcnt-mirror is
+hot-reloaded with a new ruleset that adds the first TAG rule:
+the compiler selects deep_copy for the new ruleset, RCU swap is
+atomic per §9.2, no in-flight packet sees a mixed state.
+
+*Last updated: 2026-04-10 (D26 added from external review pass)*

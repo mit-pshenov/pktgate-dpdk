@@ -1142,12 +1142,50 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
     }
 
     case MIRROR: {
-        // Architecture: two valid strategies.
-        //   (a) Deep copy via rte_pktmbuf_copy — universally safe.
+        // Architecture: two valid clone strategies, picked at COMPILE
+        // time per Ruleset. The hot path does NOT branch on strategy
+        // — mirror_clone is set once when the Ruleset is built.
+        //
+        //   (a) Deep copy via rte_pktmbuf_copy — universally safe;
+        //       allocates a fresh mbuf, copies headers + payload.
         //   (b) Refcount zero-copy via rte_mbuf_refcnt_update — faster,
-        //       requires driver tolerance for shared mbufs.
-        // The staging buffer drain logic is identical for both.
-        rte_mbuf* clone = mirror_clone(m);  // strategy at ruleset build time
+        //       but introduces a shared-buffer invariant: nothing
+        //       between clone creation and DMA completion may mutate
+        //       the mbuf data. See D26.
+        //
+        // D26 — Refcnt-mirror compile-time gate (in ruleset_builder):
+        //
+        //   use_refcnt_mirror :=
+        //         config_requests_zero_copy
+        //       ∧ ∀ rule ∈ ruleset : rule.verb ∉ MUTATING_VERBS
+        //       ∧ driver_caps[mirror_port].tx_non_mutating
+        //   else strategy := deep_copy
+        //
+        //   MUTATING_VERBS = { TAG }
+        //     // TAG rewrites DSCP (IPv4 ToS / IPv6 TC byte) and PCP
+        //     // (VLAN TCI byte) in place. Any new mutating verb (NAT,
+        //     // header rewrite, ...) MUST be added to MUTATING_VERBS
+        //     // or the gate will silently allow refcnt-mirror to
+        //     // corrupt mirror destinations. Enforced by a unit test
+        //     // that scans the verb enum and asserts every value is
+        //     // classified mutating / non-mutating, paired with the
+        //     // -Wswitch-enum coverage already in §13.
+        //
+        // Why per-ruleset (not per-packet): the verb-exclusivity
+        // argument — "a packet hit by MIRROR is never hit by TAG in
+        // the same dispatch" — is true for action match but does NOT
+        // cover the future of the original mbuf. After clone, the
+        // original goes through TX prepare, driver path, and possibly
+        // HW-offload writeback; every byte the original ever sees is
+        // also visible to the clone via the shared buffer. The gate
+        // is therefore a conservative whole-ruleset property: easier
+        // to reason about, easier to test, no per-packet cost.
+        //
+        // Phase plan interaction: D7 says mirror does not ship in
+        // Phase 1 (compiler rejects verb=mirror at publish time).
+        // D26 governs HOW mirror ships when Phase 2 enables it, not
+        // whether.
+        rte_mbuf* clone = mirror_clone(m);  // strategy fixed at build
         if (likely(clone))
             stage_mirror(ctx, a->mirror_port, clone);
         stage_tx(ctx, ctx->port_b, m);
@@ -2111,6 +2149,7 @@ CMake does not hardcode a compiler.
 | 3 | Hot reload of large IPv6 ruleset exceeds 100 ms | medium | medium | `rte_fib6` build dominates. Parallelize prefix insertion inside `ruleset_build`; if still slow, raise SLO to 250 ms. |
 | 4 | Lab hardware (E810/XL710) availability gates release | high | high | Reserve TRex windows at Phase 1 start. Cross-test on `pktgen-dpdk` from a second host. |
 | 5 | Cycle-budget tightness on realistic workloads (see §5.6) reduces headroom below what feels comfortable when adding new features | medium | medium | Any new per-packet work must come with a cycle estimate; hot-path reviews are required on changes to §5. |
+| 6 | Refcnt-mirror is enabled while the active ruleset contains a payload-mutating verb (TAG today; future NAT / header rewrite) — mirror destination receives bytes corrupted by the mutation | low | high | **D26**: compile-time gate in `ruleset_builder` selects `deep_copy` whenever any rule's verb ∈ `MUTATING_VERBS` or the destination driver lacks `tx_non_mutating`. Whole-ruleset property, evaluated once per Ruleset build, hot path is non-branching. Adding a new mutating verb requires updating `MUTATING_VERBS` — enforced by `-Wswitch-enum` coverage (§13) plus a unit test that scans the verb enum. See §5.5 MIRROR case for the full gate. |
 
 > Risk "mirror cycle budget" from design.md v1 is **not** a current
 > risk; mirror does not ship in Phase 1. It is encoded in §14.2 as
