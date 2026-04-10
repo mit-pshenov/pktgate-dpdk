@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.o
+*.a
+*.so
+*.so.*
+*.d
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake-build-*/
+compile_commands.json
+
+# Editors / IDE
+.vscode/
+.idea/
+.cache/
+*.swp
+*.swo
+*~
+.clangd/
+.ccls-cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local notes / scratch
+scratch/
+TODO.local.md
+*.local.md
