@@ -133,14 +133,15 @@ are reused.
 {
   "version": 1,                              // integer, strict match against binary
   "interface_roles": {                       // logical role → port selector (sum type)
-    "upstream_port":   { "pci":  "0000:03:00.0" },
-    "downstream_port": { "pci":  "0000:03:00.1" },
-    "mirror_port":     { "pci":  "0000:04:00.0" },
-    // Alternative selectors, supported by the same role table:
-    //   { "vdev": "net_pcap0,iface=eth1" }   // dev VM, net_pcap / net_null
-    //   { "name": "0000:03:00.0" }           // DPDK port name as reported by EAL
-    "_example_vdev":   { "vdev": "net_pcap0,iface=lo" },
-    "_example_name":   { "name": "net_tap0" }
+    // Each value is exactly one of: { "pci": <bdf> } | { "vdev": <arg> } |
+    // { "name": <eal-port-name> }. Mixing keys within a single role is
+    // rejected by the validator (§3a.2). Example below deliberately uses
+    // all three selector shapes so that dev VM (net_pcap / net_null) and
+    // production NICs share the same schema path:
+    "upstream_port":   { "pci":  "0000:03:00.0" },       // production NIC
+    "downstream_port": { "pci":  "0000:03:00.1" },       // production NIC
+    "mirror_port":     { "vdev": "net_pcap0,tx_iface=lo" },// dev-friendly sink
+    "tap_probe_port":  { "name": "net_tap0" }            // EAL-registered name
   },
   "sizing": {                                // optional; may also be a separate file
     "rules_per_layer_max": 4096,
@@ -229,11 +230,19 @@ are reused.
   startup. No compile-time ceilings — only a hard compile-time
   **minimum** of 16 per layer to keep tests meaningful.
 - **`fragment_policy`** is a top-level field. `"l3_only"` is the
-  default: non-first IPv4 fragments and IPv6 fragment-header packets
-  are L4-unclassifiable, L3 rules still run, `default_behavior`
-  applies on L3 miss. `"drop"` is terminal drop on any fragment.
-  `"allow"` is pass-through (unsafe, debug only). See §5.3 for
-  exact semantics and D17 rationale.
+  default: under it, **first** fragments (IPv4 with `frag_offset==0
+  && MF==1`, IPv6 with a Fragment ext header carrying
+  `frag_offset==0`) carry the inner L4 header in the same packet
+  and run the **full** L4 stage; **non-first** fragments are
+  L4-unclassifiable, so only the L3 rules run and `default_behavior`
+  applies on L3 miss (D27). Operators writing L4 rules should be
+  aware that under `l3_only` an L4 match against a fragmented flow
+  will only ever fire on the first fragment of each datagram —
+  observe the `l4_skipped_ipv6_fragment_nonfirst` and
+  `frag_nonfirst_l3_only` (§10.3) counters to confirm. Strict
+  symmetric handling requires `fragment_policy="drop"`. `"drop"` is
+  terminal drop on any fragment. `"allow"` is pass-through (unsafe,
+  debug only). See §5.3 for exact semantics and D17 rationale.
 - **Per-rule `id`** is operator-assigned and stable. It keys per-rule
   counters and the rate-limit arena across reloads. Operators who
   want a clean rate-limit bucket for a semantically changed rule
@@ -270,7 +279,15 @@ freed only after RCU quiescence. **All capacity arrays below are
 sized at init time from the sizing config — no fixed constants.**
 
 ```cpp
-struct alignas(64) RuleAction {
+// Read-only arena element. alignas(4) — matches the widest member
+// (uint32_t rule_id). NOT cache-line-aligned: actions are read-only
+// after publication, so multiple actions sharing a cache line only
+// cause shared-read traffic, never coherence bouncing. Keeping the
+// struct dense (sizeof = 20) keeps the arena small and improves
+// prefetch coverage. Index scaling by 20 is IMUL on x86-64 (single
+// cycle in practice) — acceptable trade vs. the 3x memory cost of
+// a shift-indexed 64-byte layout.
+struct alignas(4) RuleAction {
     uint32_t  rule_id;       // stable operator-assigned id; keys counters + rl_arena
     uint16_t  counter_slot;  // dense per-layer slot ∈ [0, rules_per_layer_max), §4.3
     uint8_t   verb;          // ALLOW | DROP | MIRROR | RL | TAG | REDIRECT
@@ -282,7 +299,8 @@ struct alignas(64) RuleAction {
     uint8_t   dscp;          // 6-bit DSCP target (for TAG)
     uint8_t   pcp;           // 3-bit PCP (for TAG)
     uint16_t  rl_index;      // index into rs->rl_actions[] (ruleset-scoped handle)
-}; // 20 bytes; action arenas are slot-indexed and packed
+};
+static_assert(sizeof(RuleAction) == 20, "RuleAction layout drift");
 
 struct L2CompoundEntry {           // value of L2 primary hash
     uint8_t  filter_mask;          // bits: ETHERTYPE|VLAN|PCP|DST_MAC|SRC_MAC
@@ -298,16 +316,23 @@ struct L2CompoundEntry {           // value of L2 primary hash
 // L4 compound entries mirror L2's pattern (D15): primary hash on the
 // most-selective exact key, secondary filter_mask over the remaining
 // L4 constraints.
+//
+// D29 — ICMP unification: §5.4 packs ICMP type into the dport slot
+// and ICMP code into the sport slot of the compound key shape. Rules
+// that match on ICMP code therefore reuse `want_src_port` for the
+// expected code — no separate ICMP field exists in this struct. The
+// `SRC_PORT` filter_mask bit means "verify the sport slot", whether
+// the underlying L4 protocol is TCP/UDP (real source port) or ICMP
+// (packed code value).
 struct L4CompoundEntry {
-    uint8_t  filter_mask;          // bits: SRC_PORT|TCP_FLAGS|ICMP_TYPE|VRF
+    uint8_t  filter_mask;          // bits: SRC_PORT|TCP_FLAGS|VRF
     uint8_t  tcp_flags_want;
     uint8_t  tcp_flags_mask;
     uint8_t  _pad;
-    uint16_t want_src_port;        // host order
-    uint16_t want_icmp_code;
+    uint16_t want_src_port;        // host order; ICMP: reused as code slot
     uint16_t action_idx;
-    uint16_t _pad2;
-};
+    uint16_t _pad2;                // keeps sizeof a multiple of 4
+}; // 12 bytes
 
 struct alignas(64) Ruleset {
     // ---- L2 ----
@@ -417,6 +442,30 @@ trivial. Defined in `include/pktgate/limits.h`.
 burst size — typically 32, configurable per port at startup but
 constant at compile time once chosen.
 
+**D28 — Port TX-queue symmetry invariant.** Each worker uses its
+own `ctx->qid` on *every* port it may send to — the primary egress
+`port_b` and, for D16 staging, every `redirect_port` and
+`mirror_port` referenced by any rule in the ruleset. There is no
+per-destination queue-selection logic in the hot path (the
+`redirect_drain` / `mirror_drain` loops in §5.5 call
+`rte_eth_tx_burst(p, ctx->qid, …)` with the worker's own `qid`).
+
+Therefore **every DPDK port registered by `eal_init` — regardless
+of role — MUST be configured with at least `n_workers` TX queues**,
+and queues `[0, n_workers)` must be owned one-per-worker. The
+control thread enforces this at startup: the init sequence (§6.1)
+rejects any `interface_roles` entry whose port cannot accept that
+queue count, and hot reload refuses to install a rule with a
+`redirect_port` / `mirror_port` whose target port does not satisfy
+the invariant.
+
+RX-queue count on the mirror / redirect destinations is
+unconstrained — we never receive from them. This is a TX-only
+symmetry requirement. The invariant is cheap (mirror / redirect
+ports are low-volume; allocating n extra TX queues costs a few KiB
+of descriptors per port), deterministic (no per-packet qid
+selection or locking), and test-covered via the startup validator.
+
 ```cpp
 struct alignas(64) WorkerCtx {
     // RX/TX
@@ -491,12 +540,29 @@ for any rule whose operator-assigned `rule_id` survives — slot
 reuse / GC mechanics for removed rules track the rate-limit arena
 (§9.4).
 
+**Counter zeroing on slot reuse**. When a rule_id disappears from
+the ruleset, the §9.4 GC pass (after `rcu_synchronize`) walks the
+removed rules and, for each, zeroes the `RuleCounter` row on
+*every* lcore at index `layer_base(L) + counter_slot`. This is safe
+because after synchronize no worker holds a reference to the old
+ruleset, so the removed slot is guaranteed unreachable on the hot
+path. A subsequent publish that reclaims the slot for a new rule
+therefore starts with clean per-lcore rows — no counter values
+leak between unrelated rules. The zeroing is cheap (~64 B × lcores
+per removed rule); step 5b of the §9.4 GC sequence.
+
 Additional per-lcore counters (`LcoreStats`):
 
 - `cycles_per_burst_{sum,count}` (histogram feed)
 - `packets_processed`
 - `rx_queue_depth_samples`
 - `l4_skipped_ipv6_extheader` (D20 / P8)
+- `l4_skipped_ipv6_fragment_nonfirst` — D27, IPv6 fragment header
+  with non-zero fragment offset; subsequent fragments cannot carry
+  L4 headers, so the L4 stage is skipped. Distinct from
+  `l4_skipped_ipv6_extheader` because the IPv6 first fragment with
+  `frag_offset == 0` is **not** counted here — it walks through to
+  L4 with `dyn->l4_extra = 8` (see §5.3 IPv6 block, §5.4).
 - `redirect_dropped_total`
 - `mirror_dropped_total`
 - `idle_iters_total`
@@ -701,11 +767,14 @@ on a pinned lcore.
 //   uint8_t  l3_offset;           // byte offset from frame start to L3 header (D13)
 //   uint8_t  parsed_l3_proto;     // cached after L3 parse
 //   uint8_t  flags;               // L4_UNCLASSIFIABLE, SKIP_L4, …
+//   uint8_t  l4_extra;             // extra bytes past the fixed L3 header
+//                                  // to the L4 start (D27: 8 for IPv6
+//                                  // first fragments, 0 otherwise)
 //   uint16_t parsed_l4_dport;
 //   uint16_t parsed_l4_sport;
 //   uint16_t parsed_vlan;         // 0xFFFF if untagged
 //   uint16_t parsed_ethertype;    // inner ethertype after any VLAN strip
-// total fits in one 16 B dynfield slot.
+// total = 16 B, fits in one 16 B dynfield slot exactly.
 
 void worker_main(WorkerCtx* ctx) {
     rte_rcu_qsbr_thread_register(ctx->qs, ctx->thread_id);
@@ -927,18 +996,24 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
     // --------- IPv6 ---------
     if (et == RTE_BE16(RTE_ETHER_TYPE_IPV6)) {
         auto* ip6 = (rte_ipv6_hdr*)l3;
-        uint8_t nxt = ip6->proto;
+        uint8_t nxt      = ip6->proto;
+        uint8_t l4_extra = 0;        // D27 — extra bytes past the fixed
+                                     // 40 B L3 header before L4 starts
 
         // The architecture recognizes two variants of IPv6 parsing:
         //   (a) first-protocol-only (shown here) — treat next_header
-        //       as the L4 protocol directly.
-        //   (b) extension-header chain walking up to K hops.
+        //       as the L4 protocol directly, with ONE exception: a
+        //       Fragment extension header (44) is walked by eight
+        //       bytes on the first fragment so that L3_ONLY / ALLOW
+        //       policies still reach the L4 header that IS present.
+        //       See D27.
+        //   (b) full extension-header chain walking up to K hops.
         // §14 selects which variant is enabled per shipping phase.
         //
-        // Extension headers split by next_header value range:
-        //   < 64: hop-by-hop=0, routing=43, fragment=44, ESP=50,
-        //         AH=51, destination-options=60 — packed into a
-        //         64-bit mask for branch-free testing.
+        // Extension header values split by range:
+        //   < 64: hop-by-hop=0, routing=43, ESP=50, AH=51,
+        //         destination-options=60 — packed into a 64-bit
+        //         mask for branch-free testing.
         //   ≥ 64: mobility=135, HIP=139, shim6=140,
         //         experimental=253/254 — listed explicitly. Putting
         //         these in the mask would be UB (`1ull << 135`
@@ -946,30 +1021,66 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
         //         the count mod 64 and silently flip an unrelated
         //         bit). They are rare enough that an OR chain costs
         //         nothing.
+        //
+        // Fragment (44) is deliberately NOT in the mask — D27
+        // handles it as a special case so the first-fragment L4
+        // header is reachable. A non-first fragment still hits
+        // SKIP_L4.
         static const uint64_t EXT_MASK_LT64 =
-            (1ull<<0)|(1ull<<43)|(1ull<<44)|(1ull<<50)|(1ull<<51)|
-            (1ull<<60);
-        bool is_ext    = (nxt < 64 && ((1ull << nxt) & EXT_MASK_LT64)) ||
-                          nxt == 135 || nxt == 139 || nxt == 140 ||
-                          nxt == 253 || nxt == 254;
-        bool is_frag6  = (nxt == 44);
+            (1ull<<0)|(1ull<<43)|(1ull<<50)|(1ull<<51)|(1ull<<60);
+        auto is_ext_proto = [](uint8_t p) {
+            return (p < 64 && ((1ull << p) & EXT_MASK_LT64)) ||
+                    p == 135 || p == 139 || p == 140 ||
+                    p == 253 || p == 254;
+        };
 
-        if (is_ext) {
+        if (unlikely(is_ext_proto(nxt))) {
+            // Any non-fragment extension header → L4 unreachable
+            // under first-protocol-only; L3 still runs.
             dyn->flags |= SKIP_L4;
             ctx_stats_bump_l4_skipped_ipv6_extheader();
-            // fragment policy converges on the same path: L3 still
-            // runs, L4 is skipped, L3-miss falls through to default
-            // via the normal pipeline.
-            if (is_frag6 && rs->fragment_policy == FRAG_DROP) {
-                dyn->verdict_layer = TERMINAL_DROP; return;
+        } else if (unlikely(nxt == 44)) {
+            // D27 — Fragment extension header. Read the 8-byte
+            // fragment header to differentiate first fragment
+            // (offset == 0, carries L4) from subsequent (no L4).
+            auto* fh = rte_pktmbuf_mtod_offset(
+                m, rte_ipv6_fragment_ext*,
+                l3_off + sizeof(rte_ipv6_hdr));
+            uint16_t frag_data   = rte_be_to_cpu_16(fh->frag_data);
+            uint16_t frag_offset = frag_data & 0xFFF8;  // 13-bit × 8
+            bool     is_first    = (frag_offset == 0);
+
+            switch (rs->fragment_policy) {
+            case FRAG_DROP:
+                dyn->verdict_layer = TERMINAL_DROP;
+                return;
+            case FRAG_ALLOW:
+                dyn->verdict_layer = TERMINAL_PASS;
+                return;
+            case FRAG_L3_ONLY:
+                if (is_first) {
+                    // First fragment carries the transport header;
+                    // drill through exactly one step to reach it.
+                    nxt      = fh->next_header;
+                    l4_extra = sizeof(rte_ipv6_fragment_ext);  // 8
+                    // If fh->next_header is itself an extension
+                    // header we do NOT walk further under
+                    // first-protocol-only: set SKIP_L4 instead.
+                    if (unlikely(is_ext_proto(nxt) || nxt == 44)) {
+                        dyn->flags |= SKIP_L4;
+                        ctx_stats_bump_l4_skipped_ipv6_extheader();
+                    }
+                } else {
+                    // Non-first fragment: no L4 header available
+                    // in this datagram fragment. L3 still applies.
+                    dyn->flags |= SKIP_L4;
+                }
+                break;
             }
-            if (is_frag6 && rs->fragment_policy == FRAG_ALLOW) {
-                dyn->verdict_layer = TERMINAL_PASS; return;
-            }
-            // else: FRAG_L3_ONLY or non-fragment ext header → L3 only
         }
 
-        dyn->parsed_l3_proto = nxt;  // first-protocol-only (P8/D20)
+        dyn->parsed_l3_proto = nxt;        // P8/D20 first-proto-only + D27
+        dyn->l4_extra        = l4_extra;    // consumed by §5.4
 
         uint64_t nh = FIB6_DEFAULT_NH;
         rte_fib6_lookup(rs->l3_v6, &ip6->dst_addr, &nh);
@@ -1023,13 +1134,15 @@ static inline void classify_l4(const Ruleset* rs, rte_mbuf* m) {
     uint8_t  proto = dyn->parsed_l3_proto;
     uint8_t  l3off = dyn->l3_offset;
 
-    // D14: L4 header offset uses IHL for IPv4, fixed 40 for IPv6.
+    // D14: L4 header offset uses IHL for IPv4, fixed 40 B for IPv6
+    // plus an optional D27 fragment-header extra (8 B for first IPv6
+    // fragments under FRAG_L3_ONLY, 0 otherwise — §5.3 IPv6 block).
     uint8_t  l4off;
     if (dyn->parsed_ethertype == RTE_BE16(RTE_ETHER_TYPE_IPV4)) {
         auto* ip = rte_pktmbuf_mtod_offset(m, rte_ipv4_hdr*, l3off);
         l4off    = l3off + ((ip->version_ihl & 0x0F) << 2);
-    } else { // IPv6 — fixed-header-only per first-protocol-only model
-        l4off    = l3off + sizeof(rte_ipv6_hdr);
+    } else { // IPv6
+        l4off    = l3off + sizeof(rte_ipv6_hdr) + dyn->l4_extra;
     }
 
     uint16_t sport = 0, dport = 0;
@@ -1198,6 +1311,22 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         //   PCP lives in the 802.1Q VLAN tag TCI; on untagged frames
         //   we DO NOT add a tag — PCP rewrite is a no-op and bumps
         //   a per-lcore counter (tag_pcp_noop_untagged_total).
+        //
+        // Checksum invariants:
+        //   - IPv4 DSCP rewrite changes the ToS byte, which is part
+        //     of the IPv4 header checksum. apply_dscp_pcp() does NOT
+        //     incrementally update the cksum — instead it clears the
+        //     current value, sets PKT_TX_IP_CKSUM in mbuf ol_flags,
+        //     and lets the NIC recompute on TX (HW cksum offload is
+        //     mandatory on all production target NICs: E810, XL710,
+        //     CX5/6). A driver that lacks the capability is caught
+        //     by the startup validator (§6.1) — a TAG rule against
+        //     a port without HW ip-cksum is rejected at publish.
+        //   - IPv6 has no L3 cksum, so TC byte rewrite is free.
+        //   - VLAN TCI rewrite is in the L2 header, which carries no
+        //     L2 checksum — no recompute needed.
+        //   - L4 pseudo-header cksum is unaffected by DSCP/PCP
+        //     rewrites (neither byte is part of the pseudo-header).
         apply_dscp_pcp(m, a->dscp, a->pcp);
         stage_tx(ctx, ctx->port_b, m);
         return;
@@ -1207,6 +1336,19 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         // D1/D10: per-lcore bucket, zero atomics.
         // Dense slot index resolved at compile time (§4.4); no
         // hash lookup on the hot path.
+        //
+        // Rate units: rl.rate_bytes_per_sec is already in bytes per
+        // second (the JSON parser converts `"200Mbps"` → 25 000 000
+        // B/s at schema load time, so `rate_bytes_per_sec = bps / 8`).
+        // Packet length: we charge `m->pkt_len`, which is the L2
+        // frame length including Ethernet and any VLAN tags but NOT
+        // the preamble, SFD, or FCS. This matches how operators
+        // size rate-limits — a "200 Mbps" limit on traffic means
+        // 200 Mbps of on-the-wire bytes, and the 4-byte FCS is the
+        // only constant delta we drop. For typical 1500 B frames
+        // that is ~0.3 % under-counting; acceptable for flood
+        // protection where the customer explicitly prefers
+        // throughput over accuracy (§4.4).
         const auto& rl  = rs->rl_actions[a->rl_index];
         auto*       row = &g_cp.rl_arena->rows[rl.slot];
         auto&       b   = row->per_lcore[rte_lcore_id()];
@@ -1327,10 +1469,15 @@ main()
   ├─ bind interface_roles → DPDK port indices (from role config / CLI)
   ├─ register mbuf dynfield slot (must fit the §5.1 dynfield schema)
   ├─ create mempools (per-NUMA-socket, see §8)
-  ├─ port_init(port_a), port_init(port_b), port_init(mirror_port?)
+  ├─ port_init(port_a), port_init(port_b), port_init(mirror/redirect …)
   │     ├─ rte_eth_dev_configure (RSS on 5-tuple, K rx/tx queues)
+  │     │     D28: K ≥ n_workers on EVERY port registered from
+  │     │     interface_roles, regardless of whether the port is a
+  │     │     primary egress or a mirror / redirect destination.
+  │     │     The startup validator rejects the config if any port
+  │     │     reports `rte_eth_dev_info.max_tx_queues < n_workers`.
   │     ├─ rte_eth_rx_queue_setup × K (mempool from worker's NUMA socket)
-  │     ├─ rte_eth_tx_queue_setup × K
+  │     ├─ rte_eth_tx_queue_setup × K  (D28: per-worker lanes)
   │     └─ rte_eth_dev_start
   ├─ allocate RateLimitArena from sizing.rate_limit_rules_max
   ├─ first parse + validate + compile of config file → Ruleset v0
@@ -1447,9 +1594,13 @@ mempools to the socket attached to the NICs (`rte_eth_dev_socket_id`).
 src/dst port, proto). Symmetric is required so that both directions
 of the same flow land on the same lcore — the architecture relies on
 this for per-flow rate-limit variants (§14) and for consistent
-per-lcore counter locality. On NICs that do not expose Toeplitz
-(e.g. the dev VM's e1000), the dataplane degrades to single-queue
-and the design still applies.
+per-lcore counter locality. The canonical symmetric Toeplitz key is
+the 40-byte repeating `0x6D5A` pattern (Woo & Park 2012 / RSS++
+reference), programmed via `rte_eth_rss_hash_conf_set` at port init;
+it makes the Toeplitz function symmetric under src↔dst swap for the
+standard IPv4/IPv6 5-tuple inputs. On NICs that do not expose
+Toeplitz (e.g. the dev VM's e1000), the dataplane degrades to
+single-queue and the design still applies.
 
 **Per-queue depth**: RX = 1024, TX = 1024 descriptors. RX below 512
 risks drops at burst peaks; above 4096 wastes memory and worst-case
@@ -1664,9 +1815,14 @@ the customer-visible SLO.
   5. free arena slots for `removed` rule ids (clears `slot_live`
      and drops `id_to_slot` entries; row memory stays in place
      for reuse — see §4.4 slot lifecycle),
+  5b. zero per-lcore counter rows for removed rules: for each
+     removed rule, resolve its `(layer, counter_slot)` and
+     memset `counters->by_rule[layer_base(L) + counter_slot]` to
+     zero on every lcore (see §4.3 "Counter zeroing on slot
+     reuse"). Safe after step 3 — no worker holds a reference.
   6. destroy `rs_old`.
 
-  Steps 4–5 run after step 3, before step 6. No second synchronize
+  Steps 4–5b run after step 3, before step 6. No second synchronize
   needed; `rs_new` never references removed ids, so no reader could
   touch them after step 2.
 - **Rule-id reassignment**: the arena keys off `rule_id` verbatim.
@@ -2150,6 +2306,7 @@ CMake does not hardcode a compiler.
 | 4 | Lab hardware (E810/XL710) availability gates release | high | high | Reserve TRex windows at Phase 1 start. Cross-test on `pktgen-dpdk` from a second host. |
 | 5 | Cycle-budget tightness on realistic workloads (see §5.6) reduces headroom below what feels comfortable when adding new features | medium | medium | Any new per-packet work must come with a cycle estimate; hot-path reviews are required on changes to §5. |
 | 6 | Refcnt-mirror is enabled while the active ruleset contains a payload-mutating verb (TAG today; future NAT / header rewrite) — mirror destination receives bytes corrupted by the mutation | low | high | **D26**: compile-time gate in `ruleset_builder` selects `deep_copy` whenever any rule's verb ∈ `MUTATING_VERBS` or the destination driver lacks `tx_non_mutating`. Whole-ruleset property, evaluated once per Ruleset build, hot path is non-branching. Adding a new mutating verb requires updating `MUTATING_VERBS` — enforced by `-Wswitch-enum` coverage (§13) plus a unit test that scans the verb enum. See §5.5 MIRROR case for the full gate. |
+| 7 | `fragment_policy=l3_only` treats first vs subsequent IPv6 fragments asymmetrically — first fragment runs the full L4 chain (port/flag matching against the inner header carried after the Fragment ext), subsequent fragments take the `SKIP_L4` path. A rule author who expects "fragment = no L4" gets surprising behaviour when the first fragment matches an L4 rule. | low | medium | **D27**: documented in §5.3 IPv6 block as the explicit semantics — matches IPv4 behaviour where the first fragment also carries L4 headers and is matchable. The dynfield carries `l4_extra = 8` for IPv6 first fragments so §5.4 advances past the Fragment ext correctly; non-first fragments set `verdict_layer = SKIP_L4`. Operator-facing docs in §3a.1 must call out that L4 rules apply only to first fragments under `l3_only`. The `l4_skipped_ipv6_fragment_nonfirst` counter (§10.3) makes the asymmetry observable. Strict-symmetry deployments should set `fragment_policy=drop`. |
 
 > Risk "mirror cycle budget" from design.md v1 is **not** a current
 > risk; mirror does not ship in Phase 1. It is encoded in §14.2 as

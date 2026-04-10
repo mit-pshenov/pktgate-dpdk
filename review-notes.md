@@ -1356,4 +1356,257 @@ hot-reloaded with a new ruleset that adds the first TAG rule:
 the compiler selects deep_copy for the new ruleset, RCU swap is
 atomic per §9.2, no in-flight packet sees a mixed state.
 
-*Last updated: 2026-04-10 (D26 added from external review pass)*
+## Second external review pass (2026-04-10)
+
+A more thorough external review of design.md (~20 numbered points
+spanning §3a through §15). Triage by category below; the three
+real architectural hits are written up as **D27 / D28 / D29**.
+Doc-level fixes were applied in-place to design.md without
+ceremony. The remainder were misreads — listed here so we don't
+re-litigate them.
+
+### Real architectural hits
+
+- **D27** — IPv6 fragment handling, first vs subsequent
+  fragments. Reviewer caught a real bug: the §5.3 IPv6 block (as
+  promoted from v2) treated *every* IPv6 packet that carried a
+  Fragment header (`nxt == 44`) as `SKIP_L4`, including the
+  **first** fragment with `frag_offset == 0`. That's an
+  IPv4/IPv6 asymmetry — IPv4 first fragments run the full L4
+  stage (the inner L4 header is in the same packet), so IPv6
+  first fragments must too. **Fixed.** See D27 below.
+- **D28** — Dataplane port TX-queue symmetry invariant. Reviewer
+  noticed that mirror and redirect destinations are written by
+  any worker, but the design only required `n_workers` TX queues
+  on the *primary* egress ports. Real risk: a mirror port
+  configured with 1 TX queue causes silent contention or driver
+  errors when worker N>0 calls `rte_eth_tx_burst(mirror, ctx->qid)`.
+  **Fixed.** See D28 below.
+- **D29** — `L4CompoundEntry::want_icmp_code` is dead. The §5.4
+  ICMP packing scheme (D14) reuses the dport slot for ICMP type
+  and the sport slot for ICMP code; a separate `want_icmp_code`
+  field never gets read. **Fixed.** See D29 below.
+
+### Doc-level fixes (applied in-place, no D-number)
+
+- §3a.1 `interface_roles` example showed only `pci`-form
+  selectors — extended to demonstrate all three variants
+  (`pci` / `vdev` / `name`) so the schema doc matches §3a.2's
+  validation rule.
+- §4.1 `RuleAction` carried `alignas(64)` which forced
+  `sizeof == 64` and conflicted with the inline "20 bytes" comment
+  and the §4.3 sizing table. The 64-byte alignment was a
+  mis-applied "cache isolation" reflex — RuleAction is **read-only
+  after publication**, so multiple actions sharing a cache line
+  cause shared-read traffic only, never coherence bouncing.
+  Replaced with `alignas(4)` + rationale comment + `static_assert
+  (sizeof(RuleAction) == 20)` so future drift is caught at
+  compile time.
+- §5.5 TAG case: documented checksum invariants — IPv4 DSCP
+  rewrite clears `m->ol_flags` cksum bits and sets
+  `PKT_TX_IP_CKSUM` for HW recompute; startup validator rejects
+  TAG rules against ports without HW ip-cksum capability; IPv6
+  has no header cksum so no action needed; VLAN PCP rewrite is
+  pure TCI, no L2 cksum; L4 pseudo-header is unaffected because
+  TAG only touches DSCP/PCP/TC, not addresses or ports.
+- §5.5 RL case: documented rate semantics — JSON parser
+  converts `bps → bytes/sec` once at config parse time, hot path
+  uses `m->pkt_len` (Ethernet frame including VLAN, excluding
+  preamble/SFD/FCS), the resulting ~0.3% under-counting at 1500 B
+  is acknowledged in §4.4 as acceptable.
+- §6.1 init sequence: D28 enforcement called out in `port_init`
+  (`K ≥ n_workers` on every port from `interface_roles`,
+  validator rejects on `max_tx_queues < n_workers`).
+- §7: spelled out the canonical symmetric Toeplitz key (40-byte
+  repeating `0x6D5A`, Woo & Park 2012 / RSS++ reference). The
+  earlier text said "symmetric Toeplitz" without naming the
+  actual key, leaving it ambiguous which of several published
+  variants we mean.
+- §9.4 GC sequence: added step 5b (zero per-lcore counter rows
+  for removed rules) so a slot reused by a new rule starts from
+  zero on every lcore. This was implicit in §4.3 ("Counter
+  zeroing on slot reuse") but missing from the GC checklist.
+- §10.3: added `l4_skipped_ipv6_fragment_nonfirst` counter
+  (D27 observability).
+- §3a.1 `fragment_policy` paragraph: added the operator-facing
+  note about first vs subsequent fragment behaviour under
+  `l3_only` (D27 risk row #7 follow-through).
+- §4.2 paragraph documenting D28 invariant.
+- §4.3 paragraph documenting counter zeroing on slot reuse.
+- §5.1 dynfield schema: added `uint8_t l4_extra` (D27).
+- §15 risk register: added row #7 for the D27 fragment-policy
+  asymmetry.
+
+### Misreads (no action)
+
+- *"`PerLcoreCounters` is contended."* Same misread as the first
+  external review — §4.3 is explicit that the array is per-lcore
+  with no atomics, and the only contention is on the aggregator
+  read path which is already snapshot-based per §10.1. Reviewer
+  did not cite the specific lines they thought were wrong.
+- *"`L2CompoundEntry` layout is wrong."* Reviewer asserted
+  layout drift but did not name the field. The struct in §4.1 is
+  consistent with §5.2's compound L2 lookup; spent ~10 minutes
+  cross-checking, no defect found.
+- *"Quiescent state ordering bug in §9."* Reviewer asserted that
+  the writer publishes the new pointer before all readers have
+  reached a quiescent state. False — §9.2 is the textbook QSBR
+  pattern: writer atomically swaps `g_active`, then calls
+  `rte_rcu_qsbr_synchronize`, which blocks until **every**
+  registered reader thread has reported quiescent at least once
+  *after* the swap. Old ruleset is freed only after synchronize
+  returns. The "bug" is the reviewer's mental model, not ours.
+- *"Token bucket precision formula is wrong."* Reviewer wrote
+  out a derivation that produced different numbers than §4.4.
+  Their derivation conflated `tsc_per_byte` with
+  `bytes_per_tsc`, off by a reciprocal. §4.4 is correct.
+- *"Mirror cycle budget is missing from §5.6."* Mirror does not
+  ship in Phase 1 (§14, D7), so it has no Phase 1 cycle budget.
+  This is M2-correct: §5.6 is the **Phase 1** cycle budget; the
+  Phase 2 mirror budget is a §14.2 phase-exit criterion, where
+  it lives.
+- *"§13 should pin a specific glibc version."* Out of scope for
+  the architecture document and conflicts with M1 (the dev VM
+  glibc is whatever Fedora 43 ships, production glibc is
+  whatever the customer's RHEL/Ubuntu LTS provides). §13 already
+  constrains the relevant axis (compiler version, C++ standard).
+
+### D27 — IPv6 fragment first/non-first differentiation
+
+**Decision.** Under `fragment_policy=l3_only`, IPv6 packets
+carrying a Fragment extension header (`next_header == 44`) are
+classified as follows:
+
+- `frag_offset == 0` (first fragment): the inner L4 header
+  immediately follows the Fragment ext header, so we **walk one
+  step** through the Fragment ext, set `dyn->l4_extra = 8`
+  (`sizeof(rte_ipv6_fragment_ext)`), and let the L4 stage run
+  normally. The L3 verdict still applies first; if the rule says
+  `next_layer = L4`, §5.4 reads the L4 header at
+  `l3off + 40 + dyn->l4_extra`.
+- `frag_offset != 0` (non-first fragment): the packet does not
+  carry the inner L4 header, so we set `verdict_layer = SKIP_L4`,
+  bump `l4_skipped_ipv6_fragment_nonfirst`, and rely on L3 alone.
+- A Fragment ext header followed by another extension header is
+  treated conservatively as `SKIP_L4` (we don't drill through
+  ext-after-fragment chains in Phase 1; if it ever matters, it's
+  a P8 follow-up).
+
+**Why.** IPv4 first fragments already run the full L4 stage —
+the IPv4 first-fragment check in §5.3 only sets `SKIP_L4` for
+**non-first** fragments. The original §5.3 IPv6 block was
+asymmetric because the easiest implementation was "any
+extension header → SKIP_L4", and Fragment (44) was lumped in
+with the rest of `EXT_MASK_LT64`. The asymmetry would have made
+IPv4-vs-IPv6 rule semantics differ in a way that's invisible
+in the schema and surprising in production.
+
+**Mechanism.** §5.3 IPv6 walker now branches on `nxt == 44`
+explicitly, separate from the generic ext-header case. The
+`is_ext_proto` lambda excludes 44 from the loop continuation
+set so the walker only descends into the Fragment ext when it
+intends to. `dyn->l4_extra` is the new dynfield byte added in
+§5.1 (fits in the existing 16 B dynfield slot exactly).
+
+**Failure modes considered.**
+- Non-conformant packet: Fragment ext with `nxt == 44` (nested
+  fragment). Treated as the chain-after-fragment case →
+  `SKIP_L4`. Counter bumped.
+- Truncated packet: pkt_len < `l3off + 40 + 8`. The §5.3 length
+  check before reading the Fragment ext rejects this; pktmbuf
+  is freed, `pkt_truncated` counter bumped.
+- Hot reload changes `fragment_policy` from `l3_only` to
+  `drop`: handled by the standard §9.2 RCU swap, no special
+  fragment-state coordination needed.
+
+**Operator-visible.** §3a.1 documents the "L4 rules apply only
+to first fragments" semantics under `l3_only`. §15 risk row #7
+captures the surprise factor.
+
+**Coverage in design.md (D27):**
+- §3a.1 `fragment_policy` bullet — operator note
+- §4.1 (no change — RuleAction layout untouched)
+- §5.1 dynfield schema — added `uint8_t l4_extra`
+- §5.3 IPv6 walker — major rewrite of the ext-header loop
+- §5.4 — L4 offset uses `l3off + 40 + dyn->l4_extra` for IPv6
+- §10.3 — `l4_skipped_ipv6_fragment_nonfirst` counter
+- §15 — risk row #7
+
+### D28 — Dataplane port TX-queue symmetry invariant
+
+**Decision.** Every DPDK port registered through `interface_roles`
+— upstream, downstream, mirror destination, redirect destination,
+tap probe — MUST be configured at startup with **at least
+`n_workers` TX queues**. Each worker uses its own `ctx->qid` on
+*every* port it transmits to (primary egress, mirror, redirect).
+The startup validator rejects the configuration if any port
+reports `rte_eth_dev_info.max_tx_queues < n_workers`.
+
+**Why.** Workers are run-to-completion lcores, each owning one
+RX queue and one TX queue index across the whole forwarding
+pipeline. The simplest, fastest, lock-free TX path is "worker N
+calls `rte_eth_tx_burst(port, N, …)` on whatever port it
+chooses". If a mirror or redirect destination port is configured
+with fewer TX queues than there are workers, then either:
+
+- Some workers cannot transmit to that port at all (driver
+  returns error, packets silently dropped, observability gap), or
+- Workers must coordinate (lock or atomic) to share queues,
+  blowing the zero-atomic property the rest of the design is
+  built on.
+
+Both outcomes break F1 (lossless forwarding within budget) for
+mirror/redirect destinations. The fix is to make the symmetric
+queue layout an architectural invariant, validated at startup,
+not a discoverable runtime failure.
+
+**Mechanism.** §6.1 init sequence enforces the invariant inside
+`port_init`. §4.2 carries the architectural statement
+("dataplane port TX queue symmetry"). The validator runs once
+at startup and once on every hot reload that touches
+`interface_roles` (currently impossible — `interface_roles` is
+not hot-reloadable per §9.2 — but the check is cheap enough to
+run defensively).
+
+**Failure modes considered.**
+- A driver reports `max_tx_queues == 1` (e1000 on the dev VM).
+  Validator rejects at startup with a clear message; on dev VM
+  the operator runs with `--workers=1` (M1: dev VM degrades
+  gracefully, doesn't reshape architecture).
+- A mirror port is added later via the operator socket. Not
+  supported; `interface_roles` is build-time only.
+- Per-port queue inequality (upstream has 8 TX queues, mirror
+  has 4): validator rejects.
+
+**Coverage in design.md (D28):**
+- §4.2 — invariant paragraph after the WorkerCtx description
+- §6.1 — `port_init` enforcement in the init sequence
+
+### D29 — Drop `L4CompoundEntry::want_icmp_code`
+
+**Decision.** Remove the `want_icmp_code` field from
+`L4CompoundEntry`. ICMP type and code are packed into the
+existing dport/sport slots (set by §5.4 D14 packing scheme):
+ICMP type → dport slot, ICMP code → sport slot. A separate
+`want_icmp_code` field is dead — never read on the hot path,
+never set by the compiler.
+
+**Why.** The L4 compound entry was originally drafted before
+the §5.4 D14 ICMP packing was finalized. After D14, the only
+correct way to match ICMP code is via `want_src_port` (with
+`SRC_PORT` bit in `filter_mask`); the dedicated field is leftover
+clutter. Cleaning it up brings `sizeof(L4CompoundEntry)` from
+14 bytes (with padding) to 12, which marginally improves the
+L4 lookup table density.
+
+**Mechanism.** §4.1 L4 block updated, with a comment block
+explaining the unification scheme so future readers don't
+re-add the field.
+
+**Coverage in design.md (D29):**
+- §4.1 `L4CompoundEntry` struct + comment
+
+---
+
+*Last updated: 2026-04-10 (D27 / D28 / D29 added from second
+external review pass)*

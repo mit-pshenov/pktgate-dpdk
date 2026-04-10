@@ -113,6 +113,15 @@ capability bits, queue count):
 | **D18** | Cycle budget §5.6 min/typ/max вместо только best case | Принят |
 | **D19** | Misc: fib_lookup single vs bulk-1, handle_idle spec, TAG semantics | Принят |
 | **D20** | IPv6 ext-headers MVP scope — pending (см. P8) | Зависит от P8 |
+| **D21** | Fix NEXT_L4 cliff in §5.3 (verdict=NEXT_L4 must not skip L4) | Принят, critical bug fix |
+| **D22** | RuleAction sizing: 20 B + alignas(4), не 64 B | Принят (in-place, см. также 2-й внеш. ревью) |
+| **D23** | NUMA awareness в Ruleset/Workers — explicit | Принят |
+| **D24** | rl_arena slot lifecycle: free slot, не free row | Принят |
+| **D25** | apply_action default arms + -Wswitch-enum | Принят |
+| **D26** | Mirror refcnt-zero-copy compile-time gate (MUTATING_VERBS) | Принят, 1-й внеш. ревью |
+| **D27** | IPv6 fragment first vs non-first differentiation, l4_extra dynfield | Принят, critical bug fix, 2-й внеш. ревью |
+| **D28** | Dataplane port TX-queue symmetry invariant (n_workers на каждом порту) | Принят, 2-й внеш. ревью |
+| **D29** | Drop dead `want_icmp_code` field из L4CompoundEntry | Принят, 2-й внеш. ревью |
 
 ## Pending (требуют решения пользователя)
 
