@@ -304,14 +304,14 @@ static_assert(sizeof(RuleAction) == 20, "RuleAction layout drift");
 
 struct L2CompoundEntry {           // value of L2 primary hash
     uint8_t  filter_mask;          // bits: ETHERTYPE|VLAN|PCP|DST_MAC|SRC_MAC
-    uint8_t  _pad;
+    uint8_t  want_pcp;
     uint16_t want_ethertype;       // network byte order
     uint16_t want_vlan;            // host order
-    uint8_t  want_pcp;
-    uint8_t  _pad2;
     uint8_t  want_mac[6];          // the *other* MAC if both src and dst constrained
     uint16_t action_idx;           // index into l2_actions[]
-}; // 16 bytes
+    uint16_t _tail_pad;            // hold sizeof at 16 B (matches §4.3 table)
+};
+static_assert(sizeof(L2CompoundEntry) == 16, "L2CompoundEntry layout drift");
 
 // L4 compound entries mirror L2's pattern (D15): primary hash on the
 // most-selective exact key, secondary filter_mask over the remaining
@@ -1485,8 +1485,18 @@ main()
   ├─ rte_rcu_qsbr_create(N_workers)
   ├─ atomic_store(&g_cp.g_active, ruleset_v0, RELEASE)
   ├─ if --standby: skip remote_launch of workers; enter park loop
-  │              (keeps RX queues drained via link-down or non-start)
-  │              until activation signal received
+  │              **Park mechanism (decision):** ports are
+  │              `rte_eth_dev_configure`'d but NOT
+  │              `rte_eth_dev_start`'ed — the NIC RX path is
+  │              quiescent, no DMA, no descriptor ring activity,
+  │              no risk of accidentally bridging traffic. On
+  │              activation: workers are remote-launched first,
+  │              then `rte_eth_dev_start` runs for each port,
+  │              then RSS/flow rules are programmed. This gives
+  │              a clean "no traffic in flight" guarantee for
+  │              warm-standby pairs (§14.3 HA). Link-down is
+  │              **not** used — it would still leave the RX
+  │              ring active and is more racy on hot promote.
   ├─ else: rte_eal_remote_launch(worker_main, ctx_i, lcore_i) per worker
   ├─ start telemetry thread (Prometheus + sFlow + log drain + rte_tel)
   ├─ start cmd_socket thread
@@ -1743,6 +1753,13 @@ expected<void> deploy(std::string path) {
     // Prefer bounded check + timeout over unbounded synchronize,
     // so a stuck worker does not hang reload forever. The watchdog
     // is the ultimate backstop for stuck workers (D12).
+    // Note: DPDK 25.11 takes the timeout argument as a TSC delta,
+    // not nanoseconds. The constant `500_ms` here is the literal
+    // pseudocode form; the implementation converts via
+    // `(rte_get_tsc_hz() * 500) / 1000`. The third arg `wait=true`
+    // makes the call block (rather than return 0) until either
+    // every registered reader has reported quiescent at least once
+    // post-publish or the TSC deadline elapses.
     if (rte_rcu_qsbr_check(g_cp.qs, /*timeout=*/500_ms, true) != 1) {
         metric_inc(reload_timeout_total);
         // Leave rs_new published (it is now the active ruleset; it

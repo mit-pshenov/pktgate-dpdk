@@ -1608,5 +1608,73 @@ re-add the field.
 
 ---
 
-*Last updated: 2026-04-10 (D27 / D28 / D29 added from second
-external review pass)*
+## Third external review pass (2026-04-10)
+
+Eleven-point follow-up review, mostly confirmations. The
+reviewer's own framing — *«не шибко важные, но, возможно,
+могут быть полезны»* — matches the triage. Three real edits,
+no new D-numbers.
+
+### Real edits (in-place)
+
+- **L2CompoundEntry field reorder.** Reviewer flagged a
+  potential alignment issue around `action_idx` after
+  `want_mac[6]`. Their UB concern was technically wrong —
+  in the original layout `action_idx` sits at offset 14, which
+  is naturally 2-byte aligned, and the struct's required
+  alignment is only 2 (largest member is `uint16_t`). However
+  the proposed reorder is **cleaner**: it removes the two
+  interior `_pad` bytes and groups the natural-alignment
+  members tightly. Applied to §4.1: filter_mask, want_pcp,
+  want_ethertype, want_vlan, want_mac, action_idx, then a
+  named `_tail_pad` to keep `sizeof == 16` (matches the §4.3
+  sizing table at 16 B × 4096 = 64 KiB). Added a
+  `static_assert(sizeof(L2CompoundEntry) == 16)` so future
+  drift fails at compile time, same as `RuleAction`.
+- **--standby park mechanism made concrete.** §6.1 had said
+  "link-down or non-start" — N3 in the writer notes had
+  already flagged this as ambiguous. Decided: ports are
+  `rte_eth_dev_configure`'d but **not** `rte_eth_dev_start`'ed
+  in standby. RX rings are quiescent, no DMA activity, no
+  risk of accidentally bridging traffic. On activation:
+  workers are remote-launched first, then `rte_eth_dev_start`
+  per port, then RSS / flow rules. Link-down is rejected as
+  the mechanism — it leaves the RX ring active and is more
+  racy on hot promote. §14.3 (HA v3) inherits this guarantee.
+- **rcu_check timeout units note.** §9.2 reload pseudocode
+  passes `timeout=500_ms`; reviewer asked whether DPDK 25.11
+  takes nanoseconds. It actually takes a **TSC delta**, not
+  nanoseconds. Added an inline comment in §9.2 spelling out
+  the conversion `(rte_get_tsc_hz() * 500) / 1000` so the
+  implementer doesn't trip over the units, and clarified that
+  `wait=true` makes the call block until the deadline.
+
+### Confirmations (no action)
+
+- RuleAction `alignas(4)` + `static_assert(sizeof == 20)`
+  is correct, no cache-line concern (read-only after publish).
+- IPv6 first-fragment `l4_extra = 8` and §5.4 offset
+  computation are correct. Chained ext-after-Fragment falls
+  through to `SKIP_L4` per Phase 1 first-protocol-only scope.
+- Rate-limit refill division order (`/ rte_get_tsc_hz() /
+  n_active_lcores`) trades a small precision loss for
+  overflow safety. Acceptable; documented in §4.4.
+- Symmetric Toeplitz key 0x6D5A repeating: target NICs
+  (E810, XL710, ConnectX-5/6) all support it via
+  `rte_eth_dev_rss_hash_conf_set`. No architecture change.
+- L4CompoundEntry trailing `_pad2`: kept (anchors sizeof
+  to a multiple of 4, helps array indexing on some
+  microarchitectures).
+- ICMP code packed into want_src_port: scheme already
+  documented in the §4.1 D29 comment block and §5.4
+  classify_l4 packs sport=icmp[1].
+- SCTP shares port offsets 0/2 with TCP/UDP, so `rte_udp_hdr*`
+  read for src/dst port is safe across all three. Already
+  written this way.
+- net_pcap vdev limits functional tests to a single lcore
+  (no RSS, no multiqueue) — known and accepted, §12 already
+  notes this.
+
+*Last updated: 2026-04-10 (third external review pass:
+L2CompoundEntry reorder, standby park mechanism, rcu_check
+timeout units note)*
