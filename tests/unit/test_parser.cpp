@@ -350,7 +350,24 @@ TEST(ParserU1_7, MixedKeysRejected) {
 // of every test is the single field under exercise, not the 15 lines
 // of boilerplate around it.
 
-std::string make_doc_with_layer4_rule(std::string_view rule_body) {
+// C5 note: U1.24 introduces mandatory `id`. The C4-era helpers embed a
+// single rule per document; to keep C4 tests green after C5 makes `id`
+// required, the helpers auto-inject `"id": 1, ` immediately after the
+// opening brace of the caller-supplied rule body. Tests that need to
+// exercise the `id` contract itself (U1.24) use the `_raw` variants
+// below, which do not inject anything and hand the body to the parser
+// verbatim.
+std::string inject_default_id(std::string_view rule_body) {
+  std::string s{rule_body};
+  const auto open = s.find('{');
+  if (open == std::string::npos) return s;
+  // Inject right after the `{`. The inner whitespace keeps the doc
+  // human-readable when the test fails and dumps the input.
+  s.insert(open + 1, R"( "id": 1, )");
+  return s;
+}
+
+std::string make_doc_with_layer4_rule_raw(std::string_view rule_body) {
   std::string out = R"json({
   "version": 1,
   "interface_roles": {
@@ -369,7 +386,11 @@ std::string make_doc_with_layer4_rule(std::string_view rule_body) {
   return out;
 }
 
-std::string make_doc_with_layer2_rule(std::string_view rule_body) {
+std::string make_doc_with_layer4_rule(std::string_view rule_body) {
+  return make_doc_with_layer4_rule_raw(inject_default_id(rule_body));
+}
+
+std::string make_doc_with_layer2_rule_raw(std::string_view rule_body) {
   std::string out = R"json({
   "version": 1,
   "interface_roles": {
@@ -386,6 +407,10 @@ std::string make_doc_with_layer2_rule(std::string_view rule_body) {
   "default_behavior": "drop"
 })json";
   return out;
+}
+
+std::string make_doc_with_layer2_rule(std::string_view rule_body) {
+  return make_doc_with_layer2_rule_raw(inject_default_id(rule_body));
 }
 
 std::string make_doc_with_fragment_policy(std::string_view fp_json_literal) {
@@ -668,6 +693,391 @@ TEST(ParserU1_20, PortListParsesAsIntArray) {
     const ParseResult result = parse(doc);
     ASSERT_FALSE(is_ok(result)) << "out-of-range list element accepted";
     EXPECT_EQ(err_kind(result), ParseError::kOutOfRange);
+  }
+}
+
+// =========================================================================
+// M1 C5 — rate spec + RuleAction + rule id + TcpFlags
+// =========================================================================
+//
+// U1.21..U1.24 + U1.29 + U1.30. Architectural anchors:
+//
+//   * D1 — rate string ("200Mbps") is converted to bytes/sec **at load
+//     time**. The runtime hot path never re-parses the string or
+//     multiplies. Tests assert the numeric post-conversion value only.
+//
+//   * D15 — rule action is a sum type with exactly-one semantics (like
+//     the interface_roles selector). A rule with zero actions or two+
+//     competing action fields is rejected with kAmbiguousAction.
+//
+//   * D7 — `mirror` action is syntactically accepted by the parser
+//     (the compiler/validator later rejects it until M2 ships real
+//     mirror support). Not probed by U1.29 directly; we rely on
+//     U1.29's core contract.
+//
+// Rule id contract (U1.24): required, positive integer. Duplicate-id
+// detection is C8 (validator), not parser territory.
+
+// -------------------------------------------------------------------------
+// U1.21 — Rate spec "200Mbps" / "1Gbps" / "64kbps" → bytes/sec.
+//
+// Per unit.md §U1.21, parser converts bps → bytes/sec at load time.
+// Expected values (from unit.md):
+//   "200Mbps"  →  25_000_000  (= 200 * 1e6 / 8)
+//   "1Gbps"    → 125_000_000  (= 1e9 / 8)
+//   "64kbps"   →       8_000  (= 64e3 / 8)
+// Bad forms ("1" ambiguous, "banana" garbage) → kBadRate.
+
+TEST(ParserU1_21, RateSpecBytesPerSec) {
+  struct Case {
+    const char* literal;
+    std::uint64_t expected_bps;
+  };
+  const Case good[] = {
+      {R"("200Mbps")", 25'000'000ull},
+      {R"("1Gbps")", 125'000'000ull},
+      {R"("64kbps")", 8'000ull},
+  };
+  for (const auto& c : good) {
+    std::string body = R"({ "action": { "type": "rate-limit", "rate": )";
+    body += c.literal;
+    body += R"(, "burst_ms": 10 } })";
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "rate=" << c.literal << " rejected; kind="
+        << static_cast<int>(err_kind(result))
+        << " msg=" << get_err(result).message;
+    const auto& cfg = get_ok(result);
+    ASSERT_EQ(cfg.pipeline.layer_4.size(), 1u);
+    ASSERT_TRUE(cfg.pipeline.layer_4[0].action.has_value());
+    const auto& act = *cfg.pipeline.layer_4[0].action;
+    ASSERT_TRUE(std::holds_alternative<::pktgate::config::ActionRateLimit>(act))
+        << "rate-limit action did not land as ActionRateLimit variant";
+    EXPECT_EQ(std::get<::pktgate::config::ActionRateLimit>(act).bytes_per_sec,
+              c.expected_bps)
+        << "rate=" << c.literal;
+  }
+
+  // Bad forms — "1" (ambiguous, no unit), "banana" (garbage) → kBadRate.
+  for (const char* lit : {R"("1")", R"("banana")", R"("200 Xbps")",
+                          R"("Mbps")", R"("-5Mbps")"}) {
+    std::string body = R"({ "action": { "type": "rate-limit", "rate": )";
+    body += lit;
+    body += R"(, "burst_ms": 10 } })";
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "bad rate " << lit << " accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kBadRate)
+        << "rate=" << lit
+        << " expected kBadRate got kind="
+        << static_cast<int>(err_kind(result))
+        << " msg=" << get_err(result).message;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.22 — rate-limit action parses `burst_ms` and derives burst_bytes.
+// burst_bytes == rate_bytes_per_sec * burst_ms / 1000.
+
+TEST(ParserU1_22, RateLimitBurstBytesDerivedAtLoadTime) {
+  // 200Mbps = 25_000_000 bytes/sec, burst_ms=10 → 250_000 bytes.
+  const std::string body =
+      R"({ "action": { "type": "rate-limit", "rate": "200Mbps", "burst_ms": 10 } })";
+  const std::string doc = make_doc_with_layer4_rule(body);
+  const ParseResult result = parse(doc);
+  ASSERT_TRUE(is_ok(result))
+      << "rate-limit action rejected; kind="
+      << static_cast<int>(err_kind(result))
+      << " msg=" << get_err(result).message;
+  const auto& cfg = get_ok(result);
+  ASSERT_EQ(cfg.pipeline.layer_4.size(), 1u);
+  ASSERT_TRUE(cfg.pipeline.layer_4[0].action.has_value());
+  const auto& act = *cfg.pipeline.layer_4[0].action;
+  ASSERT_TRUE(std::holds_alternative<::pktgate::config::ActionRateLimit>(act));
+  const auto& rl = std::get<::pktgate::config::ActionRateLimit>(act);
+  EXPECT_EQ(rl.bytes_per_sec, 25'000'000ull);
+  // The derivation must happen at load time — runtime hot path must
+  // never see the multiplication. 25_000_000 * 10 / 1000 = 250_000.
+  EXPECT_EQ(rl.burst_bytes, 250'000ull);
+}
+
+// -------------------------------------------------------------------------
+// U1.23 — `hw_offload_hint` optional, defaults false. D4.
+//
+// The hint is a per-rule boolean. Parser accepts true/false explicitly,
+// and a missing field yields `false`.
+
+TEST(ParserU1_23, HwOffloadHintOptionalDefaultsFalse) {
+  // Default: missing → false.
+  {
+    const std::string body = R"({ "dst_port": 80, "action": { "type": "allow" } })";
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "rule without hw_offload_hint rejected; msg="
+        << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_4.size(), 1u);
+    EXPECT_FALSE(get_ok(result).pipeline.layer_4[0].hw_offload_hint);
+  }
+
+  // Explicit true.
+  {
+    const std::string body =
+        R"({ "dst_port": 80, "hw_offload_hint": true, "action": { "type": "allow" } })";
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "hw_offload_hint=true rejected; msg=" << get_err(result).message;
+    EXPECT_TRUE(get_ok(result).pipeline.layer_4[0].hw_offload_hint);
+  }
+
+  // Explicit false.
+  {
+    const std::string body =
+        R"({ "dst_port": 80, "hw_offload_hint": false, "action": { "type": "allow" } })";
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "hw_offload_hint=false rejected; msg=" << get_err(result).message;
+    EXPECT_FALSE(get_ok(result).pipeline.layer_4[0].hw_offload_hint);
+  }
+
+  // Type mismatch: non-boolean → kTypeMismatch.
+  {
+    const std::string body =
+        R"({ "dst_port": 80, "hw_offload_hint": "yes", "action": { "type": "allow" } })";
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.24 — Rule `id` required, must be positive integer.
+// Inputs (from unit.md): missing id, id:0, id:-1, id:"42" → all rejected.
+// id:1 → accepted. Uses the `_raw` helper so default id injection is off.
+
+TEST(ParserU1_24, RuleIdRequiredPositive) {
+  // id:1 accepted.
+  {
+    const std::string doc = make_doc_with_layer4_rule_raw(
+        R"({ "id": 1, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "id=1 rejected; kind=" << static_cast<int>(err_kind(result))
+        << " msg=" << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_4.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_4[0].id, 1);
+  }
+  // id:42 accepted.
+  {
+    const std::string doc = make_doc_with_layer4_rule_raw(
+        R"({ "id": 42, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "id=42 rejected; msg="
+                               << get_err(result).message;
+    EXPECT_EQ(get_ok(result).pipeline.layer_4[0].id, 42);
+  }
+
+  // Missing id → rejected.
+  {
+    const std::string doc = make_doc_with_layer4_rule_raw(
+        R"({ "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "missing id was accepted";
+    // Either kUnknownField (reusing the "missing required field" idiom
+    // from top-level) or kOutOfRange — either is legitimate for a
+    // missing-required-positive-int.
+    const auto k = err_kind(result);
+    EXPECT_TRUE(k == ParseError::kUnknownField ||
+                k == ParseError::kOutOfRange)
+        << "missing id rejected with unexpected kind="
+        << static_cast<int>(k);
+  }
+
+  // id:0 → rejected (not positive).
+  {
+    const std::string doc = make_doc_with_layer4_rule_raw(
+        R"({ "id": 0, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kOutOfRange);
+  }
+
+  // id:-1 → rejected (not positive).
+  {
+    const std::string doc = make_doc_with_layer4_rule_raw(
+        R"({ "id": -1, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kOutOfRange);
+  }
+
+  // id:"42" → rejected (type mismatch).
+  {
+    const std::string doc = make_doc_with_layer4_rule_raw(
+        R"({ "id": "42", "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.29 — Action exactly-one invariant (D15-style sum type).
+//
+// The `action` object has a required `type` string selecting the
+// variant. Per unit.md the specific bad-input is:
+//   `"action": { "type": "allow", "target_port": "x" }`
+// mixing an Allow action with a TargetPort field — the resulting
+// sum-type violation → kAmbiguousAction.
+//
+// We also pin: missing `action` entirely → rule is accepted with
+// `action = nullopt` (action is an optional schema field in M1; the
+// validator will later require it for non-skeleton rules. Parser-
+// level it's optional — consistent with the C4-era test corpus that
+// never set it).
+
+TEST(ParserU1_29, ActionExactlyOneInvariant) {
+  // Happy: single-variant Allow.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "allow action rejected; msg=" << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_4.size(), 1u);
+    ASSERT_TRUE(get_ok(result).pipeline.layer_4[0].action.has_value());
+    EXPECT_TRUE(std::holds_alternative<::pktgate::config::ActionAllow>(
+        *get_ok(result).pipeline.layer_4[0].action));
+  }
+
+  // Happy: Drop variant.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "action": { "type": "drop" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "drop action rejected; msg=" << get_err(result).message;
+    EXPECT_TRUE(std::holds_alternative<::pktgate::config::ActionDrop>(
+        *get_ok(result).pipeline.layer_4[0].action));
+  }
+
+  // Bad: Allow type with an extra target_port field — mixes sum-type
+  // variants. Must reject as kAmbiguousAction.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "action": { "type": "allow", "target_port": "x" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result))
+        << "mixed action (allow + target_port) accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kAmbiguousAction)
+        << "kind=" << static_cast<int>(err_kind(result))
+        << " msg=" << get_err(result).message;
+  }
+
+  // Bad: no `type` at all — zero-variant, also kAmbiguousAction.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "action": { } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "empty action accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kAmbiguousAction);
+  }
+
+  // Bad: unknown action type string.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "action": { "type": "teleport" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    // Either kBadEnum (unknown type string) or kAmbiguousAction — both
+    // express the same sum-type violation at the schema level.
+    const auto k = err_kind(result);
+    EXPECT_TRUE(k == ParseError::kBadEnum ||
+                k == ParseError::kAmbiguousAction)
+        << "unknown action type rejected with unexpected kind="
+        << static_cast<int>(k);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.30 — `tcp_flags` sub-object parses into a (mask, want) pair.
+//
+// Input shape: `{ "syn": true, "ack": false }`.
+// Semantics: each flag present sets its bit in `mask`. If the value is
+// `true` the bit is also set in `want`; if `false`, the bit is cleared
+// in `want`. Absent flags are don't-care (bit clear in both).
+//
+// Bit layout matches L4CompoundEntry / DPDK tcp_flags byte
+// (RFC 9293): FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10,
+// URG=0x20, ECE=0x40, CWR=0x80.
+//
+// Invariant: `(want & ~mask) == 0` (want bits must be a subset of
+// mask bits). This is structurally guaranteed by the parser design.
+
+TEST(ParserU1_30, TcpFlagsMaskWantParse) {
+  constexpr std::uint8_t kSyn = 0x02;
+  constexpr std::uint8_t kAck = 0x10;
+  constexpr std::uint8_t kFin = 0x01;
+
+  // syn:true, ack:false → mask=SYN|ACK, want=SYN.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "tcp_flags": { "syn": true, "ack": false }, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "tcp_flags rejected; msg=" << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_4.size(), 1u);
+    const auto& r = get_ok(result).pipeline.layer_4[0];
+    ASSERT_TRUE(r.tcp_flags.has_value());
+    EXPECT_EQ(r.tcp_flags->mask, static_cast<std::uint8_t>(kSyn | kAck));
+    EXPECT_EQ(r.tcp_flags->want, static_cast<std::uint8_t>(kSyn));
+    // Invariant: want is a subset of mask.
+    EXPECT_EQ(r.tcp_flags->want & ~r.tcp_flags->mask, 0);
+  }
+
+  // All three true.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "tcp_flags": { "syn": true, "ack": true, "fin": true }, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+    const auto& tf = *get_ok(result).pipeline.layer_4[0].tcp_flags;
+    EXPECT_EQ(tf.mask, static_cast<std::uint8_t>(kSyn | kAck | kFin));
+    EXPECT_EQ(tf.want, static_cast<std::uint8_t>(kSyn | kAck | kFin));
+  }
+
+  // Empty object → mask=0, want=0 (no flags constrained). Still present.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "tcp_flags": {}, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+    const auto& r = get_ok(result).pipeline.layer_4[0];
+    ASSERT_TRUE(r.tcp_flags.has_value());
+    EXPECT_EQ(r.tcp_flags->mask, 0u);
+    EXPECT_EQ(r.tcp_flags->want, 0u);
+  }
+
+  // Unknown flag key → kUnknownField.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "tcp_flags": { "banana": true }, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kUnknownField);
+  }
+
+  // Non-bool value → kTypeMismatch.
+  {
+    const std::string doc = make_doc_with_layer4_rule(
+        R"({ "tcp_flags": { "syn": "yes" }, "action": { "type": "allow" } })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
   }
 }
 

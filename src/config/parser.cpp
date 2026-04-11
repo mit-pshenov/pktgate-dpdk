@@ -25,6 +25,10 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -135,23 +139,282 @@ std::optional<ParseError> parse_bounded_int_array(
 }
 
 // -------------------------------------------------------------------------
-// Parse a single Rule object. C4 only knows about the numeric-range
-// fields U1.17..U1.20 probe: `dst_port`, `dst_ports`, `vlan_id`, `pcp`.
-// Every other key → kUnknownField (strict schema, D8). C5+ extends the
-// whitelist with `id`, `action`, etc.
+// parse_rate (C5, D1). Converts a rate literal like "200Mbps" / "1Gbps"
+// / "64kbps" to a bytes/sec integer. This is the load-time conversion
+// the D1 anchor mandates — the runtime hot path MUST NEVER parse the
+// string or redo the multiply. Returns std::nullopt on success
+// (value written to `out`) and kBadRate on any parse failure.
 //
-// The same Rule shape is used for layer_2 / layer_3 / layer_4 arrays
-// right now — the parser doesn't enforce which fields are legal in
-// which layer. That's validator territory (M1 C7+).
+// Grammar: `<positive-integer><unit>` where unit is exactly one of
+// `kbps`, `Mbps`, `Gbps`. No whitespace, no floats, no bytes/sec. The
+// unit is deliberately case-sensitive to avoid silent typos (`gbps`
+// vs `Gbps` vs `GBps`): operators should get a crisp error rather
+// than a 125x overread.
+//
+// Multipliers are SI decimal (1 Mbps = 10^6 bits/sec, per ITU-T),
+// divided by 8 to land on bytes/sec:
+//   kbps → 1000/8   = 125   bytes/sec per unit
+//   Mbps → 1e6/8    = 125_000   bytes/sec per unit
+//   Gbps → 1e9/8    = 125_000_000 bytes/sec per unit
+std::optional<ParseError> parse_rate(std::string_view spec,
+                                     std::uint64_t& out) {
+  // Extract leading digits.
+  std::size_t digit_end = 0;
+  while (digit_end < spec.size() &&
+         std::isdigit(static_cast<unsigned char>(spec[digit_end]))) {
+    ++digit_end;
+  }
+  if (digit_end == 0) {
+    return make_err(ParseError::kBadRate,
+                    std::string{"rate '"} + std::string{spec} +
+                        "' has no numeric prefix");
+  }
+
+  // Parse the digit run into an unsigned 64-bit.
+  std::uint64_t value = 0;
+  for (std::size_t i = 0; i < digit_end; ++i) {
+    const std::uint64_t digit = static_cast<std::uint64_t>(spec[i] - '0');
+    // Simple overflow guard: 10^18 is well under UINT64_MAX so any
+    // reasonable rate spec fits. Anything bigger is malformed input.
+    if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      return make_err(ParseError::kBadRate,
+                      std::string{"rate '"} + std::string{spec} + "' overflows");
+    }
+    value = value * 10 + digit;
+  }
+  if (value == 0) {
+    return make_err(ParseError::kBadRate,
+                    std::string{"rate '"} + std::string{spec} +
+                        "' must be strictly positive");
+  }
+
+  // Unit suffix — must be present and one of the three allowed forms.
+  const std::string_view unit = spec.substr(digit_end);
+  std::uint64_t bits_per_unit = 0;
+  if (unit == "kbps") {
+    bits_per_unit = 1000ull;
+  } else if (unit == "Mbps") {
+    bits_per_unit = 1000ull * 1000ull;
+  } else if (unit == "Gbps") {
+    bits_per_unit = 1000ull * 1000ull * 1000ull;
+  } else {
+    return make_err(ParseError::kBadRate,
+                    std::string{"rate '"} + std::string{spec} +
+                        "' has unknown or missing unit (expected kbps/Mbps/Gbps)");
+  }
+
+  // Convert to bytes/sec. Multiply first, then /8 — the inputs are
+  // small enough to never overflow (max 1 Tbps worth = 1.25e11 bytes/sec).
+  const std::uint64_t bits_per_sec = value * bits_per_unit;
+  out = bits_per_sec / 8ull;
+  return std::nullopt;
+}
+
+// -------------------------------------------------------------------------
+// parse_action (C5, D15 exactly-one, D7 mirror-accept).
+//
+// The action object has a required `type` string field discriminating
+// the variant. Additional fields are variant-specific and strictly
+// whitelisted per type — anything outside that whitelist is a
+// sum-type violation (kAmbiguousAction) because it names a field
+// that belongs to a different variant.
+//
+// C5 scope: `allow`, `drop`, `rate-limit` for real. `tag`,
+// `target-port`, `mirror` are scaffolded so the variant sum is
+// complete and operators get a principled error if they try to
+// use them before the validator lands — but they're parser-
+// accepted, as D7 mandates for mirror.
+std::optional<ParseError> parse_action(const json& j, RuleAction& out) {
+  if (!j.is_object()) {
+    return make_err(ParseError::kTypeMismatch,
+                    "rule 'action' must be a JSON object");
+  }
+
+  // `type` is the discriminator. Missing or non-string → sum-type
+  // violation expressed as kAmbiguousAction (zero variants selected).
+  if (!j.contains("type")) {
+    return make_err(ParseError::kAmbiguousAction,
+                    "rule 'action' missing required 'type' discriminator");
+  }
+  if (!j["type"].is_string()) {
+    return make_err(ParseError::kTypeMismatch,
+                    "rule 'action.type' must be a string");
+  }
+  const std::string type = j["type"].get<std::string>();
+
+  // Per-variant whitelist. Any key in `j` outside the union of
+  // {"type"} and the variant-specific whitelist is a sum-type
+  // violation → kAmbiguousAction. This is what catches the U1.29
+  // `{ type: "allow", target_port: "x" }` case.
+  auto check_whitelist = [&](std::initializer_list<std::string_view> allowed)
+      -> std::optional<ParseError> {
+    for (auto it = j.begin(); it != j.end(); ++it) {
+      const std::string& key = it.key();
+      if (key == "type") continue;
+      bool ok = false;
+      for (const auto& w : allowed) {
+        if (key == w) {
+          ok = true;
+          break;
+        }
+      }
+      if (!ok) {
+        return make_err(
+            ParseError::kAmbiguousAction,
+            std::string{"rule 'action' has field '"} + key +
+                "' that does not belong to variant '" + type +
+                "' (sum-type violation, exactly-one per D15)");
+      }
+    }
+    return std::nullopt;
+  };
+
+  if (type == "allow") {
+    if (auto err = check_whitelist({})) return *err;
+    out = ActionAllow{};
+    return std::nullopt;
+  }
+  if (type == "drop") {
+    if (auto err = check_whitelist({})) return *err;
+    out = ActionDrop{};
+    return std::nullopt;
+  }
+  if (type == "rate-limit") {
+    if (auto err = check_whitelist({"rate", "burst_ms"})) return *err;
+    if (!j.contains("rate")) {
+      return make_err(ParseError::kBadRate,
+                      "rate-limit action missing 'rate' field");
+    }
+    if (!j["rate"].is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rate-limit 'rate' must be a string (e.g. '200Mbps')");
+    }
+    ActionRateLimit rl{};
+    if (auto err = parse_rate(j["rate"].get<std::string>(), rl.bytes_per_sec)) {
+      return *err;
+    }
+    if (!j.contains("burst_ms")) {
+      return make_err(ParseError::kBadRate,
+                      "rate-limit action missing 'burst_ms' field");
+    }
+    if (!j["burst_ms"].is_number_integer()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rate-limit 'burst_ms' must be an integer");
+    }
+    const std::int64_t burst_ms = j["burst_ms"].get<std::int64_t>();
+    if (burst_ms <= 0) {
+      return make_err(ParseError::kOutOfRange,
+                      "rate-limit 'burst_ms' must be strictly positive");
+    }
+    // D1: derive burst_bytes at load time. burst_bytes = bytes/sec * ms / 1000.
+    rl.burst_bytes = rl.bytes_per_sec *
+                     static_cast<std::uint64_t>(burst_ms) / 1000ull;
+    out = rl;
+    return std::nullopt;
+  }
+  if (type == "tag") {
+    if (auto err = check_whitelist({"dscp", "pcp"})) return *err;
+    ActionTag tag{};
+    if (j.contains("dscp")) {
+      if (auto err = parse_bounded_int(j, "dscp", 0, 63, tag.dscp)) {
+        return *err;
+      }
+    }
+    if (j.contains("pcp")) {
+      if (auto err = parse_bounded_int(j, "pcp", 0, 7, tag.pcp)) {
+        return *err;
+      }
+    }
+    out = tag;
+    return std::nullopt;
+  }
+  if (type == "target-port") {
+    if (auto err = check_whitelist({"target_port"})) return *err;
+    if (!j.contains("target_port") || !j["target_port"].is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "target-port action requires string 'target_port'");
+    }
+    out = ActionTargetPort{j["target_port"].get<std::string>()};
+    return std::nullopt;
+  }
+  if (type == "mirror") {
+    // D7: parser-accept, compiler/validator rejects in MVP.
+    if (auto err = check_whitelist({"target_port"})) return *err;
+    if (!j.contains("target_port") || !j["target_port"].is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "mirror action requires string 'target_port'");
+    }
+    out = ActionMirror{j["target_port"].get<std::string>()};
+    return std::nullopt;
+  }
+
+  return make_err(ParseError::kBadEnum,
+                  std::string{"unknown action type: '"} + type + "'");
+}
+
+// -------------------------------------------------------------------------
+// parse_tcp_flags (C5, D15). Each recognised flag key (syn, ack, fin,
+// rst, psh, urg, ece, cwr) toggles bits in (mask, want) per the
+// invariant in model.h. Absent keys = don't care. Empty object = no
+// constraints (mask = want = 0). Non-boolean values → kTypeMismatch.
+std::optional<ParseError> parse_tcp_flags(const json& j, TcpFlags& out) {
+  if (!j.is_object()) {
+    return make_err(ParseError::kTypeMismatch,
+                    "rule 'tcp_flags' must be a JSON object");
+  }
+  struct FlagBit {
+    std::string_view key;
+    std::uint8_t bit;
+  };
+  constexpr FlagBit kFlags[] = {
+      {"fin", 0x01}, {"syn", 0x02}, {"rst", 0x04}, {"psh", 0x08},
+      {"ack", 0x10}, {"urg", 0x20}, {"ece", 0x40}, {"cwr", 0x80},
+  };
+  out = TcpFlags{};
+  for (auto it = j.begin(); it != j.end(); ++it) {
+    const std::string& key = it.key();
+    const FlagBit* match = nullptr;
+    for (const auto& f : kFlags) {
+      if (key == f.key) {
+        match = &f;
+        break;
+      }
+    }
+    if (!match) {
+      return make_err(ParseError::kUnknownField,
+                      std::string{"tcp_flags unknown flag: '"} + key + "'");
+    }
+    if (!it.value().is_boolean()) {
+      return make_err(ParseError::kTypeMismatch,
+                      std::string{"tcp_flags '"} + key + "' must be boolean");
+    }
+    // Always set the mask bit — the key's mere presence is a constraint.
+    out.mask = static_cast<std::uint8_t>(out.mask | match->bit);
+    if (it.value().get<bool>()) {
+      // True: also set the want bit. Invariant (want & ~mask)==0 is
+      // preserved because we set mask first.
+      out.want = static_cast<std::uint8_t>(out.want | match->bit);
+    }
+    // False: leave want bit clear — "must be clear" constraint.
+  }
+  return std::nullopt;
+}
+
+// -------------------------------------------------------------------------
+// Parse a single Rule object. C4 knew about dst_port / dst_ports /
+// vlan_id / pcp. C5 adds: id (required positive int), action (D15
+// exactly-one variant), hw_offload_hint (D4 optional bool), tcp_flags
+// (D15 mask/want sub-object). Every other key → kUnknownField.
 std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   if (!j.is_object()) {
     return make_err(ParseError::kTypeMismatch,
                     "pipeline rule entry must be a JSON object");
   }
 
-  // Strict per-rule whitelist. Extend in C5+.
-  constexpr std::array<std::string_view, 4> kAllowedRuleKeys = {
-      "dst_port", "dst_ports", "vlan_id", "pcp"};
+  // Strict per-rule whitelist. C5 adds id/action/hw_offload_hint/tcp_flags.
+  constexpr std::array<std::string_view, 8> kAllowedRuleKeys = {
+      "id",       "dst_port",        "dst_ports", "vlan_id",
+      "pcp",      "hw_offload_hint", "tcp_flags", "action"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     const std::string& key = it.key();
     bool allowed = false;
@@ -165,6 +428,30 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
       return make_err(ParseError::kUnknownField,
                       std::string{"unknown rule field: '"} + key + "'");
     }
+  }
+
+  // C5 U1.24 — rule id required, positive integer. Enforced here
+  // rather than downstream because the parser's job is to reject
+  // structurally invalid input; duplicate-id detection (C8) is a
+  // validator concern. Type mismatch ("42") wins over missing so the
+  // error message is the most specific available.
+  if (!j.contains("id")) {
+    return make_err(ParseError::kUnknownField,
+                    "missing required rule field: 'id'");
+  }
+  if (!j["id"].is_number_integer()) {
+    return make_err(ParseError::kTypeMismatch,
+                    "rule field 'id' must be an integer");
+  }
+  {
+    const std::int64_t raw = j["id"].get<std::int64_t>();
+    if (raw < 1 ||
+        raw > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
+      return make_err(ParseError::kOutOfRange,
+                      std::string{"rule field 'id' = "} + std::to_string(raw) +
+                          " must be a positive integer");
+    }
+    out.id = static_cast<std::int32_t>(raw);
   }
 
   if (j.contains("dst_port")) {
@@ -188,6 +475,34 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
     if (auto err = parse_bounded_int(j, "pcp", 0, 7, out.pcp)) {
       return *err;
     }
+  }
+
+  // C5 U1.23 — hw_offload_hint: optional, defaults false (D4).
+  if (j.contains("hw_offload_hint")) {
+    if (!j["hw_offload_hint"].is_boolean()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'hw_offload_hint' must be boolean");
+    }
+    out.hw_offload_hint = j["hw_offload_hint"].get<bool>();
+  }
+
+  // C5 U1.30 — tcp_flags sub-object (D15).
+  if (j.contains("tcp_flags")) {
+    TcpFlags tf{};
+    if (auto err = parse_tcp_flags(j["tcp_flags"], tf)) {
+      return *err;
+    }
+    out.tcp_flags = tf;
+  }
+
+  // C5 U1.29 — action variant (D15 exactly-one). Optional at parser
+  // tier; the validator (C7+) decides whether the absence is fatal.
+  if (j.contains("action")) {
+    RuleAction act;
+    if (auto err = parse_action(j["action"], act)) {
+      return *err;
+    }
+    out.action = act;
   }
   return std::nullopt;
 }
