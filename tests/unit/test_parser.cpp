@@ -333,4 +333,342 @@ TEST(ParserU1_7, MixedKeysRejected) {
       << "error message must name the offending 'vdev' key: " << msg;
 }
 
+// =========================================================================
+// M1 C4 — enums + numeric ranges + port list
+// =========================================================================
+//
+// U1.14 / U1.15 / U1.16 pin the `fragment_policy` enum contract (D17/P9).
+// U1.17 / U1.18 / U1.19 pin numeric range guards (D8) on dst_port,
+// vlan_id, pcp. U1.20 pins the port-list shape. All of these fields
+// land on the minimal `Rule` shell introduced in C4 — just enough
+// storage for the parser to accept/reject the values; match semantics
+// and action wiring are C5+.
+//
+// Shared helper: build a minimal top-level document whose pipeline
+// contains one layer_4 rule populated with `extra_rule_fields` (raw
+// JSON fragment). Keeps each TEST body readable — the important part
+// of every test is the single field under exercise, not the 15 lines
+// of boilerplate around it.
+
+std::string make_doc_with_layer4_rule(std::string_view rule_body) {
+  std::string out = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [],
+    "layer_4": [)json";
+  out += rule_body;
+  out += R"json(]
+  },
+  "default_behavior": "drop"
+})json";
+  return out;
+}
+
+std::string make_doc_with_layer2_rule(std::string_view rule_body) {
+  std::string out = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": {
+    "layer_2": [)json";
+  out += rule_body;
+  out += R"json(],
+    "layer_3": [],
+    "layer_4": []
+  },
+  "default_behavior": "drop"
+})json";
+  return out;
+}
+
+std::string make_doc_with_fragment_policy(std::string_view fp_json_literal) {
+  std::string out = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": { "layer_2": [], "layer_3": [], "layer_4": [] },
+  "default_behavior": "drop",
+  "fragment_policy": )json";
+  out += fp_json_literal;
+  out += R"json(
+})json";
+  return out;
+}
+
+// -------------------------------------------------------------------------
+// U1.14 — fragment_policy enum accepted: l3_only / drop / allow each
+// round-trip to the matching enum value. C1 already tested the default
+// (missing → kL3Only); C4 adds the explicit-value path for all three.
+
+TEST(ParserU1_14, FragmentPolicyAllThreeValuesAccepted) {
+  struct Case {
+    std::string_view literal;
+    FragmentPolicy expected;
+  };
+  const Case cases[] = {
+      {R"("l3_only")", FragmentPolicy::kL3Only},
+      {R"("drop")", FragmentPolicy::kDrop},
+      {R"("allow")", FragmentPolicy::kAllow},
+  };
+  for (const auto& c : cases) {
+    const std::string doc = make_doc_with_fragment_policy(c.literal);
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result))
+        << "fragment_policy=" << c.literal << " rejected; err kind="
+        << static_cast<int>(std::get<ParseError>(result).kind)
+        << " msg=" << std::get<ParseError>(result).message;
+    EXPECT_EQ(get_ok(result).fragment_policy, c.expected)
+        << "fragment_policy=" << c.literal << " did not map to expected enum";
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.15 — fragment_policy unknown value rejected as kBadEnum.
+// Inputs per unit.md: "l2_only", "maybe", 42.
+//
+// Note: the non-string literal `42` must also be rejected. The current
+// parser routes type mismatches through kTypeMismatch; that's fine — the
+// point of the test is that the value never lands as a FragmentPolicy.
+
+TEST(ParserU1_15, FragmentPolicyUnknownRejected) {
+  // String enum values — must produce kBadEnum.
+  const std::string_view bad_strings[] = {R"("l2_only")", R"("maybe")"};
+  for (const auto& lit : bad_strings) {
+    const std::string doc = make_doc_with_fragment_policy(lit);
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result))
+        << "unknown fragment_policy " << lit << " accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kBadEnum)
+        << "fragment_policy=" << lit
+        << " expected kBadEnum, got kind="
+        << static_cast<int>(err_kind(result))
+        << " msg=" << get_err(result).message;
+  }
+
+  // Non-string value — rejected, either as kTypeMismatch (because the
+  // current parser type-checks first) or as kBadEnum. Both are legit;
+  // the invariant U1.15 cares about is "never accepted as a policy".
+  {
+    const std::string doc = make_doc_with_fragment_policy("42");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result))
+        << "numeric fragment_policy 42 was accepted";
+    const auto kind = err_kind(result);
+    EXPECT_TRUE(kind == ParseError::kTypeMismatch ||
+                kind == ParseError::kBadEnum)
+        << "fragment_policy=42 rejected with unexpected kind="
+        << static_cast<int>(kind);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.16 — fragment_policy missing → default kL3Only (P9). C1 already pins
+// this on the minimal doc; here we pin it on a doc that happens to have
+// other C4-era fields populated, guarding against an accidental future
+// regression where adding new rule fields silently wipes the default.
+
+TEST(ParserU1_16, FragmentPolicyMissingDefaultsToL3Only) {
+  // Doc with a populated layer_4 rule but no fragment_policy — default
+  // must still land.
+  const std::string doc = make_doc_with_layer4_rule(R"({ "dst_port": 80 })");
+  const ParseResult result = parse(doc);
+  ASSERT_TRUE(is_ok(result))
+      << "doc rejected; err kind="
+      << static_cast<int>(std::get<ParseError>(result).kind)
+      << " msg=" << std::get<ParseError>(result).message;
+  EXPECT_EQ(get_ok(result).fragment_policy, FragmentPolicy::kL3Only);
+}
+
+// -------------------------------------------------------------------------
+// U1.17 — port range 0..65535 on `dst_port`.
+// Accepted: 0, 65535.
+// Rejected: -1 (kOutOfRange), 65536 (kOutOfRange), "80" (kTypeMismatch).
+
+TEST(ParserU1_17, DstPortRangeChecked) {
+  // Accepted boundaries.
+  {
+    const std::string doc = make_doc_with_layer4_rule(R"({ "dst_port": 0 })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "dst_port=0 rejected; msg="
+                               << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_4.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_4[0].dst_port, 0);
+  }
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "dst_port": 65535 })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "dst_port=65535 rejected; msg="
+                               << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_4.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_4[0].dst_port, 65535);
+  }
+
+  // Rejected: out-of-range negative and above-ceiling.
+  for (const char* body :
+       {R"({ "dst_port": -1 })", R"({ "dst_port": 65536 })"}) {
+    const std::string doc = make_doc_with_layer4_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "out-of-range accepted: " << body;
+    EXPECT_EQ(err_kind(result), ParseError::kOutOfRange)
+        << "body=" << body << " kind=" << static_cast<int>(err_kind(result));
+  }
+
+  // Rejected: string where int is required.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "dst_port": "80" })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "string dst_port accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.18 — vlan_id range 0..4095.
+// Same shape as U1.17. Note: 4095 is the spec bound per unit.md §U1.18
+// ("Same pattern, 0..4095 bounds") — even though vlan 4095 is reserved
+// in IEEE 802.1Q, the schema-level range is what this test pins.
+
+TEST(ParserU1_18, VlanIdRangeChecked) {
+  {
+    const std::string doc = make_doc_with_layer2_rule(R"({ "vlan_id": 0 })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "vlan_id=0 rejected; msg="
+                               << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_2.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_2[0].vlan_id, 0);
+  }
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "vlan_id": 4095 })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "vlan_id=4095 rejected; msg="
+                               << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_2.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_2[0].vlan_id, 4095);
+  }
+  for (const char* body :
+       {R"({ "vlan_id": -1 })", R"({ "vlan_id": 4096 })"}) {
+    const std::string doc = make_doc_with_layer2_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "out-of-range vlan accepted: " << body;
+    EXPECT_EQ(err_kind(result), ParseError::kOutOfRange);
+  }
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "vlan_id": "10" })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.19 — PCP range 0..7 (3-bit field).
+
+TEST(ParserU1_19, PcpRangeChecked) {
+  {
+    const std::string doc = make_doc_with_layer2_rule(R"({ "pcp": 0 })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "pcp=0 rejected; msg="
+                               << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_2.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_2[0].pcp, 0);
+  }
+  {
+    const std::string doc = make_doc_with_layer2_rule(R"({ "pcp": 7 })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "pcp=7 rejected; msg="
+                               << get_err(result).message;
+    ASSERT_EQ(get_ok(result).pipeline.layer_2.size(), 1u);
+    EXPECT_EQ(get_ok(result).pipeline.layer_2[0].pcp, 7);
+  }
+  for (const char* body : {R"({ "pcp": -1 })", R"({ "pcp": 8 })"}) {
+    const std::string doc = make_doc_with_layer2_rule(body);
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "out-of-range pcp accepted: " << body;
+    EXPECT_EQ(err_kind(result), ParseError::kOutOfRange);
+  }
+  {
+    const std::string doc = make_doc_with_layer2_rule(R"({ "pcp": "3" })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.20 — Port list `[22, 80, 443]` parsed as array of ints.
+//
+// The list-valued field is `dst_ports` — a sibling of `dst_port`, used
+// when a rule wants to match any of several L4 ports. The generic
+// int-array parse helper that lands in parser.cpp in C4 is exercised
+// here through this field. Unit.md leaves the exact storage field
+// name to the implementer; we pick `dst_ports` because that's the
+// natural plural of the U1.17 field and keeps C5's action work free
+// to introduce further list-valued fields without renaming.
+//
+// Range-check sanity: each element of the list is subject to the same
+// 0..65535 guard as `dst_port`. We don't separately retest the
+// negative path here (U1.17 covers that for the same helper), but we
+// do assert a well-formed list lands in the AST verbatim.
+
+TEST(ParserU1_20, PortListParsesAsIntArray) {
+  // Explicit multi-element list.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "dst_ports": [22, 80, 443] })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "dst_ports=[22,80,443] rejected; msg="
+                               << get_err(result).message;
+    const Config& cfg = get_ok(result);
+    ASSERT_EQ(cfg.pipeline.layer_4.size(), 1u);
+    const auto& r = cfg.pipeline.layer_4[0];
+    ASSERT_EQ(r.dst_ports.size(), 3u);
+    EXPECT_EQ(r.dst_ports[0], 22);
+    EXPECT_EQ(r.dst_ports[1], 80);
+    EXPECT_EQ(r.dst_ports[2], 443);
+  }
+
+  // Singleton list.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "dst_ports": [8080] })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "singleton dst_ports rejected; msg="
+                               << get_err(result).message;
+    const auto& r = get_ok(result).pipeline.layer_4[0];
+    ASSERT_EQ(r.dst_ports.size(), 1u);
+    EXPECT_EQ(r.dst_ports[0], 8080);
+  }
+
+  // Non-array → kTypeMismatch.
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "dst_ports": 80 })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "scalar dst_ports accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+
+  // Out-of-range element → kOutOfRange (int-array helper contract).
+  {
+    const std::string doc =
+        make_doc_with_layer4_rule(R"({ "dst_ports": [80, 99999] })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result)) << "out-of-range list element accepted";
+    EXPECT_EQ(err_kind(result), ParseError::kOutOfRange);
+  }
+}
+
 }  // namespace

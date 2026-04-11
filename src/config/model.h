@@ -71,10 +71,34 @@ struct InterfaceRole {
 enum class DefaultBehavior : std::uint8_t { kAllow, kDrop };
 enum class FragmentPolicy : std::uint8_t { kL3Only, kDrop, kAllow };
 
-// Empty pipeline struct for C1. Real layer_2 / layer_3 / layer_4 rule
-// vectors land in C3+.
+// -------------------------------------------------------------------------
+// Rule shell (C4 minimal surface).
+//
+// C4 only needs the fields U1.17 / U1.18 / U1.19 / U1.20 probe: `dst_port`,
+// `dst_ports`, `vlan_id`, `pcp`. Everything else (match predicates,
+// actions, rate specs, rule ids) lands in C5+. Unset numeric fields carry
+// the sentinel `-1` — the validator in M1 C7 rejects rules with no
+// match fields at all; that's not C4's job.
+//
+// Rationale for int32_t (not uint16_t): the parser needs to *detect*
+// out-of-range negatives at load time (U1.17/U1.18/U1.19 check `-1`
+// rejection). A signed wider type captures the raw JSON integer before
+// the range check decides accept/reject.
+
+struct Rule {
+  std::int32_t dst_port = -1;            // U1.17 range 0..65535, -1 = unset
+  std::vector<std::int32_t> dst_ports;   // U1.20 port list
+  std::int32_t vlan_id = -1;             // U1.18 range 0..4095, -1 = unset
+  std::int32_t pcp = -1;                 // U1.19 range 0..7, -1 = unset
+};
+
+// Pipeline layer rule vectors. C1 shape-checked the layer arrays; C4
+// starts populating them with minimal Rule shells so the parser has
+// a home for the numeric-range fields U1.17..U1.20 land on.
 struct Pipeline {
-  // intentionally empty in C1
+  std::vector<Rule> layer_2;
+  std::vector<Rule> layer_3;
+  std::vector<Rule> layer_4;
 };
 
 // -------------------------------------------------------------------------
