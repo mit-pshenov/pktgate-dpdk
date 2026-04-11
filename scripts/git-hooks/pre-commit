@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# scripts/git-hooks/pre-commit
+#
+# pktgate-dpdk pre-commit gate — implementation-plan.md §0.3.
+#
+# If the staged diff touches anything under `src/`, run
+#   ctest --preset dev-asan -L unit
+# before letting the commit through. The `unit` label is the fast
+# path — it excludes functional/corner/chaos/perf suites so the
+# hook stays under a few seconds once those labels exist (M1+).
+#
+# In M0 this hook is effectively a no-op: `src/` only contains
+# main.cpp and there are no `unit`-labelled tests yet. Landing
+# the hook now means M1's first real src/ commit is gated from
+# the moment it is staged — the alternative (adding the hook
+# alongside M1) risks a gap where guards don't run.
+#
+# --- Installation -----------------------------------------------------
+# Not auto-installed. To enable locally:
+#
+#   ln -sf "$(pwd)/scripts/git-hooks/pre-commit" .git/hooks/pre-commit
+#
+# or, if you prefer `core.hooksPath`:
+#
+#   git config core.hooksPath scripts/git-hooks
+#
+# CI (.github/workflows/ci.yml) is the authoritative gate; the hook
+# just gives developers a fast local tripwire. Never bypass with
+# --no-verify to "get the commit in" — if the hook is wrong, fix
+# the hook.
+#
+# --- Behaviour --------------------------------------------------------
+# * No staged changes under src/   → exit 0 fast (no-op).
+# * Staged changes under src/      → run the ctest preset.
+# * Build tree missing for preset  → first-run bootstrap (configure
+#                                    + build) before running tests.
+# * dev-asan preset missing from   → hard-fail with a pointer to
+#   CMakePresets.json                 CMakePresets.json.
+#
+# The hook deliberately does NOT re-run on amended or rebased
+# commits unless src/ is in the staged diff — pure prose/commit-
+# message churn is fine without the gate.
+
+set -euo pipefail
+
+# We're running inside the repo root for sure (git runs hooks with
+# cwd = top-level worktree), but let's be defensive and anchor to
+# the repo root via rev-parse in case someone copy-pastes this
+# script into an unusual setup.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Collect the list of paths staged for this commit. `--cached`
+# against HEAD gives us exactly the delta that would be committed;
+# `--diff-filter=ACMR` skips deletions (D) and type-changes we
+# don't care about.
+if git rev-parse --verify --quiet HEAD >/dev/null; then
+  staged="$(git diff --name-only --cached --diff-filter=ACMR HEAD || true)"
+else
+  # First commit on a fresh repo — compare against the empty tree.
+  EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+  staged="$(git diff --name-only --cached --diff-filter=ACMR "$EMPTY_TREE" || true)"
+fi
+
+# Nothing under src/? Skip the gate — fast path.
+if ! grep -q '^src/' <<<"$staged"; then
+  exit 0
+fi
+
+echo "pre-commit: staged changes under src/ detected, running dev-asan unit gate"
+
+PRESET="dev-asan"
+
+# Sanity-check that the preset exists before we shell out to cmake.
+# The canonical source is CMakePresets.json; if it's missing or
+# the dev-asan entry has been renamed, fail loudly rather than
+# silently skipping the gate.
+if ! grep -q "\"name\": \"${PRESET}\"" CMakePresets.json 2>/dev/null; then
+  echo "pre-commit: ERROR — preset '${PRESET}' missing from CMakePresets.json" >&2
+  echo "pre-commit: fix the hook or the presets file; do NOT bypass with --no-verify" >&2
+  exit 1
+fi
+
+# First-run bootstrap: configure + build if the preset's build dir
+# doesn't exist yet. Subsequent commits just re-run ctest against
+# the existing build tree (ninja picks up incremental deltas).
+BUILD_DIR="build/${PRESET}"
+if [ ! -d "$BUILD_DIR" ]; then
+  echo "pre-commit: ${BUILD_DIR} missing, configuring..."
+  cmake --preset "${PRESET}"
+fi
+
+cmake --build --preset "${PRESET}"
+ctest --preset "${PRESET}" -L unit --output-on-failure

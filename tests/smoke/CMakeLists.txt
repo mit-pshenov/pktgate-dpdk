@@ -44,6 +44,21 @@ target_compile_definitions(smoke_fuzz_sanity
   PRIVATE "PKTGATE_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
 )
 
+# CI workflow + pre-commit hook scaffolding sentinel (M0 C6).
+# Same pattern as smoke.fuzz_sanity: structural file-existence +
+# content-grep checks, no actual CI/hook execution. Catches
+# bit-rot under every dev-* smoke run so missing sanitizer
+# entries in ci.yml or a non-executable git hook go red before
+# anyone discovers it in GitHub Actions.
+pktgate_add_test(
+  NAME    smoke.ci_workflow_sanity
+  SOURCES test_ci_workflow_sanity.cpp
+  LABELS  smoke
+)
+target_compile_definitions(smoke_ci_workflow_sanity
+  PRIVATE "PKTGATE_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
+)
+
 # Label-reachability guard. Not a gtest binary — shell script that
 # runs `ctest -N -L <label>` and asserts each required label matches
 # >= 1 test. Runs on every smoke-label invocation, so label drift is

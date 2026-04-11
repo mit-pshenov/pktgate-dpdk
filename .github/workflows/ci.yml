@@ -1,0 +1,134 @@
+# .github/workflows/ci.yml
+#
+# pktgate-dpdk sanitizer gate — implementation-plan.md §0.2.
+#
+# The design (harness.md §H3) asks for two tiers of coverage:
+#
+#   * rotating-per-commit — every push builds and tests under exactly
+#     one sanitizer flavour, picked deterministically from the commit
+#     SHA. Cheap enough to gate merges on, surfacing a regression
+#     inside ~5 commits on average across the five presets. The
+#     mapping is commit-derived (not round-robin) so replaying the
+#     same SHA always hits the same flavour — reproducibility first.
+#
+#   * nightly-full-matrix — once a day the whole dev-{release,debug,
+#     asan,ubsan,tsan} matrix runs in parallel. This is where slow
+#     flavours (tsan especially) and flakes surface. Nightly failures
+#     don't block merges directly, but they page whoever's on the
+#     watchdog rotation per harness.md §H3.4.
+#
+# Fuzz preset is deliberately excluded from both tiers. libFuzzer
+# shortruns live in a separate workflow (harness.md §H4.7) because
+# the per-target `-runs` budget is measured in minutes, not seconds,
+# and a fuzz regression is not a merge blocker the way a sanitizer
+# regression is. See implementation-plan.md §0.2 — "per-cycle gate"
+# explicitly covers the five dev-* flavours only.
+#
+# DPDK installation: we install from the distro package on both
+# ubuntu-24.04 and the nightly container. The dev VM uses a meson-
+# uninstalled DPDK 25.11 build (see user memory "Dev VM DPDK
+# layout"), but CI doesn't need 25.11 specifically — any DPDK the
+# presets can link against is enough for M0's empty `main()` and
+# will be enough for M1's pure-C++ parser/validator code too. When
+# M3 lands the first hot-path code that depends on a specific DPDK
+# feature, this file gets revisited.
+
+name: sanitizer-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 02:17 UTC daily — off-hour, avoids the top-of-the-hour runner
+    # congestion that harness.md §H3.4 calls out. Minutes offset so
+    # we don't collide with anyone else's nightly cron.
+    - cron: "17 2 * * *"
+  workflow_dispatch: {}
+
+# Cancel in-flight runs for the same branch when a new commit lands.
+# Saves minutes and stops the rotating job from racing itself when a
+# developer force-pushes a fixup.
+concurrency:
+  group: sanitizer-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Rotating per-commit job. Runs on push and on PRs; picks ONE preset
+  # from the five dev-* flavours keyed off the commit SHA. This is the
+  # merge-gating path.
+  # ---------------------------------------------------------------------
+  rotating:
+    name: rotating (${{ github.event_name }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain + DPDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++-14 clang-18 \
+            pkg-config libdpdk-dev
+
+      - name: Pick rotating sanitizer from SHA
+        id: pick
+        shell: bash
+        run: |
+          # Deterministic: 8 hex nibbles of the commit SHA mod 5.
+          # Same SHA always lands on the same preset — this matters
+          # when a developer replays a failing commit locally.
+          presets=(dev-debug dev-release dev-asan dev-ubsan dev-tsan)
+          idx=$(( 0x${GITHUB_SHA:0:8} % 5 ))
+          preset="${presets[$idx]}"
+          echo "preset=$preset" >> "$GITHUB_OUTPUT"
+          echo "::notice::rotating sanitizer for $GITHUB_SHA -> $preset"
+
+      - name: Configure
+        run: cmake --preset ${{ steps.pick.outputs.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ steps.pick.outputs.preset }}
+
+      - name: Test (smoke label)
+        run: ctest --preset ${{ steps.pick.outputs.preset }} -L smoke
+
+  # ---------------------------------------------------------------------
+  # Nightly full-matrix job. Scheduled only; runs every dev-* preset
+  # in parallel. Failures here are not merge blockers but page the
+  # watchdog rotation (harness.md §H3.4).
+  # ---------------------------------------------------------------------
+  nightly:
+    name: nightly (${{ matrix.preset }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset:
+          - dev-debug
+          - dev-release
+          - dev-asan
+          - dev-ubsan
+          - dev-tsan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain + DPDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++-14 clang-18 \
+            pkg-config libdpdk-dev
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test (smoke label)
+        run: ctest --preset ${{ matrix.preset }} -L smoke

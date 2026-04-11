@@ -57,6 +57,16 @@ Every milestone's "done" criterion is the same:
 - CI runs one flavour per commit (rotating), and the full matrix
   nightly (`harness.md` §H3)
 
+The **fuzz preset is explicitly scoped out** of the per-cycle /
+per-commit gate. `harness.md` §H4.7 owns the fuzz short-run CI
+job separately: libFuzzer runs are minute-scale per target and
+would tank the rotating-per-commit path's latency budget. A
+fuzz regression is not a merge blocker — it pages the watchdog
+rotation asynchronously, same tier as nightly matrix failures.
+`.github/workflows/ci.yml` (landed M0 C6) therefore enumerates
+only the five `dev-*` flavours in both the rotating job and the
+nightly matrix; the fuzz preset lives in its own workflow file.
+
 Merging is blocked while any of the above is red. No exceptions
 for "this flavour is flaky" — fix the flake first.
 

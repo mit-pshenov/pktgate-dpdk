@@ -2151,14 +2151,17 @@ the test-architect brigade.
   `cmd_socket.test_allow_uids` as `unknown field` in release.
 
 *Last updated: 2026-04-11 (D31–D38 + full five-lawyer triage,
-single batch commit after the embarrassing D30 fix.)
-2026-04-11 later: D39/D40 + Q3/Q5/Q6/Q7/Q9 clarifications
-landed after the test-architect brigade.
-2026-04-11 even later: M0 C4 landed the live
-`scripts/check-counter-consistency.sh` (Pass 1 + Pass 3) and its
-first run against the repo caught §11 referencing
-`pktgate_port_link_up` as a gauge while §10.3 never listed it
-(classic D33 drift, exactly the class D31 had four weeks back).
-Fixed by adding the gauge to §10.3 under the port metrics. No new
-D-number — the drift predates C4 and was a doc oversight, not an
-architecture decision.*
+single batch commit after the embarrassing D30 fix; D39/D40 +
+Q3/Q5/Q6/Q7/Q9 clarifications landed later same day after the
+test-architect brigade.)*
+
+<!--
+  NOTE. Do not append per-cycle implementation notes here. This
+  file is the architectural-decision ledger (M1/M2 + D1..D40 +
+  Q-findings + P*); `git log` is the authoritative source for
+  "what landed in M0 Cx". Drift of this footer into a changelog
+  was caught and reverted in M0 C6. If a cycle surfaces a NEW
+  architectural decision, it gets a D-number and its own section
+  above — not a prose addendum here.
+-->
+

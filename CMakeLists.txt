@@ -1,16 +1,16 @@
 # pktgate-dpdk — root CMakeLists
 #
-# M0 Cycle 1 GREEN: minimal skeleton that makes
-# tests/smoke/test_build.cpp compile and pass under `dev-debug`.
+# Build system entry point. The C++ baseline (D2), warning wall
+# (D25), DPDK discovery (harness.md §H1) and the preset/fuzz gate
+# are all set up here. Per-milestone history lives in `git log`
+# and `implementation-plan.md`, not in this header — don't turn
+# this comment back into a cycle changelog.
 #
-# Scope grows per cycle, not per milestone:
-#   C1: this file + tests/smoke, dev-debug preset only.
-#   C2: five presets (dev-{release,debug,asan,ubsan,tsan}), sanitizer
-#       and warning modules.
-#   C3: pktgate_add_test helper + label taxonomy.
-#   C4: D33 counter-consistency script + ctest target.
-#   C5: Fuzz.cmake (libFuzzer, clang-only).
-#   C6: git hooks + CI workflow stub.
+# Modules (cmake/):
+#   Warnings.cmake    — -Wall -Wextra -Wpedantic -Werror -Wswitch-enum
+#   Sanitizers.cmake  — PKTGATE_SANITIZER={asan,ubsan,tsan,""} wiring
+#   Gtest.cmake       — pktgate_add_test / pktgate_add_placeholder_test
+#   Fuzz.cmake        — included only under PKTGATE_FUZZ=ON
 
 cmake_minimum_required(VERSION 3.22)
 project(pktgate_dpdk
