@@ -1675,6 +1675,106 @@ no new D-numbers.
   (no RSS, no multiqueue) — known and accepted, §12 already
   notes this.
 
-*Last updated: 2026-04-10 (third external review pass:
-L2CompoundEntry reorder, standby park mechanism, rcu_check
-timeout units note)*
+## Fourth review pass — five specialized lawyers (2026-04-11)
+
+Five narrow-lens reviewers run in parallel: DPDK API correctness,
+RCU/concurrency, protocol corner cases, performance/cache,
+threat model. The most thorough sweep so far. Full triage will
+land alongside D31–D38 in the next batch commit; this section
+covers the embarrassing finding that was prybitten immediately
+in its own commit (D30) plus the D36 spec it forced.
+
+### D30 — `rte_rcu_qsbr_check` correct usage (embarrassing fix)
+
+**Decision.** Replace the §9.2 reload check with the textbook
+DPDK QSBR pattern: `rte_rcu_qsbr_start()` returns a token; the
+writer polls `rte_rcu_qsbr_check(qs, token, wait=false)` against
+an explicit user-space TSC deadline. There is **no** built-in
+timeout argument to `rte_rcu_qsbr_check` or
+`rte_rcu_qsbr_synchronize` — the `t` parameter is the token,
+not a duration of any unit.
+
+**Why this is embarrassing.** The third external review pass
+(2026-04-10) asserted that DPDK 25.11 takes the timeout argument
+"as a TSC delta, not nanoseconds" and recommended converting
+via `(rte_get_tsc_hz() * 500) / 1000`. We accepted this without
+verifying it against `doc.dpdk.org/api-25.11/rte__rcu__qsbr_8h.html`
+and added an inline comment in §9.2 propagating the wrong claim.
+The DPDK API lawyer in this fourth pass pulled the actual API
+page and showed both claims were false. We turned a clean piece
+of pseudocode into a wrong piece of pseudocode by trusting an
+external reviewer's authority over our own API check.
+
+**Lesson.** External reviewers' factual claims about DPDK
+APIs MUST be cross-checked against `doc.dpdk.org/api-<version>/`
+before being applied. "Reviewer says X" is hearsay, not a fact.
+This is now a working rule in CLAUDE.md.
+
+**Mechanism.** §9.2 reload pseudocode now reads:
+```cpp
+const uint64_t token    = rte_rcu_qsbr_start(g_cp.qs);
+const uint64_t deadline = rte_rdtsc() + (rte_get_tsc_hz() / 2);
+int rc;
+while ((rc = rte_rcu_qsbr_check(g_cp.qs, token, false)) != 1) {
+    if (rte_rdtsc() > deadline) { /* timeout path */ break; }
+    rte_pause();
+}
+```
+
+**Coverage in design.md (D30):**
+- §9.2 — full pseudocode replaced; meta-explanation in comment
+- §9.4 corner case "Reload timeout" — D12 + D30 + D36 pattern
+- §9.3 latency table — `rcu_check (bounded poll vs deadline)`
+
+**Bundled API renames (same DPDK lawyer pass):**
+- §6.1 init: `rte_rcu_qsbr_create(N_workers)` → 3-step
+  `rte_rcu_qsbr_get_memsize` + `rte_zmalloc_socket` +
+  `rte_rcu_qsbr_init`. (`_create` does not exist.)
+- §7 RSS: `rte_eth_rss_hash_conf_set` → `rte_eth_dev_rss_hash_update`.
+- §5.3 IPv4 / IPv6 FIB lookup: `rte_fib_lookup` /
+  `rte_fib6_lookup` → `rte_fib_lookup_bulk(..., 1)` /
+  `rte_fib6_lookup_bulk(..., 1)`. (Single-entry public APIs do
+  not exist; only `_bulk` is exported.)
+- §5.6 cycle budget: `PKT_RX_FDIR` → `RTE_MBUF_F_RX_FDIR_ID`
+  (legacy spelling drift; modern flag in §5.2 was already correct).
+
+### D36 — `pending_free` queue for the reload-timeout path
+
+**Decision.** `ControlPlaneState` carries a bounded
+`pending_free[K_PENDING]` array (K_PENDING = 8 production target)
+plus `pending_free_n` count, both protected by `reload_mutex`
+(D35, next batch). On `rte_rcu_qsbr_check` deadline expiry the
+writer pushes `rs_old` onto the queue and returns `ReloadTimeout`.
+Every successful check that follows drains the entire queue —
+because a single successful check covers every publish that
+preceded its `start()` token. On overflow the timeout path
+intentionally leaks `rs_old` and bumps
+`reload_pending_full_total`; that condition means the dataplane
+is wedged and pages on-call.
+
+**Why bundled with D30.** The corrected §9.2 reload check needs
+*somewhere* to put `rs_old` on timeout. The previous text said
+"deferred pass keyed by the next successful synchronize" without
+specifying where the pointer was held — the concurrency lawyer
+flagged this as a leak. The fix and the queue are one feature;
+splitting them would leave the document inconsistent for one
+commit.
+
+**Coverage in design.md (D36):**
+- §4.5 ControlPlaneState — fields + helper functions
+- §9.2 reload pseudocode — `pending_free_push` on timeout,
+  `pending_free_drain` after every successful check
+- §9.3 latency table — pending_free drain row
+- §9.4 corner case "Reload timeout" — full lifecycle described
+- §10.3 metrics — `pktgate_reload_total{result="...|pending_full"}`
+  + `pktgate_reload_pending_free_depth` gauge
+
+**The remaining lawyer findings (D31–D35, D37, D38, plus a
+batch of MEDIUMs and LOWs)** land in the next commit alongside
+the full triage section. Stop-gap rationale for splitting:
+hygiene — the rcu_check / pending_free fix has to be visible
+in `git log` as a single self-contained "we acknowledge we
+were wrong" commit.
+
+*Last updated: 2026-04-11 (D30 + D36 — embarrassing fix from
+fourth review pass; remaining D31–D38 + full triage land next.)*

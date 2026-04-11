@@ -683,12 +683,62 @@ struct alignas(64) ControlPlaneState {
     alignas(64) _Atomic(const Ruleset*) g_active;
     RateLimitArena*                     rl_arena;
     rte_rcu_qsbr*                       qs;
+    int                                 cp_socket_id;
+
+    // D35: single reload-path mutex. ALL entry points that call
+    // deploy() (inotify, cmd_socket UDS reload verb, future push
+    // channels) acquire this around the whole compile / publish /
+    // GC pipeline. By construction g_active has exactly one writer
+    // at a time. (Spec'd in §9.2 + §10.7; field declared here.)
+    pthread_mutex_t                     reload_mutex;
+
+    // D36: deferred-free queue for the reload-timeout path. The
+    // bounded reload check in §9.2 cannot block forever, so on
+    // timeout we leave rs_new published and stash rs_old here for
+    // a later successful check to drain. Bounded depth K_PENDING:
+    // on overflow the next reload is refused (`reload_total{result=
+    // "pending_full"}`) and a watchdog alert fires — that condition
+    // means the dataplane is wedged, not a transient hiccup.
+    // Capacity at the production target: K_PENDING = 8 (each
+    // entry is one Ruleset pointer; the actual rulesets stay
+    // alive in their own NUMA-local heap until drain).
+    static constexpr size_t K_PENDING = 8;
+    const Ruleset*                      pending_free[K_PENDING];
+    size_t                              pending_free_n;
+
     // … control-thread state
 };
 
 // single process-wide instance
 ControlPlaneState g_cp;
 ```
+
+The `pending_free` queue is operated by two helpers used in §9.2:
+
+```cpp
+// Called under reload_mutex on the timeout path. Pushes the orphan
+// ruleset onto the FIFO. Caller checks the return; on overflow the
+// reload is refused.
+bool pending_free_push(ControlPlaneState* cp, const Ruleset* rs) {
+    if (cp->pending_free_n >= cp->K_PENDING) return false;
+    cp->pending_free[cp->pending_free_n++] = rs;
+    return true;
+}
+
+// Called under reload_mutex after any successful rte_rcu_qsbr_check.
+// That check covers every pointer published before its token, so
+// every queued ruleset is now safe to free.
+void pending_free_drain(ControlPlaneState* cp) {
+    for (size_t i = 0; i < cp->pending_free_n; ++i)
+        ruleset_destroy(cp->pending_free[i]);
+    cp->pending_free_n = 0;
+}
+```
+
+Drain is **all-or-nothing per call**: a successful check after a
+publish covers all earlier publishes too, so we never partially
+drain. The fallback (overflow → reload refused → operator alert) is
+the explicit "dataplane wedged" backstop, not a silent leak.
 
 There is exactly **one** `g_active` for the entire process. The hot
 path loads it once at the top of each burst with
@@ -962,9 +1012,14 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
         // Compound L3 rules (src+dst, or VRF+IP) carry secondary
         // constraints in the action descriptor for post-lookup
         // verification.
+        // D30: rte_fib does NOT export a single-entry public lookup;
+        // only rte_fib_lookup_bulk(fib, addrs, nh, n) exists. We pass
+        // n=1 here. D19 already noted that a true bulk-over-burst
+        // call is faster — that is the §5.1 batched-loop direction;
+        // the per-packet form below is the architectural default.
         uint32_t da = rte_be_to_cpu_32(ip->dst_addr);
         uint64_t nh = FIB_DEFAULT_NH;
-        rte_fib_lookup(rs->l3_v4, &da, &nh);
+        rte_fib_lookup_bulk(rs->l3_v4, &da, &nh, 1);
         if (nh != FIB_DEFAULT_NH &&
             l3_secondary_ok(rs, (uint16_t)nh, ip)) {
             dispatch_l3(rs, m, (uint16_t)nh);
@@ -975,7 +1030,7 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
         if (rs->l3_v4_src) {
             uint32_t sa = rte_be_to_cpu_32(ip->src_addr);
             nh = FIB_DEFAULT_NH;
-            rte_fib_lookup(rs->l3_v4_src, &sa, &nh);
+            rte_fib_lookup_bulk(rs->l3_v4_src, &sa, &nh, 1);
             if (nh != FIB_DEFAULT_NH &&
                 l3_secondary_ok(rs, (uint16_t)nh, ip)) {
                 dispatch_l3(rs, m, (uint16_t)nh);
@@ -1082,8 +1137,9 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
         dyn->parsed_l3_proto = nxt;        // P8/D20 first-proto-only + D27
         dyn->l4_extra        = l4_extra;    // consumed by §5.4
 
+        // D30: same single-vs-bulk note as IPv4 above. n=1 form.
         uint64_t nh = FIB6_DEFAULT_NH;
-        rte_fib6_lookup(rs->l3_v6, &ip6->dst_addr, &nh);
+        rte_fib6_lookup_bulk(rs->l3_v6, &ip6->dst_addr, &nh, 1);
         if (nh != FIB6_DEFAULT_NH &&
             l3_secondary_ok_v6(rs, (uint16_t)nh, ip6)) {
             dispatch_l3(rs, m, (uint16_t)nh);
@@ -1091,7 +1147,7 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
         }
         if (rs->l3_v6_src) {
             nh = FIB6_DEFAULT_NH;
-            rte_fib6_lookup(rs->l3_v6_src, &ip6->src_addr, &nh);
+            rte_fib6_lookup_bulk(rs->l3_v6_src, &ip6->src_addr, &nh, 1);
             if (nh != FIB6_DEFAULT_NH &&
                 l3_secondary_ok_v6(rs, (uint16_t)nh, ip6)) {
                 dispatch_l3(rs, m, (uint16_t)nh);
@@ -1409,7 +1465,7 @@ min / typical / max triple (not single best case).
 | RCU quiescent publish | 2 | 2 | 3 |
 | RX burst (amortized) | 10 | 15 | 20 |
 | Header prefetch | hidden | hidden | hidden |
-| D4 `PKT_RX_FDIR` branch | 3 | 3 | 3 |
+| D4 `RTE_MBUF_F_RX_FDIR_ID` branch | 3 | 3 | 3 |
 | L2 parse | 15 | 20 | 25 |
 | L2 hit (1 primary) | 30 | 40 | 50 |
 | L2 miss (src + dst + vlan + etype) | 80 | 95 | 110 |
@@ -1430,7 +1486,7 @@ L3 dst-prefix rule that terminates at L3:
 ```
 RCU quiescent          2
 RX burst amortized    15
-PKT_RX_FDIR branch     3
+RTE_MBUF_F_RX_FDIR_ID branch     3
 L2 parse              20
 L2 miss               95
 L3 IHL/frag check      5
@@ -1482,7 +1538,15 @@ main()
   ├─ allocate RateLimitArena from sizing.rate_limit_rules_max
   ├─ first parse + validate + compile of config file → Ruleset v0
   │     │ on failure → fatal exit, watchdog will retry
-  ├─ rte_rcu_qsbr_create(N_workers)
+  ├─ qsbr bring-up (D30):
+  │     sz   = rte_rcu_qsbr_get_memsize(N_workers);
+  │     mem  = rte_zmalloc_socket("qsbr", sz,
+  │                               RTE_CACHE_LINE_SIZE,
+  │                               g_cp.cp_socket_id);
+  │     g_cp.qs = (rte_rcu_qsbr*)mem;
+  │     rte_rcu_qsbr_init(g_cp.qs, N_workers);
+  │     (DPDK 25.11 has no rte_rcu_qsbr_create — bring-up is the
+  │      get_memsize / zmalloc_socket / init three-step.)
   ├─ atomic_store(&g_cp.g_active, ruleset_v0, RELEASE)
   ├─ if --standby: skip remote_launch of workers; enter park loop
   │              **Park mechanism (decision):** ports are
@@ -1606,7 +1670,10 @@ of the same flow land on the same lcore — the architecture relies on
 this for per-flow rate-limit variants (§14) and for consistent
 per-lcore counter locality. The canonical symmetric Toeplitz key is
 the 40-byte repeating `0x6D5A` pattern (Woo & Park 2012 / RSS++
-reference), programmed via `rte_eth_rss_hash_conf_set` at port init;
+reference), programmed via `rte_eth_dev_rss_hash_update` at port init
+(D30: the previous `rte_eth_rss_hash_conf_set` spelling does not exist
+in DPDK 25.11 — `_dev_rss_hash_update` is the setter, paired with
+`_dev_rss_hash_conf_get` for the read side);
 it makes the Toeplitz function symmetric under src↔dst swap for the
 standard IPv4/IPv6 5-tuple inputs. On NICs that do not expose
 Toeplitz (e.g. the dev VM's e1000), the dataplane degrades to
@@ -1750,24 +1817,48 @@ expected<void> deploy(std::string path) {
         &g_cp.g_active, rs_new.release(), memory_order_acq_rel);
 
     // Wait for all workers to pass quiescent state.
-    // Prefer bounded check + timeout over unbounded synchronize,
-    // so a stuck worker does not hang reload forever. The watchdog
-    // is the ultimate backstop for stuck workers (D12).
-    // Note: DPDK 25.11 takes the timeout argument as a TSC delta,
-    // not nanoseconds. The constant `500_ms` here is the literal
-    // pseudocode form; the implementation converts via
-    // `(rte_get_tsc_hz() * 500) / 1000`. The third arg `wait=true`
-    // makes the call block (rather than return 0) until either
-    // every registered reader has reported quiescent at least once
-    // post-publish or the TSC deadline elapses.
-    if (rte_rcu_qsbr_check(g_cp.qs, /*timeout=*/500_ms, true) != 1) {
-        metric_inc(reload_timeout_total);
-        // Leave rs_new published (it is now the active ruleset; it
-        // just could not confirm old-reader drain in time). Free
-        // rs_old via a later deferred pass keyed by the next
-        // successful synchronize. Return reload_timeout to caller.
-        return tl::unexpected(Err::ReloadTimeout);
+    // Prefer bounded check + explicit deadline over unbounded
+    // synchronize, so a stuck worker does not hang reload forever.
+    // The watchdog is the ultimate backstop for stuck workers (D12).
+    //
+    // **D30 — correct rte_rcu_qsbr_check usage.** The `t` parameter
+    // is NOT a timeout — it is a token returned by
+    // rte_rcu_qsbr_start() that names the epoch the writer wants
+    // confirmed quiescent. There is no built-in timeout on
+    // rte_rcu_qsbr_check or rte_rcu_qsbr_synchronize. We get a
+    // bounded wait by polling rte_rcu_qsbr_check(..., wait=false)
+    // against an explicit TSC deadline tracked in user space.
+    // (A previous revision of this section misread the API and
+    // claimed `t` was a TSC-delta timeout. It is not. See D30 in
+    // review-notes.md for the meta-finding.)
+    const uint64_t token    = rte_rcu_qsbr_start(g_cp.qs);
+    const uint64_t deadline = rte_rdtsc()
+                            + (rte_get_tsc_hz() / 2);  // 500 ms
+    int rc;
+    while ((rc = rte_rcu_qsbr_check(g_cp.qs, token, /*wait=*/false))
+           != 1) {
+        if (rte_rdtsc() > deadline) {
+            metric_inc(reload_timeout_total);
+            // Leave rs_new published (it is now the active ruleset;
+            // it just could not confirm old-reader drain in time).
+            // rs_old goes onto g_cp.pending_free for the next
+            // successful check to drain (see D36 / §4.5).
+            if (!pending_free_push(&g_cp, rs_old)) {
+                // Queue full → dataplane wedged. Refuse the timeout
+                // path entirely (rs_new stays published, rs_old is
+                // intentionally leaked to memory). Operator alert
+                // fires; this is a "stop the world, page on-call"
+                // condition, not a transient hiccup.
+                metric_inc(reload_pending_full_total);
+            }
+            return tl::unexpected(Err::ReloadTimeout);
+        }
+        rte_pause();
     }
+    // Drain any prior reload-timeouts whose epoch is now safely
+    // past quiescent (D36). The current successful check covers
+    // every pointer that was published before `token`.
+    pending_free_drain(&g_cp);
 
     // --- Arena GC diff (D11) ---
     // After synchronize, no worker can be holding rs_old.
@@ -1802,7 +1893,8 @@ expected<void> deploy(std::string path) {
 | compile objects + rules | < 10 ms |
 | ruleset_build (FIB inserts dominate) | 10–50 ms |
 | atomic exchange | < 1 µs |
-| rcu_check (bounded) | < 1 ms typical, 500 ms worst case |
+| rcu_check (bounded poll vs deadline) | < 1 ms typical, 500 ms worst case |
+| pending_free drain (D36, only if prior timeout) | < 1 ms |
 | arena GC (row frees) | < 1 ms |
 | destroy old ruleset | < 5 ms |
 
@@ -1850,11 +1942,20 @@ the customer-visible SLO.
   starts fresh (its slot was freed in step 5 above; the next
   allocation zero-initializes the row). Documented in §3a.2 and the
   operator CONFIG doc.
-- **Reload timeout** (D12): `rcu_check + 500 ms` returns
-  `reload_timeout` error; the new ruleset remains active (it has
-  already been exchanged in), but the old ruleset free is deferred.
-  Repeated timeouts indicate a stuck worker and are the watchdog's
-  job to resolve (watchdog is the backstop).
+- **Reload timeout** (D12 + D30 + D36): the bounded rcu check
+  loop in §9.2 polls `rte_rcu_qsbr_check(qs, token, wait=false)`
+  against an explicit 500 ms TSC deadline. On expiry: `rs_new`
+  remains active (it was already exchanged in), `rs_old` goes
+  onto `g_cp.pending_free` (D36), `reload_timeout_total` is bumped,
+  and the function returns `Err::ReloadTimeout` to the caller.
+  The next reload that achieves a successful check drains the
+  whole pending queue (one successful check covers every
+  publish that preceded its `start()` token). On `pending_free`
+  overflow (queue depth > `K_PENDING = 8`) the timeout path
+  bumps `reload_pending_full_total` and intentionally leaks
+  `rs_old` — that condition is "dataplane wedged, page on-call",
+  not a transient hiccup. Repeated timeouts also feed the
+  watchdog as the backstop for stuck workers.
 
 ### 9.5 Hardware offload publish (D4)
 
@@ -1958,8 +2059,9 @@ pktgate_lcore_dispatch_unreachable_total{lcore}                   counter
 pktgate_redirect_dropped_total{lcore,port}                        counter
 pktgate_mirror_dropped_total{lcore,port}                          counter
 
-pktgate_reload_total{result="success|parse_err|validate_err|compile_err|oom|timeout"} counter
+pktgate_reload_total{result="success|parse_err|validate_err|compile_err|oom|timeout|pending_full"} counter
 pktgate_reload_latency_seconds                                    histogram
+pktgate_reload_pending_free_depth                                 gauge   # D36
 pktgate_active_generation                                         gauge
 pktgate_active_rules{layer}                                       gauge
 
