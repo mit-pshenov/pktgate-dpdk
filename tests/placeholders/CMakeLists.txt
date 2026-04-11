@@ -7,7 +7,8 @@
 #
 # Lifecycle — each placeholder dies at a specific milestone:
 #
-#   placeholder.unit      -> deleted when M1 lands U1.* real unit tests
+#   placeholder.unit      -> DELETED in M1 C1 (real U1.1/U1.2/U1.3 cover
+#                            the `unit` label via tests/unit/test_parser.cpp)
 #   placeholder.corner    -> deleted when M4 lands the first C1.* case
 #   placeholder.reload    -> deleted when M8 lands the first reload test
 #   placeholder.security  -> deleted when M11 lands D38 auth tests
@@ -18,7 +19,6 @@
 # sure the label is still required (it should be — required set is a
 # contract, not a placeholder-driven list).
 
-pktgate_add_placeholder_test(NAME placeholder.unit     LABELS unit)
 pktgate_add_placeholder_test(NAME placeholder.corner   LABELS corner)
 pktgate_add_placeholder_test(NAME placeholder.reload   LABELS reload)
 pktgate_add_placeholder_test(NAME placeholder.security LABELS security)

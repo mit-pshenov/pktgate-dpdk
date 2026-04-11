@@ -95,13 +95,43 @@ endfunction()
 
 _pktgate_strip_missing_include_dirs(PkgConfig::DPDK)
 
+# ---- nlohmann_json (M1 C1) ----------------------------------------------
+#
+# The config parser uses nlohmann::json — small, header-only, already
+# packaged on the dev VM (json-devel) and available via pkg-config as
+# `nlohmann_json`. Keep the dependency import minimal: one
+# IMPORTED_TARGET that libpktgate_core links against PUBLIC so every
+# translation unit that includes src/config/parser.cpp gets the headers.
+pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json)
+
+# ---- libpktgate_core (M1) -----------------------------------------------
+#
+# Pure C++ static library that the product binary, every unit test, and
+# (later) the fuzz harnesses all link against. No DPDK includes — kept
+# deliberately DPDK-free so unit tests run under the dev-* presets
+# without EAL init. The runtime / dataplane modules (M3+) live in a
+# separate library, added alongside this one when they land.
+#
+# Source list grows one file per M1 cycle: C1 seeds parser.cpp; C6
+# adds sizing.cpp; C7 adds validator.cpp; etc. Keep it explicit (no
+# glob) so a missing file is a configure error, not a silent drop.
+if(NOT PKTGATE_FUZZ)
+  add_library(pktgate_core STATIC
+    src/config/parser.cpp
+  )
+  target_include_directories(pktgate_core PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)
+  pktgate_apply_warnings(pktgate_core)
+  pktgate_apply_sanitizer(pktgate_core)
+endif()
+
 # ---- Product binary (empty in M0; main{return 0;}) ----------------------
 #
 # Skipped under PKTGATE_FUZZ — the fuzz preset does not ship a product
 # binary, and linking main() next to LLVMFuzzerTestOneInput would fail.
 if(NOT PKTGATE_FUZZ)
   add_executable(pktgate_dpdk src/main.cpp)
-  target_link_libraries(pktgate_dpdk PRIVATE PkgConfig::DPDK)
+  target_link_libraries(pktgate_dpdk PRIVATE PkgConfig::DPDK pktgate_core)
   pktgate_apply_warnings(pktgate_dpdk)
   pktgate_apply_sanitizer(pktgate_dpdk)
 endif()
