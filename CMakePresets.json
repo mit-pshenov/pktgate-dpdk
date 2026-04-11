@@ -13,27 +13,129 @@
       }
     },
     {
-      "name": "dev-debug",
+      "name": "base-gcc",
+      "hidden": true,
       "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "base-clang",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+
+    {
+      "name": "dev-debug",
+      "inherits": "base-gcc",
       "displayName": "dev-debug (gcc, -O0 -g3)",
-      "description": "Fast iteration loop. No sanitizers. harness.md §H2.2.",
+      "description": "Fast iteration loop, no sanitizers. harness.md §H2.2.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_CXX_FLAGS": "-O0 -g3 -fno-omit-frame-pointer"
+        "CMAKE_CXX_FLAGS":  "-O0 -g3 -fno-omit-frame-pointer",
+        "PKTGATE_PRESET_NAME": "dev-debug",
+        "PKTGATE_SANITIZER":   ""
+      }
+    },
+    {
+      "name": "dev-release",
+      "inherits": "base-gcc",
+      "displayName": "dev-release (gcc, -O3, NDEBUG)",
+      "description": "Release build for perf microbench. harness.md §H2.3.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS":  "-O3 -march=native -DNDEBUG",
+        "PKTGATE_PRESET_NAME": "dev-release",
+        "PKTGATE_SANITIZER":   ""
+      }
+    },
+    {
+      "name": "dev-asan",
+      "inherits": "base-clang",
+      "displayName": "dev-asan (clang, addr+ub)",
+      "description": "Combined ASan+UBSan. harness.md §H2.4.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS":  "-O1 -g -fno-omit-frame-pointer",
+        "PKTGATE_PRESET_NAME": "dev-asan",
+        "PKTGATE_SANITIZER":   "asan"
+      }
+    },
+    {
+      "name": "dev-ubsan",
+      "inherits": "base-clang",
+      "displayName": "dev-ubsan (clang, ub only)",
+      "description": "UBSan alone. harness.md §H2.6.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS":  "-O1 -g -fno-omit-frame-pointer",
+        "PKTGATE_PRESET_NAME": "dev-ubsan",
+        "PKTGATE_SANITIZER":   "ubsan"
+      }
+    },
+    {
+      "name": "dev-tsan",
+      "inherits": "base-clang",
+      "displayName": "dev-tsan (clang, thread)",
+      "description": "ThreadSanitizer. harness.md §H2.5 / §H5.2.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS":  "-O1 -g -fno-omit-frame-pointer",
+        "PKTGATE_PRESET_NAME": "dev-tsan",
+        "PKTGATE_SANITIZER":   "tsan"
       }
     }
   ],
 
   "buildPresets": [
-    { "name": "dev-debug", "configurePreset": "dev-debug" }
+    { "name": "dev-debug",   "configurePreset": "dev-debug" },
+    { "name": "dev-release", "configurePreset": "dev-release" },
+    { "name": "dev-asan",    "configurePreset": "dev-asan" },
+    { "name": "dev-ubsan",   "configurePreset": "dev-ubsan" },
+    { "name": "dev-tsan",    "configurePreset": "dev-tsan" }
   ],
 
   "testPresets": [
     {
       "name": "dev-debug",
       "configurePreset": "dev-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-release",
+      "configurePreset": "dev-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-asan",
+      "configurePreset": "dev-asan",
       "output": { "outputOnFailure": true },
-      "execution": { "stopOnFailure": false }
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:symbolize=1:print_stacktrace=1",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:symbolize=1",
+        "LSAN_OPTIONS": "suppressions=${sourceDir}/tests/lsan.supp"
+      }
+    },
+    {
+      "name": "dev-ubsan",
+      "configurePreset": "dev-ubsan",
+      "output": { "outputOnFailure": true },
+      "environment": {
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:symbolize=1"
+      }
+    },
+    {
+      "name": "dev-tsan",
+      "configurePreset": "dev-tsan",
+      "output": { "outputOnFailure": true },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7",
+        "TSAN_SUPPRESSIONS": "${sourceDir}/tests/tsan.supp"
+      }
     }
   ]
 }

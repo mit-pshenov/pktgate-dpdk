@@ -1,0 +1,7 @@
+# tests/lsan.supp — LeakSanitizer suppressions
+#
+# Intentionally empty in M0. EAL-internal lifetime-of-process allocations
+# are not yet in scope — src/main.cpp returns 0 without calling into
+# rte_eal_init. Populated starting M3 when EAL goes live and LSan picks
+# up its static allocations; suppressions must be pinned to specific
+# rte_* symbols, never blanket-wildcarded, per harness.md §H2.4.

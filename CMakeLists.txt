@@ -18,6 +18,10 @@ project(pktgate_dpdk
   LANGUAGES CXX
 )
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(Warnings)
+include(Sanitizers)
+
 # ---- C++ baseline (D2) ---------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +33,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # -fPIC everywhere. Required by the tsan preset (harness.md §H5.3); doing
 # it globally from the start avoids a future link-time surprise.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Every preset bakes PKTGATE_PRESET so tests/smoke/test_presets.cpp can
+# cross-check the preset name against the compiler's view of sanitizer
+# reality. Fallback for the manual `cmake ..` case without a preset.
+if(NOT DEFINED PKTGATE_PRESET_NAME)
+  set(PKTGATE_PRESET_NAME "dev-debug")
+endif()
+add_compile_definitions(PKTGATE_PRESET=${PKTGATE_PRESET_NAME})
 
 # ---- Locate DPDK via pkg-config (harness.md §H1, M0 checklist §5) --------
 #
@@ -68,6 +80,8 @@ _pktgate_strip_missing_include_dirs(PkgConfig::DPDK)
 # ---- Product binary (empty in M0; main{return 0;}) ----------------------
 add_executable(pktgate_dpdk src/main.cpp)
 target_link_libraries(pktgate_dpdk PRIVATE PkgConfig::DPDK)
+pktgate_apply_warnings(pktgate_dpdk)
+pktgate_apply_sanitizer(pktgate_dpdk)
 
 # ---- Tests ---------------------------------------------------------------
 #

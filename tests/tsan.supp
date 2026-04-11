@@ -1,0 +1,8 @@
+# tests/tsan.supp — ThreadSanitizer suppressions
+#
+# Intentionally empty in M0. DPDK-internal synchronization primitives
+# (rte_rwlock, rte_mcslock, rte_rcu_qsbr) will trigger TSan reports
+# once we actually invoke them — see harness.md §H5.2. Populated
+# starting M3+ when EAL comes up on worker lcores. Only DPDK-internal
+# symbols are permitted in here; any pktgate-owned code that TSan
+# flags is a real bug, not a suppression target.

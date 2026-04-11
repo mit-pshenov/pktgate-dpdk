@@ -290,7 +290,7 @@ flavors coexist without rebuilds stepping on each other.
   to release semantics. Must NOT be used for correctness tests —
   UBSAN-level bugs are invisible at `-O3`.
 
-### H2.4 — `asan` (clang)
+### H2.4 — `dev-asan` (clang)
 
 - Toolchain: clang (`CC=clang CXX=clang++`)
 - `-O1 -g -fno-omit-frame-pointer`
@@ -306,7 +306,7 @@ flavors coexist without rebuilds stepping on each other.
   verify on dev VM and pin the suppressions to specific symbols)
 - Label: `asan-safe` — tests that don't trip H5.1 gotchas
 
-### H2.5 — `tsan` (clang)
+### H2.5 — `dev-tsan` (clang)
 
 - Toolchain: clang
 - `-O1 -g -fno-omit-frame-pointer -fPIE -pie`
@@ -323,7 +323,7 @@ flavors coexist without rebuilds stepping on each other.
   invariant.
 - Label: `tsan-safe`
 
-### H2.6 — `ubsan` (clang)
+### H2.6 — `dev-ubsan` (clang)
 
 - `-O1 -g -fno-omit-frame-pointer`
 - `-fsanitize=undefined`
@@ -419,9 +419,9 @@ flavors coexist without rebuilds stepping on each other.
 |---|---|---|---|---|---|
 | dev-debug | gcc (default) | -O0 | none | no | dev only |
 | dev-release | gcc (default) | -O3 | none | no | perf dev bench |
-| asan | clang | -O1 | addr+ub | no | `ci-asan` |
-| tsan | clang | -O1 | thread | no | `ci-tsan` |
-| ubsan | clang | -O1 | ub | no | `ci-ubsan` |
+| dev-asan | clang | -O1 | addr+ub | no | `ci-asan` |
+| dev-tsan | clang | -O1 | thread | no | `ci-tsan` |
+| dev-ubsan | clang | -O1 | ub | no | `ci-ubsan` |
 | msan | clang | -O1 | memory | no | manual |
 | coverage | gcc | -O0 | none | yes | `ci-coverage` |
 | fuzz | clang | -O1 | fuzz+addr+ub | no | `ci-fuzz-*` |
@@ -539,8 +539,8 @@ job assumes the code compiles under both toolchains.
 
 - **Trigger**: PR, push
 - **Duration budget**: 15 min
-- **Command**: `cmake --preset asan && cmake --build build/asan -j
-  && ctest --preset asan -L 'unit|functional|corner|asan-safe'
+- **Command**: `cmake --preset dev-asan && cmake --build build/dev-asan -j
+  && ctest --preset dev-asan -L 'unit|functional|corner|asan-safe'
   --output-on-failure`
 - **Pass criterion**: no ASAN report, no UBSAN report, all tests
   green. `ASAN_OPTIONS=halt_on_error=1` means the first finding
@@ -553,7 +553,7 @@ job assumes the code compiles under both toolchains.
 - **Trigger**: push (not every PR — TSAN is slower and D35/D9 are
   the main regressions we watch)
 - **Duration budget**: 20 min
-- **Command**: `cmake --preset tsan ... && ctest --preset tsan -L
+- **Command**: `cmake --preset dev-tsan ... && ctest --preset dev-tsan -L
   'unit|functional|tsan-safe' --output-on-failure`
 - **Pass criterion**: no TSAN report on any worker / reload / ctl
   path. Suppressions are allowed only against DPDK-internal symbols.
@@ -567,7 +567,7 @@ job assumes the code compiles under both toolchains.
 
 - **Trigger**: PR, push
 - **Duration budget**: 15 min
-- **Command**: `cmake --preset ubsan ... && ctest --preset ubsan -L
+- **Command**: `cmake --preset dev-ubsan ... && ctest --preset dev-ubsan -L
   'unit|functional|corner|ubsan-safe' --output-on-failure`
 - **Pass criterion**: no UBSAN report, all tests green
 - **Load-bearing gates**: D22 alignment tests (misaligned read of
@@ -627,7 +627,7 @@ job assumes the code compiles under both toolchains.
 
 - **Trigger**: nightly, manual
 - **Duration budget**: 45 min
-- **Command**: `cmake --preset asan && ctest --preset asan -L
+- **Command**: `cmake --preset dev-asan && ctest --preset dev-asan -L
   'chaos&&asan-safe' --output-on-failure --timeout 2400`
   (chaos runs under ASAN to catch use-after-free on the reload
   race; the asan-safe subset excludes anything that trips H5.1)
@@ -954,17 +954,17 @@ One entry point for all local test invocations. Subcommands:
   ~10 s.
 - `dev-test.sh functional` → `dev-debug`, `ctest -L functional`.
   Several minutes.
-- `dev-test.sh asan [label]` → `asan` preset; label defaults to
+- `dev-test.sh asan [label]` → `dev-asan` preset; label defaults to
   `'unit|functional|asan-safe'`, can be narrowed.
-- `dev-test.sh tsan [label]` → `tsan` preset; same.
-- `dev-test.sh ubsan [label]` → `ubsan` preset; same.
+- `dev-test.sh tsan [label]` → `dev-tsan` preset; same.
+- `dev-test.sh ubsan [label]` → `dev-ubsan` preset; same.
 - `dev-test.sh coverage` → `coverage` preset, full run, opens HTML.
 - `dev-test.sh fuzz <target> [duration]` → e.g.
   `dev-test.sh fuzz parser 5m`. Parses human duration
   (`30s`, `5m`, `1h`) into libFuzzer `-max_total_time`.
 - `dev-test.sh perf [test-regex]` → `dev-release`, perf-dev label,
   optional regex filter.
-- `dev-test.sh chaos [label]` → `asan` preset (same as CI),
+- `dev-test.sh chaos [label]` → `dev-asan` preset (same as CI),
   chaos label.
 - `dev-test.sh clean` → `rm -rf build/`.
 
@@ -989,7 +989,7 @@ cycle-per-packet and IPC. Not for gating, for local exploration.
 
 ### H8.3 — `scripts/dev-fuzz-replay.sh <target> <crash-file>`
 
-Replay a single saved crash artifact against a target under `asan`
+Replay a single saved crash artifact against a target under `dev-asan`
 preset (not fuzz preset — no libFuzzer runtime needed). Prints the
 faulting stack. Used when a nightly fuzz run drops a crash and the
 developer needs to reproduce.
@@ -1171,7 +1171,7 @@ and this document is the operational contract — a typo here wastes
     },
 
     {
-      "name": "asan",
+      "name": "dev-asan",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
@@ -1183,7 +1183,7 @@ and this document is the operational contract — a typo here wastes
     },
 
     {
-      "name": "tsan",
+      "name": "dev-tsan",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
@@ -1195,7 +1195,7 @@ and this document is the operational contract — a typo here wastes
     },
 
     {
-      "name": "ubsan",
+      "name": "dev-ubsan",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
@@ -1266,9 +1266,9 @@ and this document is the operational contract — a typo here wastes
   "buildPresets": [
     { "name": "dev-debug",   "configurePreset": "dev-debug" },
     { "name": "dev-release", "configurePreset": "dev-release" },
-    { "name": "asan",        "configurePreset": "asan" },
-    { "name": "tsan",        "configurePreset": "tsan" },
-    { "name": "ubsan",       "configurePreset": "ubsan" },
+    { "name": "dev-asan",    "configurePreset": "dev-asan" },
+    { "name": "dev-tsan",    "configurePreset": "dev-tsan" },
+    { "name": "dev-ubsan",   "configurePreset": "dev-ubsan" },
     { "name": "msan",        "configurePreset": "msan" },
     { "name": "coverage",    "configurePreset": "coverage" },
     { "name": "fuzz",        "configurePreset": "fuzz" },
@@ -1282,7 +1282,7 @@ and this document is the operational contract — a typo here wastes
       "output": { "outputOnFailure": true }
     },
     {
-      "name": "asan", "configurePreset": "asan",
+      "name": "dev-asan", "configurePreset": "dev-asan",
       "environment": {
         "ASAN_OPTIONS": "halt_on_error=1:abort_on_error=1:symbolize=1:print_stacktrace=1:detect_leaks=1",
         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:symbolize=1",
@@ -1291,14 +1291,14 @@ and this document is the operational contract — a typo here wastes
       "output": { "outputOnFailure": true }
     },
     {
-      "name": "tsan", "configurePreset": "tsan",
+      "name": "dev-tsan", "configurePreset": "dev-tsan",
       "environment": {
         "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7:suppressions=${sourceDir}/tests/tsan.supp"
       },
       "output": { "outputOnFailure": true }
     },
     {
-      "name": "ubsan", "configurePreset": "ubsan",
+      "name": "dev-ubsan", "configurePreset": "dev-ubsan",
       "environment": {
         "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:symbolize=1"
       },
