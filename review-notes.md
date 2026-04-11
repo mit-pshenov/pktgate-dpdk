@@ -2025,5 +2025,132 @@ factual claims about DPDK APIs MUST be cross-checked against
 Hearsay ≠ fact. The five-lawyer sweep is the antidote: independent
 lawyers with different perspectives catch each other's errors.
 
+### D39 — Headers-in-first-seg invariant (test-architect finding)
+
+**Decision.** Every classifier stage (`classify_l2` / `classify_l3`
+/ `classify_l4`) requires `m->nb_segs == 1` at entry. Port init
+enforces this invariant in two steps:
+
+1. `rxmode.offloads & RTE_ETH_RX_OFFLOAD_SCATTER == 0` on every
+   port at configure time.
+2. The startup validator rejects any port where
+   `(port.max_rx_pkt_len + RTE_PKTMBUF_HEADROOM) > (mempool.elt_size
+   − sizeof(rte_mbuf))` — i.e. a frame that cannot fit in one
+   mempool element. Reason string: `multiseg_rx_unsupported`.
+
+`classify_l2` debug-asserts `m->nb_segs == 1`; release builds
+route an observed multi-seg mbuf to `TERMINAL_DROP` and bump a
+dedicated `pkt_multiseg_drop_total` per-lcore counter so the
+anomaly is visible (the counter should stay at zero forever; any
+non-zero value is investigative).
+
+**Why.** The corner-case architect agent discovered that D31
+length guards check `m->pkt_len` (whole chain) but the classifier
+stages use `rte_pktmbuf_mtod[_offset]` which linear-reads the
+**first segment only**. A chained mbuf with a header straddling a
+segment boundary would pass the guard and then read undefined
+memory past the first segment's data area. `design.md` nowhere
+documented a single-seg assumption, so this was a latent UB
+waiting to fire on any driver that ever delivers a chain (scatter
+RX, jumbo frames, some PMDs on DMA re-assembly).
+
+**Alternatives considered.** (a) enforce `nb_segs == 1` at port
+init — chosen, cheapest; (b) replace all header reads with
+`rte_pktmbuf_read` — slower, more code, no benefit under M1; (c)
+document "no jumbo" informally — rejected, not mechanically
+enforced. Phase 2 may revisit (b) if jumbo becomes a real
+requirement.
+
+**Coverage in design.md (D39):**
+- §4.3 LcoreStats — `pkt_multiseg_drop_total` bullet
+- §5.1 preamble — "Headers-in-first-seg invariant" paragraph
+- §5.2 classify_l2 — `RTE_ASSERT(m->nb_segs == 1)` + release fallback
+- §6.1 port_init — validator rejects `multiseg_rx_unsupported`,
+  scatter offload flag is enforced off
+- §10.3 metrics — `pktgate_lcore_pkt_multiseg_drop_total{lcore}`
+
+### D40 — IPv4 fragment-skip and fragment-drop counters
+
+**Decision.** Two new per-lcore counters restore telemetry
+symmetry between IPv4 and IPv6 fragment handling:
+
+- `pkt_frag_skipped_total{af="v4|v6"}` — fragment non-first whose
+  L4 stage was skipped under `fragment_policy=l3_only`. For IPv6,
+  the existing `l4_skipped_ipv6_fragment_nonfirst` counter is
+  **retained** as a named backwards-compat alias and bumped at the
+  same site — both counters increment together.
+- `pkt_frag_dropped_total{policy="drop",af="v4|v6"}` — fragment
+  drop under `fragment_policy=drop`. The `policy` label is kept
+  for forward compatibility with any future `quarantine` mode.
+
+**Why.** The corner-case architect agent noted two observability
+gaps exposed by the test matrix:
+
+1. IPv4 non-first fragment under `l3_only` went silently through
+   `SKIP_L4` with no counter, while IPv6 had D27's
+   `l4_skipped_ipv6_fragment_nonfirst`. An operator staring at
+   metrics could see IPv6 skips but was blind to v4 skips.
+2. `fragment_policy=drop` had no dedicated drop counter at all —
+   all drops ended up in `rule_matches_total{action=drop}` (where
+   they were indistinguishable from explicit policy drops). A
+   fragment storm under `drop` policy would look like a normal
+   rate increase.
+
+Adding two per-lcore counters is cheap (8 B × lcores × label
+cardinality) and closes both gaps.
+
+**Coverage in design.md (D40):**
+- §4.3 LcoreStats — `pkt_frag_skipped_total`,
+  `pkt_frag_dropped_total` bullets
+- §5.3 IPv4 branch — `FRAG_DROP` and `FRAG_L3_ONLY/is_nonfirst`
+  arms bump the counters
+- §5.3 IPv6 fragment ext branch — `FRAG_DROP` and
+  `FRAG_L3_ONLY/non-first` arms bump the counters; IPv6 skip
+  bumps the D27 alias AND the D40 symmetric family-keyed counter
+  at the same site
+- §10.3 metrics — `pktgate_lcore_pkt_frag_skipped_total{lcore,af}`,
+  `pktgate_lcore_pkt_frag_dropped_total{lcore,policy,af}`
+
+### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
+
+Not standalone decisions; one-paragraph prose fixes surfaced by
+the test-architect brigade.
+
+- **Q3 (§5.2 QinQ inner-garbage)** — added prose after §5.2 code
+  block: when the outer tag is consumed and the inner ethertype
+  is neither another VLAN TPID nor a recognised L3 ethertype, the
+  packet proceeds to §5.3 with `parsed_ethertype=<inner value>`
+  and falls through both branches to `TERMINAL_PASS`, handed to
+  §5.5 default-behaviour. **No new counter** — `qinq_outer_only_
+  total` only fires when the inner *is* another VLAN TPID, so
+  the signal remains a clean demand signal for full QinQ.
+- **Q5 (`reload_pending_full_total` cadence)** — specified as
+  once-per-overflow: the counter is incremented exactly once per
+  reload attempt that hits an already-full queue; the caller must
+  not retry until the queue drains. Alerting rule is
+  `rate(...[5m]) > 0`, not level. Added to §9.2 inline comment.
+- **Q6 (SO_PEERCRED single accept-time check)** — §10.7 prose
+  clarified: `SO_PEERCRED` is enforced exactly once at `accept(2)`
+  time. There is no per-verb re-check; the ucred is pinned by the
+  kernel at accept and cannot be spoofed thereafter. The "mutating
+  verbs additionally require" wording collapses into "must be
+  allow-listed at accept" — same check, enforced once. Read-only
+  and mutating verbs run under the same gate.
+- **Q7 (idle handler stays RCU-online)** — §5.1 reinforcement:
+  the existing "crucially it does NOT call
+  `rte_rcu_qsbr_thread_offline`" sentence was strengthened to
+  "this is **explicitly** the required behaviour — reload progress
+  during idle windows depends on it" and references D12/D30
+  bounded-sync.
+- **Q9 (`PKTGATE_TESTING` + `pktgate_test2`)** — §13 adds a new
+  build flavour documenting the test hooks (deterministic RNG,
+  mempool shrink knob, classify fault injection, SO_PEERCRED
+  bypass for test UIDs) and the companion system user used to
+  exercise D38 peer-differentiation. Release builds `static_assert`
+  the flag is undefined; the validator rejects
+  `cmd_socket.test_allow_uids` as `unknown field` in release.
+
 *Last updated: 2026-04-11 (D31–D38 + full five-lawyer triage,
-single batch commit after the embarrassing D30 fix.)*
+single batch commit after the embarrassing D30 fix.)
+2026-04-11 later: D39/D40 + Q3/Q5/Q6/Q7/Q9 clarifications
+landed after the test-architect brigade.*

@@ -138,6 +138,14 @@ capability bits, queue count):
 | **D36** | `pending_free` queue для reload-timeout path | Принят (bundled с D30), 4-й ревью |
 | **D37** | Validator memory-budget pre-flight + per-rule expansion ceiling | Принят, 4-й ревью |
 | **D38** | SO_PEERCRED на UDS + IN_CLOSE_WRITE-only inotify | Принят, 4-й ревью |
+| **D39** | Headers-in-first-seg invariant (`nb_segs==1` + scatter-off + mempool-fit validator) | Принят, test-architect brigade (C6.14) |
+| **D40** | IPv4 fragment-skip/drop counters + IPv6 symmetric `pkt_frag_*` family | Принят, test-architect brigade |
+
+## Q-findings (test-architect → closed)
+
+Q3/Q5/Q6/Q7/Q9 закрыты как prose clarifications в design.md
+одним batch'ем с D39/D40. Подробности в review-notes.md
+под заголовками «Q3 / Q5 / Q6 / Q7 / Q9».
 
 ## Pending (требуют решения пользователя)
 

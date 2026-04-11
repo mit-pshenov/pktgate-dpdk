@@ -586,6 +586,24 @@ Additional per-lcore counters (`LcoreStats`):
   `pkt_truncated_total[l2_vlan]` (which counts truncations under
   the QinQ outer header). Helps operators decide whether to ship
   full QinQ matching in a future phase.
+- `pkt_multiseg_drop_total` — D39, a multi-segment mbuf reached
+  `classify_l2` despite the port-init guarantee that RX scatter
+  is disabled. Always expected to be zero; non-zero indicates a
+  driver misbehaviour or a missing SCATTER-off enforcement and
+  requires investigation. Route is `TERMINAL_DROP`.
+- `pkt_frag_skipped_total{af}` — D40, IPv4 / IPv6 non-first
+  fragment whose L4 stage was skipped under
+  `fragment_policy=l3_only`. Keyed by address family (`v4`, `v6`).
+  The IPv6 value MUST equal `l4_skipped_ipv6_fragment_nonfirst`
+  (the latter stays as a named alias for backwards telemetry
+  compatibility and is populated from the same bump site). Added
+  for symmetry with D27 — IPv4 skip was previously silent.
+- `pkt_frag_dropped_total{policy,af}` — D40, fragment drop under
+  `fragment_policy=drop`. `policy` is always `"drop"` (kept as a
+  label for forward compatibility with any future
+  `fragment_policy=quarantine` or similar); `af` is `v4` / `v6`.
+  Previously folded silently into `rule_matches_total{action=drop}`
+  which made drop storms indistinguishable from normal drops.
 
 All rows are written only by the owning lcore. Aggregation is the
 telemetry thread's job (§10).
@@ -917,7 +935,29 @@ let the CPU cool (`rte_pause()` or equivalent). **Crucially it does
 NOT call `rte_rcu_qsbr_thread_offline`.** A worker that goes offline
 without announcing would hang a concurrent reload's
 `synchronize`. The worker stays online and keeps publishing quiescent
-state every (even empty) iteration.
+state every (even empty) iteration. This is **explicitly** the
+required behaviour — reload progress during idle windows depends on
+it (D12 / D30 bounded-sync path would otherwise stall for the full
+deadline in any no-traffic window).
+
+**Headers-in-first-seg invariant (D39).** Every classifier stage
+below (`classify_l2` / `classify_l3` / `classify_l4`) reads packet
+headers through `rte_pktmbuf_mtod[_offset]`, which linearly reads
+**the first mbuf segment only**. D31 length guards check
+`m->pkt_len`, which covers the full chain, so a chained mbuf with a
+header straddling a segment boundary would pass the guard but read
+undefined memory. Phase 1 closes this by enforcing
+`m->nb_segs == 1` at classifier entry and by refusing any port
+configuration where the RX mempool segment size cannot hold the
+largest admissible frame.
+
+Runtime: `classify_l2` asserts `m->nb_segs == 1` under
+`RTE_ASSERT` in debug builds; release builds rely on the port-init
+guarantee (see §6.1). If the invariant is ever observed to fail in
+production (counter `pkt_multiseg_drop_total`), the packet is
+routed to `TERMINAL_DROP` — same path as truncation. Phase 2 may
+revisit this with `rte_pktmbuf_read` if jumbo / multi-seg becomes a
+real requirement.
 
 ### 5.2 Layer 2 classifier
 
@@ -926,6 +966,18 @@ static inline void classify_l2(WorkerCtx* ctx, const Ruleset* rs,
                                rte_mbuf* m) {
     auto* dyn  = mbuf_dyn(m);
     dyn->flags = 0;
+
+    // D39 — headers-in-first-seg invariant. Port-init enforces
+    // SCATTER=off and that the mempool element holds the largest
+    // admissible frame, so a chained mbuf here is a driver bug.
+    // Debug builds abort; release builds route to TERMINAL_DROP and
+    // bump a dedicated counter so the anomaly is visible in metrics.
+    RTE_ASSERT(m->nb_segs == 1);
+    if (unlikely(m->nb_segs != 1)) {
+        ctx_stats_bump_pkt_multiseg_drop(ctx);
+        dyn->verdict_layer = TERMINAL_DROP;
+        return;
+    }
 
     // D31 — explicit length guard. The fast path will read 14 B
     // (ether) and possibly 4 more (VLAN) before any matching, so
@@ -1039,6 +1091,20 @@ if (unlikely(m->ol_flags & RTE_MBUF_F_RX_FDIR_ID)) {
 }
 ```
 
+**QinQ inner-garbage path (D32 / Q3 clarification).** When the
+outer tag is consumed and the inner ethertype is **not** another
+VLAN TPID and **not** a recognised L3 ethertype (IPv4 / IPv6), the
+L2 stage still records `parsed_ethertype = <inner value>` and
+`l3_offset = 18`, and hands off to §5.3 via `NEXT_L3`. §5.3 then
+falls through its IPv4 / IPv6 branches and terminates with
+`TERMINAL_PASS`, so the packet is handed to §5.5 for the
+default-behaviour verdict. No new counter: the drop (if any) is
+charged to `default_action_total`, and the L2 stage's
+`qinq_outer_only_total` bump only fires when the inner *is*
+another VLAN TPID. This is deliberate — the outer-only counter
+is a demand signal for full QinQ matching, and firing it on
+random inner garbage would pollute that signal.
+
 ### 5.3 Layer 3 classifier
 
 ```cpp
@@ -1076,6 +1142,8 @@ static inline void classify_l3(WorkerCtx* ctx, const Ruleset* rs,
         if (unlikely(is_frag)) {
             switch (rs->fragment_policy) {
             case FRAG_DROP:
+                // D40: explicit per-lcore counter for fragment drops.
+                ctx_stats_bump_pkt_frag_dropped(ctx, "drop", "v4");
                 dyn->verdict_layer = TERMINAL_DROP;
                 return;
             case FRAG_ALLOW:
@@ -1085,7 +1153,9 @@ static inline void classify_l3(WorkerCtx* ctx, const Ruleset* rs,
                 if (is_nonfirst) {
                     // No reliable L4 header. Mark packet
                     // L4-unclassifiable; L3 rules still apply.
+                    // D40 — observable symmetry with IPv6 (D27).
                     dyn->flags |= SKIP_L4;
+                    ctx_stats_bump_pkt_frag_skipped(ctx, "v4");
                 }
                 break;  // fall through to L3 matching
             }
@@ -1208,6 +1278,8 @@ static inline void classify_l3(WorkerCtx* ctx, const Ruleset* rs,
 
             switch (rs->fragment_policy) {
             case FRAG_DROP:
+                // D40: explicit per-lcore counter for fragment drops.
+                ctx_stats_bump_pkt_frag_dropped(ctx, "drop", "v6");
                 dyn->verdict_layer = TERMINAL_DROP;
                 return;
             case FRAG_ALLOW:
@@ -1230,6 +1302,11 @@ static inline void classify_l3(WorkerCtx* ctx, const Ruleset* rs,
                     // Non-first fragment: no L4 header available
                     // in this datagram fragment. L3 still applies.
                     dyn->flags |= SKIP_L4;
+                    // D27 — the named backwards-compat counter.
+                    ctx_stats_bump_l4_skipped_ipv6_fragment_nonfirst(ctx);
+                    // D40 — the symmetric family-keyed counter; both
+                    // are bumped at the same site.
+                    ctx_stats_bump_pkt_frag_skipped(ctx, "v6");
                 }
                 break;
             }
@@ -1651,6 +1728,17 @@ main()
   │     │     primary egress or a mirror / redirect destination.
   │     │     The startup validator rejects the config if any port
   │     │     reports `rte_eth_dev_info.max_tx_queues < n_workers`.
+  │     │     D39: the startup validator also enforces that the
+  │     │     per-port max admissible frame length (RTE_ETHER_MTU
+  │     │     + headroom, or the offload-enabled jumbo MTU) fits
+  │     │     in ONE mempool segment. Formally:
+  │     │        (port.max_rx_pkt_len + RTE_PKTMBUF_HEADROOM)
+  │     │          ≤ (mempool.elt_size - sizeof(rte_mbuf))
+  │     │     AND `rxmode.offloads & SCATTER == 0` is set on every
+  │     │     port at configure time. Any port that demands
+  │     │     multi-seg RX is rejected at startup with reason
+  │     │     `multiseg_rx_unsupported`. This guarantees the
+  │     │     §5.1 D39 headers-in-first-seg invariant.
   │     ├─ rte_eth_rx_queue_setup × K (mempool from worker's NUMA socket)
   │     ├─ rte_eth_tx_queue_setup × K  (D28: per-worker lanes)
   │     └─ rte_eth_dev_start
@@ -2028,6 +2116,16 @@ expected<void> deploy(std::string path) {
                 // intentionally leaked to memory). Operator alert
                 // fires; this is a "stop the world, page on-call"
                 // condition, not a transient hiccup.
+                //
+                // Q5 cadence: `reload_pending_full_total` is a
+                // counter with once-per-overflow semantics —
+                // incremented exactly once per reload attempt that
+                // hits an already-full queue. It is NOT incremented
+                // on every retry of a stuck reload loop (the caller
+                // is responsible for not reloading again until the
+                // queue drains). Structured-log entry fires on the
+                // same edge. Alerting rule should be
+                // `rate(...[5m]) > 0`, not level.
                 metric_inc(reload_pending_full_total);
             }
             return tl::unexpected(Err::ReloadTimeout);
@@ -2249,6 +2347,15 @@ pktgate_lcore_pkt_truncated_total{lcore,where}                    counter
 # D32 — QinQ outer (0x88A8) accepted by §5.2 fast path; the inner
 # C-tag is left unparsed in this phase.
 pktgate_lcore_qinq_outer_only_total{lcore}                        counter
+# D39 — multi-seg mbuf observed at classifier entry despite the
+# port-init scatter-off guarantee. Should always be zero.
+pktgate_lcore_pkt_multiseg_drop_total{lcore}                      counter
+# D40 — fragment-skip (l3_only policy) and fragment-drop (drop
+# policy), symmetrical across IPv4 and IPv6.
+# IPv6 skip value is duplicated as `l4_skipped_ipv6_fragment_nonfirst`
+# above (same bump site) for backwards telemetry continuity.
+pktgate_lcore_pkt_frag_skipped_total{lcore,af="v4|v6"}            counter
+pktgate_lcore_pkt_frag_dropped_total{lcore,policy="drop",af="v4|v6"} counter
 pktgate_redirect_dropped_total{lcore,port}                        counter
 pktgate_mirror_dropped_total{lcore,port}                          counter
 
@@ -2331,9 +2438,19 @@ satisfy **both**:
 A peer that fails the check is logged at warn (`peer_uid`,
 `peer_gid`, `peer_pid`), the connection is closed immediately,
 and `pktgate_cmd_socket_rejected_total{reason="peer_uid|peer_gid"}`
-is bumped. Mutating verbs (`reload`, `activate`) additionally
-require the connection to have been authenticated this way — a
-read-only `status`/`dump-*` is allowed for any allow-listed peer.
+is bumped.
+
+**Q6 clarification — single accept-time check.** `SO_PEERCRED`
+is enforced **exactly once, at `accept(2)` time**, on the
+connection socket. Every verb served on that connection reuses
+the ucred captured at accept. There is no per-verb re-check: the
+kernel's ucred is pinned at accept and cannot be spoofed by the
+peer thereafter, and a long-lived connection cannot acquire new
+capabilities mid-stream. Both mutating (`reload`, `activate`) and
+read-only (`status`, `dump-*`, `counters`) verbs therefore run
+under the same gate; the allow-list distinction between "anyone
+allow-listed" and "must be authenticated" collapses to "must be
+allow-listed at accept" — which is the only check there is.
 This blocks the local-unprivileged-user attack against a
 permissive `0666` socket left over from a misconfigured
 deployment.
@@ -2520,6 +2637,28 @@ CMake does not hardcode a compiler.
 - `-Wshadow -Wconversion -Wsign-conversion -Wnon-virtual-dtor`
 - `-Wundef -Wcast-align -Wuninitialized -Wnull-dereference`
 - ASAN/UBSAN/TSAN as separate build flavors via CMake presets.
+
+**Test-only build flavour (Q9).** A `-DPKTGATE_TESTING=1` cmake
+option exposes **test hooks** that must NEVER be present in a
+release build: deterministic RNG seed override for the sample-rate
+RNG, a force-shrink knob on the mempool sizer, a classify-stage
+fault-injection site (deliberate `TERMINAL_DROP` for a named
+rule_id), and an `accept(2)` path that bypasses `SO_PEERCRED` for
+a test UID allow-list. The CMake preset `dev-testing` enables it;
+the `release` preset asserts `PKTGATE_TESTING` is undefined via
+`static_assert` so no accidental shipment is possible. Functional
+and chaos test plans rely on these hooks; see
+`test-plan-drafts/functional.md` H2 / H3.
+
+**Test companion user (Q9).** Functional / chaos tests that
+exercise D38 SO_PEERCRED differentiation use a secondary
+system user `pktgate_test2` alongside the primary `pktgate` user.
+Under `PKTGATE_TESTING`, the allow-list parser accepts a
+`cmd_socket.test_allow_uids` list read from the config; under a
+release build that key is rejected by the validator (`unknown
+field` error). The systemd unit files for tests provision both
+users in the `[Service]` stanza; release units create only
+`pktgate`.
 
 ## 14. Phase plan
 
