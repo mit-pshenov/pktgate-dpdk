@@ -170,7 +170,8 @@ suite, and is ready for RED tests to land.
 - `cmake/Sanitizers.cmake`, `cmake/Gtest.cmake`, `cmake/Fuzz.cmake`.
 - `src/main.cpp` — `int main(){ return 0; }`, DPDK link present.
 - `tests/CMakeLists.txt`, `tests/smoke/`.
-- `scripts/check_counter_consistency.py` driving the §10.3 grep.
+- `scripts/check-counter-consistency.sh` driving the §10.3 grep
+  (bash + awk + grep; harness.md §H7 is explicit — no python).
 - `.github/workflows/ci.yml` (or equivalent) — rotating
   sanitizer per commit, full matrix nightly.
 
@@ -178,9 +179,16 @@ suite, and is ready for RED tests to land.
 compile time is measured.
 
 **Exit gate.** `ctest --preset dev-{release,debug,asan,ubsan,tsan}
--L smoke` all green. The D33 grep target is in the default ctest
-set and green (it has nothing to check yet but the harness is
-live).
+-L smoke` all green. The D33 grep driver
+(`scripts/check-counter-consistency.sh`) is already live in M0
+under the `smoke.counter_consistency` ctest: Pass 1 (§10.3 →
+canonical set) and Pass 3 (prose → §10.3, covering both design.md
+outside §10.3 and all of review-notes.md) actually run and flag
+drift in the doc tree — its first run against C4 caught
+`pktgate_port_link_up` being referenced in §11 but missing from
+§10.3, fixed in the same cycle. Pass 2 (§10.3 → src/ producers)
+is a deliberate SKIPPED stub until M3 populates src/ with the
+first counter producer macros (harness.md §H7.2).
 
 **Tag:** `m00-harness`.
 

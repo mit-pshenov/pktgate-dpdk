@@ -2333,6 +2333,7 @@ pktgate_port_rx_bytes_total{port}                                 counter
 pktgate_port_tx_bytes_total{port}                                 counter
 pktgate_port_rx_dropped_total{port,reason="nombuf|noqueue|err"}   counter
 pktgate_port_tx_dropped_total{port}                               counter
+pktgate_port_link_up{port}                                        gauge (0/1)
 
 pktgate_lcore_packets_total{lcore}                                counter
 pktgate_lcore_cycles_per_burst{lcore}                             histogram

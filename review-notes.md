@@ -2153,4 +2153,12 @@ the test-architect brigade.
 *Last updated: 2026-04-11 (D31–D38 + full five-lawyer triage,
 single batch commit after the embarrassing D30 fix.)
 2026-04-11 later: D39/D40 + Q3/Q5/Q6/Q7/Q9 clarifications
-landed after the test-architect brigade.*
+landed after the test-architect brigade.
+2026-04-11 even later: M0 C4 landed the live
+`scripts/check-counter-consistency.sh` (Pass 1 + Pass 3) and its
+first run against the repo caught §11 referencing
+`pktgate_port_link_up` as a gauge while §10.3 never listed it
+(classic D33 drift, exactly the class D31 had four weeks back).
+Fixed by adding the gauge to §10.3 under the port metrics. No new
+D-number — the drift predates C4 and was a doc oversight, not an
+architecture decision.*
