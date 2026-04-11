@@ -1769,12 +1769,261 @@ commit.
 - §10.3 metrics — `pktgate_reload_total{result="...|pending_full"}`
   + `pktgate_reload_pending_free_depth` gauge
 
-**The remaining lawyer findings (D31–D35, D37, D38, plus a
-batch of MEDIUMs and LOWs)** land in the next commit alongside
-the full triage section. Stop-gap rationale for splitting:
-hygiene — the rcu_check / pending_free fix has to be visible
-in `git log` as a single self-contained "we acknowledge we
-were wrong" commit.
+### D31 — Per-stage truncation guards
 
-*Last updated: 2026-04-11 (D30 + D36 — embarrassing fix from
-fourth review pass; remaining D31–D38 + full triage land next.)*
+**Decision.** Every classifier stage that dereferences a header
+gets an explicit `m->pkt_len ≥ offset + N` check before the read.
+On a miss the mbuf is `TERMINAL_DROP`-routed (freed in §5.5
+dispatch) and `pkt_truncated_total{where}` is bumped on the
+owning lcore. `where` covers `l2`, `l2_vlan`, `l3_v4`, `l3_v6`,
+`l3_v6_frag_ext`, `l4`. `l3_v4` also rejects IPv4 packets with
+`IHL < 5` (otherwise §5.4's `(ihl << 2)` produces a bogus l4off).
+
+**Why.** Three of the five lawyers independently flagged this:
+the protocol lawyer for malformed-input UB, the perf lawyer for
+the same reason (a fault on the read path is much more expensive
+than a length compare), and the threat-model lawyer for short-
+header DoS shapes. The previous text relied on "we trust DPDK to
+have given us a packet at least 14 bytes long" — true for normal
+RX, false for the corner case where the inner-vlan / IPv6-fragext
+read pushes us past the actual `pkt_len`.
+
+**Counter-touch sites.** `classify_l2`, `classify_l3` (IPv4 fixed,
+IPv4 IHL, IPv6 fixed, IPv6 fragment ext), `classify_l4` (TCP/UDP/
+SCTP 4-byte port pair, ICMP/v6 2-byte type+code).
+
+**Coverage in design.md (D31):**
+- §4.3 LcoreStats — `pkt_truncated_total[where]` bullet
+- §5.1 worker loop — classify_* now take `WorkerCtx*` so they can
+  bump per-lcore counters
+- §5.2 — ether 14 B + VLAN 18 B guards
+- §5.3 — IPv4 (`l3_off + 20`, IHL ≥ 5), IPv6 (`l3_off + 40`),
+  IPv6 fragment ext (`l3_off + 48`) guards
+- §5.4 — `l4off + need` guard with `need = 4` (ports) or `2` (icmp)
+- §10.3 — `pktgate_lcore_pkt_truncated_total{lcore,where}`
+
+The D27 review-notes already CLAIMED a `pkt_truncated` counter
+existed; D31 makes that claim true. (Counter consistency lesson
+captured under D33.)
+
+### D32 — QinQ outer (0x88A8) accept in §5.2
+
+**Decision.** §5.2 fast path treats both `0x8100` (single VLAN /
+inner C-tag) and `0x88A8` (S-tag, QinQ outer) as VLAN TPIDs and
+walks ONE tag. Inner C-tag of a true QinQ stack is **not** drilled
+in this phase, but the outer S-tag is recognized so its packets
+are not silently dropped as "unknown ethertype" by downstream L3.
+A new per-lcore counter `qinq_outer_only_total` fires when the
+inner ethertype after the first walked tag is itself another VLAN
+TPID — i.e. a real QinQ stack. Operators use that counter to
+quantify demand for full QinQ matching in a future phase.
+
+**Why.** Protocol lawyer finding: GGSN-Gi production traffic in
+some carrier deployments wraps customer traffic in S-tags
+(`802.1ad`); the original §5.2 only matched `0x8100` and would
+have classified S-tagged packets as "unknown ethertype" and
+dropped them at L3. This is a deployment-blocker for any operator
+using QinQ on the southbound link.
+
+**Coverage in design.md (D32):**
+- §5.2 classify_l2 — `is_vlan_tpid` covers both TPIDs
+- §4.3 LcoreStats — `qinq_outer_only_total` bullet
+- §10.3 — `pktgate_lcore_qinq_outer_only_total{lcore}`
+
+### D33 — Counter consistency invariant
+
+**Decision.** Every counter named in design.md prose
+(§3a / §4.3 / §5 / §11 / §15) AND in review-notes (D27 history,
+etc.) appears in §10.3. The §10.3 list is the source of truth;
+prose references that drift away from it are bugs in the doc.
+
+**Why.** The D27 `pkt_truncated` claim (counter named in prose,
+absent from §10.3) was caught by the perf lawyer this round. Same
+issue caught earlier with `frag_nonfirst_l3_only` (named in §3a.2,
+absent from §10.3 — D33 removes the dangling reference). The fix
+is structural: a single named counter row, prose links to the
+canonical name.
+
+**Action taken.** Added missing rows (`l4_skipped_ipv6_fragment_
+nonfirst`, `pkt_truncated`, `qinq_outer_only`, `cmd_socket_rejected`,
+`log_dropped`) and removed the `frag_nonfirst_l3_only` orphan.
+Reload-failure sub-reasons (`reload_failures_total` in the §6.3
+sequence diagram) collapsed into `reload_total{result="..."}`.
+
+### D34 — `rl_arena` refill `elapsed` clamp at one TSC second
+
+**Decision.** The §4.4 RL hot-path computes
+`elapsed = now - b.last_refill_tsc; refill_bytes = elapsed * rate
+/ tsc_hz / n_lcores`. After a long idle (or first-touch on a
+fresh bucket where `last_refill_tsc == 0`), `elapsed` can become
+arbitrarily large and the multiply overflows 64-bit. Clamp
+`elapsed` to `rte_get_tsc_hz()` (one TSC second). Steady-state
+behaviour is unchanged because the bucket is also capped at
+`burst_bytes` immediately after the multiply — any clamp
+≥ "time to fill burst" is equivalent to no clamp.
+
+**Why.** Concurrency / perf lawyer joint finding. The original
+code had no clamp at all; on long-idle lcores or freshly-published
+slots the first packet would compute a nonsense refill and then
+get capped to `burst_bytes` — sometimes correctly, sometimes via
+silently-overflowed arithmetic that happened to land in range.
+Not a current bug in the field but a future bug-magnet.
+
+**Coverage in design.md (D34):**
+- §4.4 hot-path snippet — explicit `raw vs elapsed` clamp with
+  rationale comment
+
+### D35 — Single `reload_mutex` covering all reload entry points
+
+**Decision.** `g_cp.reload_mutex` (D35, declared in §4.5) is
+acquired at the top of `deploy()` and held across compile,
+publish, GC, and `pending_free` operations. Every reload entry
+point — inotify, UDS `cmd_socket` reload verb, `rte_telemetry`
+`/pktgate/reload` flag — funnels through this **one** function;
+there is no second copy of the publish pipeline anywhere in the
+control plane.
+
+**Why.** Concurrency lawyer finding: §9.2 documented "the inotify
+thread holds a reload mutex" but cmd_socket reload was a separate
+write path. Two writers to `g_active` violates the D9 single-writer
+invariant, and the §9.2 D11 GC ordering relied on it. The fix is
+two-part: (a) declare the mutex in `ControlPlaneState` so its
+lifetime is unambiguous, (b) document that all reload sources end
+in the same `deploy()` call.
+
+**Coverage in design.md (D35):**
+- §4.5 ControlPlaneState — `pthread_mutex_t reload_mutex` field
+- §9.2 deploy() — `lock_guard` at function entry, "Single funnel"
+  paragraph above
+- §9.4 corner case "Nested / concurrent reload" — rewritten
+
+### D37 — Validator memory budget pre-flight
+
+**Decision.** Between `validate(*cfg)` and the compile stages,
+`validate_budget(cfg, sizing)` runs three pure-arithmetic gates:
+
+1. **Per-rule expansion ceiling** (default 4096 entries/rule)
+2. **Aggregate post-expansion ceiling** (≤ `sizing.l*_entries_max`)
+3. **Hugepage budget** (estimated `expected_ruleset_bytes(...)`
+   ≤ free hugepages on cp socket − safety margin)
+
+A failure short-circuits the reload before the compiler touches
+any hugepage. Failure path bumps `reload_total{result="validate_
+err"}` with structured-log sub-reason.
+
+**Why.** Threat-model lawyer finding: a hostile config (or a
+typo: `dst_port: [0-65535]` accidentally expanded to 65k+ entries
+per rule) could push the compiler into a multi-second build that
+allocates gigabytes before failing on `ENOMEM`. Pre-flight is
+microseconds and rejects the obvious cases.
+
+**Coverage in design.md (D37):**
+- §9.2 — "D37 — validator budget pre-flight" paragraph + the
+  `validate_budget` call inserted into `deploy()`
+
+### D38 — UDS `SO_PEERCRED` + inotify `IN_CLOSE_WRITE`-only
+
+**Decision.** Two threat-model fixes bundled:
+
+(a) The control thread enforces caller identity at `accept(2)`
+on `/run/pktgate/ctl.sock` via `SO_PEERCRED`. Required: `uid ==
+0` or `uid == pktgate_uid`, AND `gid` ∈ `allow_gids` (default:
+just `pktgate_gid`). Mutating verbs (`reload`, `activate`)
+require this; read-only verbs are allowed for any allow-listed
+peer. Rejection bumps `pktgate_cmd_socket_rejected_total{reason=
+"peer_uid|peer_gid"}`.
+
+(b) The inotify watcher subscribes to `IN_CLOSE_WRITE | IN_MOVED_TO`
+only — **not** `IN_MODIFY`. The former two fire exactly once per
+atomic file replacement; `IN_MODIFY` fires on every partial write
+and would race the parser against in-progress edits. Watch is on
+the directory, never the file. `inotify_init1(IN_NONBLOCK |
+IN_CLOEXEC)`.
+
+**Why.** Threat-model lawyer findings:
+- (a) Defense in depth against a misconfigured `0666` socket.
+  `mode 0600` is the first gate, `SO_PEERCRED` is the second.
+- (b) Editor-buffer-in-progress race: a `vim`-backed write would
+  fire `IN_MODIFY` mid-flush; the parser would see a syntactically
+  invalid file, log a parse error, and the operator's actual
+  finished edit would land in the next debounce window. Filtering
+  to `IN_CLOSE_WRITE | IN_MOVED_TO` makes the parser see only
+  fully-formed configs.
+
+**Coverage in design.md (D38):**
+- §10.7 — "D38 — peer authentication" + "D38 — inotify event
+  filtering" paragraphs
+- §10.3 — `pktgate_cmd_socket_rejected_total{reason}`
+
+### Five-lawyer triage (full)
+
+The 2026-04-11 sweep ran five narrow-lens reviewers in parallel.
+Below is the dedup'd HIGH/MED/LOW table with hits, accepts, and
+deferrals.
+
+**HIGH (≈10 unique after dedup, 15 raw)**
+
+| # | Source | Finding | Disposition |
+|---|---|---|---|
+| 1 | concurrency, dpdk-api | `rte_rcu_qsbr_check` token vs duration confusion | **D30**, fixed in commit 1 |
+| 2 | concurrency | `rs_old` orphaned on reload-timeout (no specified queue) | **D36**, commit 1 |
+| 3 | concurrency | Two reload writers (inotify + cmd_socket UDS) | **D35**, this commit |
+| 4 | protocol, perf, threat | Per-stage truncation guards missing | **D31**, this commit |
+| 5 | protocol | QinQ S-tag (0x88A8) silently dropped in §5.2 | **D32**, this commit |
+| 6 | concurrency, perf | `rl_arena` refill `elapsed` overflow on long idle | **D34**, this commit |
+| 7 | threat | Validator can be DoS'd by hostile expansion / sizing | **D37**, this commit |
+| 8 | threat | UDS lacks peer-cred check; inotify uses `IN_MODIFY` | **D38**, this commit |
+| 9 | dpdk-api | `rte_rcu_qsbr_create` / `rte_eth_rss_hash_conf_set` / single-entry FIB lookup APIs do not exist | **D30 bundled renames**, commit 1 |
+| 10 | perf | `pkt_truncated` counter named in D27 prose, missing from §10.3 | **D33**, this commit (counter consistency invariant) |
+
+**MEDIUM (folded into the HIGH commits)**
+
+- Counter dangling references (`frag_nonfirst_l3_only`,
+  `reload_failures_total`, `pktgate_log_dropped_total`) — folded
+  into D33.
+- §6.3 reload sequence diagram still named the obsolete
+  `reload_failures_total` instead of `reload_total{result="..."}`
+  — folded into D33.
+- IPv4 IHL < 5 silent acceptance — folded into D31 (`l3_v4`
+  bucket, explicit reject).
+- §9.4 corner case wording for "nested reload" was
+  inotify-specific — folded into D35.
+- inotify watch on file vs directory ambiguity in §10.7 — folded
+  into D38 ("watch is on the directory, never the file").
+
+**LOW (deferred — explicitly NOT fixed in this batch)**
+
+| # | Finding | Reason for deferral |
+|---|---|---|
+| L1 | §13 should add `-Wstrict-aliasing=2` | Real, but it's a build flag, not architecture. Goes in §14 phase 1 build flags when we get there. |
+| L2 | §5.6 cycle budget min/typ/max columns are still notional pending lab measurements | Already documented in D18 / §5.6 as "to be tightened post-§14.2 lab pass". |
+| L3 | §4.4 token-bucket struct is 64 B padded but the comment says "cache-line isolated" — could be tightened | Cosmetic; the layout is correct, the comment is fine. |
+| L4 | §9.5 hw-offload publish doesn't describe rollback on partial install failure | Real and architectural, but big enough to deserve its own decision (D-something later). Out of scope for the truncation/budget batch. |
+| L5 | §11 should add a row for `validate_budget` failure | Already covered by `validate_err` row; the sub-reason is a structured-log payload (see D33). |
+| L6 | §3a.1 doesn't cover `cmd_socket.allow_gids` field | Schema doc; will land when §3a is next touched. Not blocking. |
+
+**Misses (lawyer-flagged, intentionally not fixed)**
+
+- "Use `rte_rcu_qsbr_synchronize` instead of bounded check" —
+  rejected for the same reason it was rejected in D9/D12: a
+  stuck worker would hang the writer forever. The bounded poll
+  is the deliberate trade-off.
+- "Per-rule allocation should use `rte_malloc` instead of arena
+  slot" — rejected, breaks O(1) hot-path access (§4.4 slot
+  lifecycle is a load-bearing decision).
+- "QinQ should drill BOTH tags in §5.2" — deferred. D32 ships
+  the outer-accept fix; full QinQ matching depends on operator
+  demand which `qinq_outer_only_total` will measure. Phase 2+
+  decision.
+- "Validator should also pre-flight FIB-trie depth" — academically
+  interesting, no production failure mode (FIB trie depth is
+  bounded by IP address space, not by config size). Skipped.
+
+**Meta-finding logged in D30 / CLAUDE.md.** External reviewers'
+factual claims about DPDK APIs MUST be cross-checked against
+`doc.dpdk.org/api-<version>/` before being applied to design.md.
+Hearsay ≠ fact. The five-lawyer sweep is the antidote: independent
+lawyers with different perspectives catch each other's errors.
+
+*Last updated: 2026-04-11 (D31–D38 + full five-lawyer triage,
+single batch commit after the embarrassing D30 fix.)*

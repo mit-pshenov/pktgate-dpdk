@@ -130,14 +130,14 @@ capability bits, queue count):
 | **D28** | Dataplane port TX-queue symmetry invariant (n_workers на каждом порту) | Принят, 2-й внеш. ревью |
 | **D29** | Drop dead `want_icmp_code` field из L4CompoundEntry | Принят, 2-й внеш. ревью |
 | **D30** | Fix `rte_rcu_qsbr_check` misuse: token + explicit deadline (НЕ TSC delta), bundled API renames | Принят, embarrassing fix, 4-й (5-lawyer) ревью |
-| **D31** | Truncation guards в §5.2/§5.3/§5.4 + `pkt_truncated_total` counter | Pending, 4-й ревью |
-| **D32** | QinQ 0x88A8 outer accept в Phase 1 + counter | Pending, 4-й ревью |
-| **D33** | Counter consistency pass §10.3 (закрыть dangling references из D27/D31/D32) | Pending, 4-й ревью |
-| **D34** | rl_arena refill `elapsed` clamp at `tsc_hz` (overflow на idle) | Pending, 4-й ревью |
-| **D35** | Single `reload_mutex` covering все reload entry points (inotify + cmd_socket) | Pending, 4-й ревью |
+| **D31** | Truncation guards в §5.2/§5.3/§5.4 + `pkt_truncated_total[where]` counter | Принят, 4-й ревью |
+| **D32** | QinQ 0x88A8 outer accept в §5.2 + `qinq_outer_only_total` counter | Принят, 4-й ревью |
+| **D33** | Counter consistency invariant: §10.3 = source of truth (закрыты dangling refs) | Принят, 4-й ревью |
+| **D34** | rl_arena refill `elapsed` clamp at `tsc_hz` (overflow на idle) | Принят, 4-й ревью |
+| **D35** | Single `g_cp.reload_mutex` covering все reload entry points (inotify + cmd_socket + telemetry) | Принят, 4-й ревью |
 | **D36** | `pending_free` queue для reload-timeout path | Принят (bundled с D30), 4-й ревью |
-| **D37** | Validator memory-budget pre-flight + per-rule expansion ceiling | Pending, 4-й ревью |
-| **D38** | SO_PEERCRED на UDS + IN_CLOSE_WRITE-only inotify | Pending, 4-й ревью |
+| **D37** | Validator memory-budget pre-flight + per-rule expansion ceiling | Принят, 4-й ревью |
+| **D38** | SO_PEERCRED на UDS + IN_CLOSE_WRITE-only inotify | Принят, 4-й ревью |
 
 ## Pending (требуют решения пользователя)
 

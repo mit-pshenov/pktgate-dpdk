@@ -238,8 +238,8 @@ are reused.
   applies on L3 miss (D27). Operators writing L4 rules should be
   aware that under `l3_only` an L4 match against a fragmented flow
   will only ever fire on the first fragment of each datagram —
-  observe the `l4_skipped_ipv6_fragment_nonfirst` and
-  `frag_nonfirst_l3_only` (§10.3) counters to confirm. Strict
+  observe the `l4_skipped_ipv6_fragment_nonfirst` counter (§10.3)
+  to confirm. Strict
   symmetric handling requires `fragment_policy="drop"`. `"drop"` is
   terminal drop on any fragment. `"allow"` is pass-through (unsafe,
   debug only). See §5.3 for exact semantics and D17 rationale.
@@ -574,6 +574,18 @@ Additional per-lcore counters (`LcoreStats`):
   `apply_action` switch defaults (§5.5 / §13 -Wswitch-enum). Should
   always read zero in a healthy build; non-zero indicates a state
   machine bug that bypassed the compile-time check.
+- `pkt_truncated_total[where]` — D31, per-classifier-stage drops
+  caused by length guards (`l2`, `l2_vlan`, `l3_v4`, `l3_v6`,
+  `l3_v6_frag_ext`, `l4`). A length-guard miss free()s the mbuf
+  and short-circuits the §5.5 dispatch via `TERMINAL_DROP`. Always
+  per-lcore, never atomic. Surfaces malformed traffic and DoS
+  shapes that try to land short headers in the parser.
+- `qinq_outer_only_total` — D32, QinQ outer tag (0x88A8) was
+  accepted as a single VLAN by the §5.2 fast path because the
+  inner tag was either missing or unmatched. Distinct from
+  `pkt_truncated_total[l2_vlan]` (which counts truncations under
+  the QinQ outer header). Helps operators decide whether to ship
+  full QinQ matching in a future phase.
 
 All rows are written only by the owning lcore. Aggregation is the
 telemetry thread's job (§10).
@@ -622,8 +634,21 @@ struct RateLimitArena {
 const auto& rl  = rs->rl_actions[a->rl_index];
 auto*       row = &rl_arena->rows[rl.slot];      // O(1), no hash lookup
 auto&       b   = row->per_lcore[rte_lcore_id()];
-uint64_t    now          = rte_rdtsc();
-uint64_t    elapsed      = now - b.last_refill_tsc;
+uint64_t    now     = rte_rdtsc();
+
+// D34 — clamp `elapsed` to one second of TSC. After a long idle
+// (no traffic on this lcore for many seconds, lcore freshly
+// brought up, or first hit on a new bucket where last_refill_tsc
+// is zero) the raw delta times rate_bytes_per_sec overflows the
+// 64-bit `refill_bytes` multiply. The bucket is also capped at
+// burst_bytes anyway, so any clamp ≥ "time to fill burst" is
+// equivalent to no clamp for steady-state correctness; one second
+// is comfortably above the worst-case burst-fill time at any
+// realistic per-lcore rate. Zero special-case for fresh buckets
+// (b.last_refill_tsc == 0) is folded into the same clamp.
+uint64_t    raw     = now - b.last_refill_tsc;
+uint64_t    elapsed = raw > rte_get_tsc_hz() ? rte_get_tsc_hz() : raw;
+
 uint64_t    refill_bytes = elapsed * rl.rate_bytes_per_sec
                           / rte_get_tsc_hz() / n_active_lcores;
 b.tokens                 = min(b.tokens + refill_bytes, rl.burst_bytes);
@@ -847,23 +872,27 @@ void worker_main(WorkerCtx* ctx) {
         for (uint16_t i = 0; i < min<uint16_t>(n, 8); i++)
             rte_prefetch0(rte_pktmbuf_mtod(rx[i], void*));
 
-        // (5) Layer 2 classify (always runs)
+        // (5) Layer 2 classify (always runs). D31: classify_*
+        // take ctx so they can bump pkt_truncated on a length
+        // guard miss; on miss they set verdict_layer =
+        // TERMINAL_DROP and the §5.5 dispatcher routes the
+        // packet to free without further parsing.
         for (uint16_t i = 0; i < n; i++) {
             if (i + 8 < n) rte_prefetch0(rte_pktmbuf_mtod(rx[i+8], void*));
-            classify_l2(rs, rx[i]);
+            classify_l2(ctx, rs, rx[i]);
         }
 
         // (6) Layer 3 classify (only those that proceeded)
         for (uint16_t i = 0; i < n; i++) {
             if (mbuf_dyn(rx[i])->verdict_layer == NEXT_L3)
-                classify_l3(rs, rx[i]);
+                classify_l3(ctx, rs, rx[i]);
         }
 
         // (7) Layer 4 (skipped for L4_UNCLASSIFIABLE packets)
         for (uint16_t i = 0; i < n; i++) {
             if (mbuf_dyn(rx[i])->verdict_layer == NEXT_L4 &&
                 !(mbuf_dyn(rx[i])->flags & SKIP_L4))
-                classify_l4(rs, rx[i]);
+                classify_l4(ctx, rs, rx[i]);
         }
 
         // (8) Apply actions — stages into per-port TX / mirror / redirect bufs
@@ -893,30 +922,71 @@ state every (even empty) iteration.
 ### 5.2 Layer 2 classifier
 
 ```cpp
-static inline void classify_l2(const Ruleset* rs, rte_mbuf* m) {
-    auto* eth  = rte_pktmbuf_mtod(m, rte_ether_hdr*);
+static inline void classify_l2(WorkerCtx* ctx, const Ruleset* rs,
+                               rte_mbuf* m) {
     auto* dyn  = mbuf_dyn(m);
+    dyn->flags = 0;
+
+    // D31 — explicit length guard. The fast path will read 14 B
+    // (ether) and possibly 4 more (VLAN) before any matching, so
+    // a runt packet ≤ 13 B would otherwise be UB. We free the mbuf
+    // and short-circuit via TERMINAL_DROP; §5.5 routes it to free
+    // without further parsing. Counter is per-lcore (D31).
+    if (unlikely(m->pkt_len < sizeof(rte_ether_hdr))) {
+        ctx_stats_bump_pkt_truncated(ctx, "l2");
+        dyn->verdict_layer = TERMINAL_DROP;
+        return;
+    }
+    auto* eth = rte_pktmbuf_mtod(m, rte_ether_hdr*);
 
     uint16_t etype = eth->ether_type;
     uint16_t vlan  = 0xFFFF;
     uint8_t  pcp   = 0;
     uint8_t  l3_off = sizeof(rte_ether_hdr);  // 14
 
-    if (etype == RTE_BE16(RTE_ETHER_TYPE_VLAN)) {
+    // D32 — accept BOTH 0x8100 (single VLAN / inner C-tag) and
+    // 0x88A8 (S-tag, QinQ outer) here. The first-phase parser
+    // walks ONE tag and then treats the next ethertype as L3 — if
+    // the next ethertype is itself 0x8100/0x88A8 (true QinQ stack)
+    // we still do not drill the inner C-tag in this phase, but the
+    // outer S-tag is recognized so its packets are not dropped as
+    // "unknown ethertype" by downstream logic. Bumps
+    // qinq_outer_only_total whenever we exit with the outer tag
+    // consumed but the inner ethertype is *another* VLAN type;
+    // operators use that counter to scope the demand for full
+    // QinQ matching in a future phase.
+    bool is_vlan_tpid =
+        (etype == RTE_BE16(RTE_ETHER_TYPE_VLAN)) ||
+        (etype == RTE_BE16(RTE_ETHER_TYPE_QINQ));   // 0x88A8
+    if (is_vlan_tpid) {
+        // D31 — need 4 more bytes for the VLAN tag.
+        if (unlikely(m->pkt_len <
+                     sizeof(rte_ether_hdr) + sizeof(rte_vlan_hdr))) {
+            ctx_stats_bump_pkt_truncated(ctx, "l2_vlan");
+            dyn->verdict_layer = TERMINAL_DROP;
+            return;
+        }
         auto* vh = (rte_vlan_hdr*)(eth + 1);
         uint16_t tci = rte_be_to_cpu_16(vh->vlan_tci);
         vlan   = tci & 0x0FFF;
         pcp    = (tci >> 13) & 0x7;
         etype  = vh->eth_proto;                 // inner ethertype
         l3_off = sizeof(rte_ether_hdr) + sizeof(rte_vlan_hdr); // 18
-        // QinQ (two VLAN tags) architecturally yields l3_off = 22;
-        // the second tag is parsed by the same pattern.
+
+        // D32 — true QinQ stack (S-tag then C-tag, or two C-tags).
+        // We do NOT walk the inner tag in this phase; the inner
+        // ethertype is unknown to downstream classifiers, so we
+        // mark the event and proceed with L4 unclassifiable. L2
+        // and L3 still run normally on the outer key.
+        if (unlikely(etype == RTE_BE16(RTE_ETHER_TYPE_VLAN) ||
+                     etype == RTE_BE16(RTE_ETHER_TYPE_QINQ))) {
+            ctx_stats_bump_qinq_outer_only(ctx);
+        }
     }
 
     dyn->parsed_vlan      = vlan;
     dyn->parsed_ethertype = etype;
     dyn->l3_offset        = l3_off;    // D13: record once, reuse in L3/L4
-    dyn->flags            = 0;
 
     // Selectivity order: src_mac > dst_mac > vlan > ethertype > pcp.
     // Try the most-selective primary first; on hit, validate filter_mask.
@@ -972,15 +1042,30 @@ if (unlikely(m->ol_flags & RTE_MBUF_F_RX_FDIR_ID)) {
 ### 5.3 Layer 3 classifier
 
 ```cpp
-static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
+static inline void classify_l3(WorkerCtx* ctx, const Ruleset* rs,
+                               rte_mbuf* m) {
     auto*    dyn    = mbuf_dyn(m);
     uint8_t  l3_off = dyn->l3_offset;
     uint16_t et     = dyn->parsed_ethertype;
-    void*    l3     = rte_pktmbuf_mtod_offset(m, void*, l3_off);  // D13
 
     // --------- IPv4 ---------
     if (et == RTE_BE16(RTE_ETHER_TYPE_IPV4)) {
-        auto* ip = (rte_ipv4_hdr*)l3;
+        // D31 — need 20 B fixed IPv4 header before any header
+        // read. We deliberately reject IHL<5 packets here too,
+        // since the §5.4 IHL-driven L4 offset would otherwise
+        // produce a bogus l4off value. (LOW finding from the
+        // 5-lawyer pass: explicit IHL reject.)
+        if (unlikely(m->pkt_len < l3_off + sizeof(rte_ipv4_hdr))) {
+            ctx_stats_bump_pkt_truncated(ctx, "l3_v4");
+            dyn->verdict_layer = TERMINAL_DROP;
+            return;
+        }
+        auto* ip = rte_pktmbuf_mtod_offset(m, rte_ipv4_hdr*, l3_off);
+        if (unlikely((ip->version_ihl & 0x0F) < 5)) {
+            ctx_stats_bump_pkt_truncated(ctx, "l3_v4");  // bad IHL
+            dyn->verdict_layer = TERMINAL_DROP;
+            return;
+        }
 
         // --- Fragment handling (D17, per-config fragment_policy) ---
         bool is_frag =
@@ -1050,7 +1135,13 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
 
     // --------- IPv6 ---------
     if (et == RTE_BE16(RTE_ETHER_TYPE_IPV6)) {
-        auto* ip6 = (rte_ipv6_hdr*)l3;
+        // D31 — need 40 B fixed IPv6 header before reading proto.
+        if (unlikely(m->pkt_len < l3_off + sizeof(rte_ipv6_hdr))) {
+            ctx_stats_bump_pkt_truncated(ctx, "l3_v6");
+            dyn->verdict_layer = TERMINAL_DROP;
+            return;
+        }
+        auto* ip6 = rte_pktmbuf_mtod_offset(m, rte_ipv6_hdr*, l3_off);
         uint8_t nxt      = ip6->proto;
         uint8_t l4_extra = 0;        // D27 — extra bytes past the fixed
                                      // 40 B L3 header before L4 starts
@@ -1098,6 +1189,16 @@ static inline void classify_l3(const Ruleset* rs, rte_mbuf* m) {
             // D27 — Fragment extension header. Read the 8-byte
             // fragment header to differentiate first fragment
             // (offset == 0, carries L4) from subsequent (no L4).
+            //
+            // D31 — need 8 more bytes past the IPv6 fixed header
+            // before reading fh. A truncated fragment-ext header
+            // is dropped (we cannot tell first vs non-first).
+            if (unlikely(m->pkt_len < l3_off + sizeof(rte_ipv6_hdr) +
+                                      sizeof(rte_ipv6_fragment_ext))) {
+                ctx_stats_bump_pkt_truncated(ctx, "l3_v6_frag_ext");
+                dyn->verdict_layer = TERMINAL_DROP;
+                return;
+            }
             auto* fh = rte_pktmbuf_mtod_offset(
                 m, rte_ipv6_fragment_ext*,
                 l3_off + sizeof(rte_ipv6_hdr));
@@ -1180,7 +1281,8 @@ which variant is enabled in each shipping phase.
 ### 5.4 Layer 4 classifier (D15 — compound primary + filter mask)
 
 ```cpp
-static inline void classify_l4(const Ruleset* rs, rte_mbuf* m) {
+static inline void classify_l4(WorkerCtx* ctx, const Ruleset* rs,
+                               rte_mbuf* m) {
     auto* dyn = mbuf_dyn(m);
     if (dyn->flags & SKIP_L4) {
         dyn->verdict_layer = TERMINAL_PASS;  // L3 verdict / default applies
@@ -1199,6 +1301,23 @@ static inline void classify_l4(const Ruleset* rs, rte_mbuf* m) {
         l4off    = l3off + ((ip->version_ihl & 0x0F) << 2);
     } else { // IPv6
         l4off    = l3off + sizeof(rte_ipv6_hdr) + dyn->l4_extra;
+    }
+
+    // D31 — minimum bytes we'll read at l4off:
+    //   TCP/UDP/SCTP: 4 B (src+dst port pair, big enough for the
+    //                 unified compound key shape)
+    //   ICMP/ICMPv6:  2 B (type+code)
+    //   other:        0 (handled below as a no-op)
+    uint16_t need = 0;
+    if (proto == IPPROTO_TCP || proto == IPPROTO_UDP ||
+        proto == IPPROTO_SCTP)         need = 4;
+    else if (proto == IPPROTO_ICMP ||
+             proto == IPPROTO_ICMPV6)  need = 2;
+
+    if (unlikely(need && m->pkt_len < (uint32_t)l4off + need)) {
+        ctx_stats_bump_pkt_truncated(ctx, "l4");
+        dyn->verdict_layer = TERMINAL_DROP;
+        return;
     }
 
     uint16_t sport = 0, dport = 0;
@@ -1609,7 +1728,8 @@ file change ───►
    │                │                                  └─emit reload_done log+metric
    │                │
    │                └─on parse/validate/compile failure: log, bump
-   │                   reload_failures_total, leave g_active untouched
+   │                   reload_total{result="parse_err|validate_err|
+   │                   compile_err|oom"}, leave g_active untouched
 ```
 
 ### 6.4 Shutdown
@@ -1795,10 +1915,69 @@ quiescent publication releases all references.
 
 Writer (control thread on reload):
 
+**Single funnel**. Every reload entry point — the inotify watcher,
+the UDS `cmd_socket` `{"cmd":"reload"}` verb, the `rte_telemetry`
+`/pktgate/reload` flag, and any future push channel — calls into
+this **one** `deploy()` function. There is no second copy of the
+publish pipeline anywhere in the control plane. The
+`g_cp.reload_mutex` (D35, declared in §4.5) is acquired at the top
+of `deploy()` and held across compile, publish, GC, and the §9.4
+`pending_free` operations, so by construction `g_active` has
+exactly one writer at a time even when multiple sources fire
+concurrently. Threads contending for the mutex serialize cleanly;
+nested reload from the same thread is structurally impossible
+(`deploy` is a leaf in the call graph and never recurses).
+
+**D37 — validator budget pre-flight**. Between `validate(*cfg)` and
+`compile_*` the validator runs a **pure-arithmetic** memory and
+ceiling check against the live sizing config. The goal is to fail
+a hostile or careless reload **before** the compiler has touched
+any hugepage, so a "10⁹-port-list expansion" or "256k synthetic
+rules" payload can never even allocate. Three independent gates,
+all hard-failing with a structured error:
+
+- **Per-rule expansion ceiling.** Each rule's compile-time
+  expansion (port lists, prefix lists, address-group inlining) is
+  bounded by `sizing.max_expansion_per_rule` (default 4096 entries
+  per rule). Operators wanting larger expansions raise the bound
+  explicitly in `sizing` — there is no silent compiler accommodation.
+- **Aggregate post-expansion ceiling.** The sum of all per-rule
+  expansions must fit inside `sizing.l{2,3,4}_entries_max`. This
+  is the same number §4.3 / §8.4 already use for arena sizing;
+  the validator verifies the rule set fits **before** the
+  compiler is asked to populate the arenas.
+- **Hugepage budget.** The validator computes a conservative
+  `expected_ruleset_bytes(cfg, sizing)` from the same formulas as
+  §8.1 / §8.2 (Ruleset arenas + FIB tries + hash tables) and
+  refuses the reload if it exceeds free hugepages on the
+  control-plane socket minus a safety margin. This is a
+  pre-flight estimate, not an allocator probe — the goal is to
+  reject obviously oversized configs in a few microseconds rather
+  than discover OOM 30 ms into `ruleset_build`.
+
+Failure on any gate returns `Err::ValidateBudget` and bumps
+`reload_total{result="validate_err"}` (sub-reason in the structured
+log: `expansion_per_rule | aggregate | hugepage_budget`). The
+configured sizing limits are surfaced via
+`rte_telemetry /pktgate/sizing` so operators can introspect the
+ceilings without grepping the binary.
+
 ```cpp
 expected<void> deploy(std::string path) {
+    // D35 — funnel guard. ALL reload entry points end here, so
+    // this single mutex serializes the entire compile/publish/GC
+    // pipeline against itself. Held across the bounded rcu_check
+    // (§9.2 D30) so the §9.4 pending_free push/drain happens
+    // under the same lock as everything else that touches
+    // g_cp.pending_free.
+    std::lock_guard<pthread_mutex_t> _g(g_cp.reload_mutex);
+
     auto cfg = parse(path);                     if (!cfg) return cfg.error();
     auto v   = validate(*cfg);                  if (!v)   return v.error();
+    // D37 — pure-arithmetic pre-flight: per-rule expansion ceiling,
+    // aggregate post-expansion ceiling, hugepage budget. Rejects
+    // hostile / oversized configs before any compiler allocation.
+    auto vb  = validate_budget(*cfg, sizing);   if (!vb)  return vb.error();
     auto co  = compile_objects(cfg->objects);   if (!co)  return co.error();
     auto cr  = compile_rules(cfg->pipeline, *co, sizing);
                                                 if (!cr)  return cr.error();
@@ -1907,9 +2086,16 @@ the customer-visible SLO.
 - **Failed reload**: any `expected<>` error returns cleanly; the
   active ruleset is never replaced. The partially-built new ruleset
   is destroyed by the `unique_ptr` path.
-- **Nested reload**: the inotify thread holds a reload mutex; only
-  one reload runs at a time. Subsequent events coalesce into one
-  follow-up reload.
+- **Nested / concurrent reload** (D35): the single
+  `g_cp.reload_mutex` serializes every reload entry point —
+  inotify, UDS `cmd_socket` `reload`, `rte_telemetry`
+  `/pktgate/reload` flag — through one `deploy()` call. The
+  inotify watcher additionally **debounces** rapid file events
+  into one trigger, so a burst of writes coalesces before it ever
+  reaches the funnel; the mutex is the backstop for the
+  cross-channel case (e.g. UDS reload arrives while inotify is
+  mid-deploy). Subsequent contention is plain lock waiting; no
+  reload is lost.
 - **Hugepage exhaustion mid-build**: `ruleset_build` returns
   `ENOMEM`, old ruleset stays, `reload_oom_total` increments,
   operator alert fires.
@@ -2054,8 +2240,15 @@ pktgate_lcore_packets_total{lcore}                                counter
 pktgate_lcore_cycles_per_burst{lcore}                             histogram
 pktgate_lcore_idle_iters_total{lcore}                             counter
 pktgate_lcore_l4_skipped_ipv6_extheader_total{lcore}              counter
+pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total{lcore}      counter  # D27
 pktgate_lcore_tag_pcp_noop_untagged_total{lcore}                  counter
 pktgate_lcore_dispatch_unreachable_total{lcore}                   counter
+# D31 — per-stage truncation guards (§5.2 / §5.3 / §5.4).
+# `where` ∈ {l2, l2_vlan, l3_v4, l3_v6, l3_v6_frag_ext, l4}.
+pktgate_lcore_pkt_truncated_total{lcore,where}                    counter
+# D32 — QinQ outer (0x88A8) accepted by §5.2 fast path; the inner
+# C-tag is left unparsed in this phase.
+pktgate_lcore_qinq_outer_only_total{lcore}                        counter
 pktgate_redirect_dropped_total{lcore,port}                        counter
 pktgate_mirror_dropped_total{lcore,port}                          counter
 
@@ -2064,13 +2257,23 @@ pktgate_reload_latency_seconds                                    histogram
 pktgate_reload_pending_free_depth                                 gauge   # D36
 pktgate_active_generation                                         gauge
 pktgate_active_rules{layer}                                       gauge
+# D38 — UDS peer-cred rejections.
+pktgate_cmd_socket_rejected_total{reason="peer_uid|peer_gid"}     counter
 
 pktgate_mempool_in_use{socket}                                    gauge
 pktgate_mempool_free{socket}                                      gauge
 
 pktgate_watchdog_restarts_total                                   counter
 pktgate_bypass_active                                             gauge (0/1)
+pktgate_log_dropped_total                                         counter  # §10.5
 ```
+
+**D33 — counter consistency invariant.** Every counter named in the
+prose of §3a / §4.3 / §5 / §11 / §15 / review-notes also appears in
+the list above. The validator-budget sub-reasons are exposed via
+`reload_total{result="validate_err"}`'s structured-log payload, not
+as a separate metric (the failure rate is the operationally
+interesting signal — sub-reason is for forensics).
 
 ### 10.4 sFlow details
 
@@ -2113,6 +2316,38 @@ delimited JSON:
 {"cmd":"counters","layer":"l3","id":42}
 {"cmd":"activate"}      // exit --standby park state
 ```
+
+**D38 — peer authentication.** Filesystem permissions
+(`mode 0600`, owner `pktgate:pktgate`) are the first gate, but the
+control thread additionally enforces caller identity at
+`accept(2)` time using `SO_PEERCRED`. The accepted ucred must
+satisfy **both**:
+
+1. `uid == 0` *or* `uid == pktgate_uid` (the daemon's own uid;
+   needed so the watchdog can self-reload), AND
+2. `gid` ∈ a configurable allow-list (`config.cmd_socket.allow_gids`,
+   default: just `pktgate_gid`).
+
+A peer that fails the check is logged at warn (`peer_uid`,
+`peer_gid`, `peer_pid`), the connection is closed immediately,
+and `pktgate_cmd_socket_rejected_total{reason="peer_uid|peer_gid"}`
+is bumped. Mutating verbs (`reload`, `activate`) additionally
+require the connection to have been authenticated this way — a
+read-only `status`/`dump-*` is allowed for any allow-listed peer.
+This blocks the local-unprivileged-user attack against a
+permissive `0666` socket left over from a misconfigured
+deployment.
+
+**D38 — inotify event filtering.** The directory watcher subscribes
+to `IN_CLOSE_WRITE | IN_MOVED_TO` only — *not* `IN_MODIFY`. The
+former two fire exactly once per atomic file replacement
+(`mv tmp file` or `editor-buffer-flush; close`), so the parser
+sees a fully-formed config; `IN_MODIFY` fires on every partial
+write and would race the parser against in-progress edits. The
+debounce window (§9.3) collapses bursts of these events into one
+deploy. `inotify_init1` uses `IN_NONBLOCK | IN_CLOEXEC`, and the
+watch is set on the **directory**, never on the file itself, so
+atomic-replace via rename is observed correctly.
 
 ## 11. Failure modes and responses
 
