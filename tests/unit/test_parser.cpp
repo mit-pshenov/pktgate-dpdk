@@ -1271,12 +1271,95 @@ TEST(ParserU1_27, SizingBelowHardMinRejected) {
 }
 
 // -------------------------------------------------------------------------
-// U1.28 — `objects.subnets` parses each name → CIDR list entry into
+// U1.28 — rule-side `src_subnet` reference preserved unresolved.
+//
+// A layer_3 rule with `"src_subnet": "corp_v4"` parses into the AST
+// with the name stashed as an unresolved reference. The parser does
+// NOT resolve the name to any concrete `SubnetId` / CIDR list: that
+// mapping is the validator's job in C8. This test pins the contract
+// at the parser layer.
+//
+// Contract assertions:
+//   * parse succeeds.
+//   * the produced layer_3 rule holds a non-empty `src_subnet`
+//     optional whose `SubnetRef::name` equals the literal from the
+//     JSON document.
+//   * no side effects into `objects.subnets` — the pool must stay
+//     empty because nothing defined the name yet; this also proves
+//     the parser did not attempt resolution.
+//
+// Covers: D8 (strict object model, parser vs validator separation).
+
+TEST(ParserU1_28, RuleSrcSubnetRefUnresolvedPreserved) {
+  const std::string doc = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [ { "id": 4201, "src_subnet": "corp_v4" } ],
+    "layer_4": []
+  },
+  "default_behavior": "drop"
+})json";
+
+  const ParseResult result = parse(doc);
+  ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+  const Config& cfg = get_ok(result);
+
+  ASSERT_EQ(cfg.pipeline.layer_3.size(), 1u);
+  const auto& rule = cfg.pipeline.layer_3[0];
+  EXPECT_EQ(rule.id, 4201);
+  ASSERT_TRUE(rule.src_subnet.has_value())
+      << "parser dropped the src_subnet reference — rule.src_subnet is empty";
+  EXPECT_EQ(rule.src_subnet->name, "corp_v4");
+
+  // Proof-of-no-resolution: the parser did not fabricate an objects.subnets
+  // entry on our behalf. The pool stays whatever was in the document
+  // (nothing in this case). Resolution → C8 validator.
+  EXPECT_TRUE(cfg.objects.subnets.empty())
+      << "parser must not resolve src_subnet into objects.subnets; "
+         "that's C8 validator work";
+
+  // Also exercise the type-check contract — non-string src_subnet must
+  // be rejected with kTypeMismatch, not silently stringified or dropped.
+  {
+    const std::string bad = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [ { "id": 4202, "src_subnet": 42 } ],
+    "layer_4": []
+  },
+  "default_behavior": "drop"
+})json";
+    const ParseResult r2 = parse(bad);
+    ASSERT_FALSE(is_ok(r2));
+    EXPECT_EQ(err_kind(r2), ParseError::kTypeMismatch);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.32 — `objects.subnets` parses each name → CIDR list entry into
 // the unresolved ObjectPool. IPv4 entries land as Cidr4, IPv6 entries
 // as Cidr6. Malformed CIDRs surface kBadCidr. No dangling-ref check
 // here (that's the validator's C7+ job).
+//
+// NOTE: this test was originally filed as U1.28 in C6 but actually
+// covers the definition-side `objects.subnets` dictionary parsing.
+// The literal U1.28 (rule-side `src_subnet` reference preserved
+// unresolved) lives in `ParserU1_28,
+// RuleSrcSubnetRefUnresolvedPreserved` above. C6.5 retroactive fix:
+// add a new row U1.32 in test-plan-drafts/unit.md for the contract
+// this test body actually exercises, and rename the fixture to match.
 
-TEST(ParserU1_28, ObjectsSubnetsParseAndRejectBadCidr) {
+TEST(ParserU1_32, ObjectsSubnetsDictionaryParses) {
   // Happy path — two named subnets, mixed IPv4 and IPv6.
   {
     const std::string doc = make_doc_with_sections("", R"({

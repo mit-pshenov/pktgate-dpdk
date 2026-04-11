@@ -209,6 +209,20 @@ No EAL, no mempool, no sockets.
   expected size.
 - Covers: D6, performance regression guard.
 
+### U1.32 `objects.subnets` dictionary parses
+- Goal: the `objects.subnets` top-level dictionary parses as an
+  ordered list of `SubnetObject` entries (name → list of CIDRs).
+  Each CIDR element is a string, parsed via `addr.h` into a
+  `SubnetCidr` sum of (`Cidr4`, `Cidr6`); v4/v6 may be mixed in
+  one named subnet. Missing `objects` section produces an empty
+  pool, not an error. Malformed CIDR → `kBadCidr` with the
+  offending literal named in the message. Non-string CIDR list
+  element → `kTypeMismatch`. Unknown key under `objects` (e.g.
+  `mac_groups`) → `kUnknownField` — C6 only implements `subnets`.
+  Dangling rule → pool references are **not** checked here; that
+  is the validator's job (C7+).
+- Covers: D8 (strict object dict parsing, object model).
+
 ---
 
 ## U2 — Validator (`src/config/validator.*`)
@@ -1228,7 +1242,7 @@ function taking struct values. No real socket, no real fork.
 | **D5** | HA compat: interface_roles, --standby | U1.4–U1.7, U2.3, U2.4, U2.11 | integration for --standby park/activate end-to-end |
 | **D6** | Runtime sizing, dev vs prod | U1.25–U1.27, U4.1 | — |
 | **D7** | Mirror schema full, MVP reject | U2.12, U3.17 | functional: once mirror actually ships |
-| **D8** | Clean schema, no pktgate compat | U1.2–U1.31, U2.1–U2.20 | — |
+| **D8** | Clean schema, no pktgate compat | U1.2–U1.32, U2.1–U2.20 | — |
 | **D9** | Single global `g_active`, no per-lcore slot | U6.42, U6.43 | integration: real RCU swap with EAL |
 | **D10** | Rewrite §4.4/§5.5 per D1 | U5.*, U6.58 | same as D1 |
 | **D11** | rl_arena GC ordering after synchronize | U4.11, U4.13 | integration: real RCU synchronize |

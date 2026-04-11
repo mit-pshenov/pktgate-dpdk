@@ -414,9 +414,12 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   }
 
   // Strict per-rule whitelist. C5 adds id/action/hw_offload_hint/tcp_flags.
-  constexpr std::array<std::string_view, 8> kAllowedRuleKeys = {
+  // C6.5 adds src_subnet (U1.28 — unresolved object reference,
+  // resolution happens in the C8 validator).
+  constexpr std::array<std::string_view, 9> kAllowedRuleKeys = {
       "id",       "dst_port",        "dst_ports", "vlan_id",
-      "pcp",      "hw_offload_hint", "tcp_flags", "action"};
+      "pcp",      "hw_offload_hint", "tcp_flags", "action",
+      "src_subnet"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     const std::string& key = it.key();
     bool allowed = false;
@@ -505,6 +508,21 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
       return *err;
     }
     out.action = act;
+  }
+
+  // C6.5 U1.28 — `src_subnet` unresolved object reference. Parser
+  // stores the raw name verbatim in a SubnetRef; validator (C8) maps
+  // it to an entry in `objects.subnets`. The parser stays dumb:
+  // empty-string and dangling-name detection are not our business.
+  // Only the structural type-check is enforced here.
+  if (j.contains("src_subnet")) {
+    const json& v = j["src_subnet"];
+    if (!v.is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'src_subnet' must be a string "
+                      "(object reference into objects.subnets)");
+    }
+    out.src_subnet = SubnetRef{v.get<std::string>()};
   }
   return std::nullopt;
 }

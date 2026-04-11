@@ -150,6 +150,19 @@ struct TcpFlags {
 };
 
 // -------------------------------------------------------------------------
+// SubnetRef (C6.5, D8). Unresolved reference to an entry in
+// `objects.subnets`. The parser stores the raw name verbatim; the
+// validator (C8) maps it to a concrete SubnetId / CIDR list. We keep
+// this as a named struct rather than a bare std::string so the AST
+// statically distinguishes "a name pointing at an object" from all the
+// other string-typed fields on Rule (role names, action targets).
+// Dangling-reference detection is explicitly out of parser scope.
+
+struct SubnetRef {
+  std::string name;
+};
+
+// -------------------------------------------------------------------------
 // Rule shell.
 //
 // C4 minimal surface: `dst_port`, `dst_ports`, `vlan_id`, `pcp`.
@@ -172,6 +185,10 @@ struct Rule {
   bool hw_offload_hint = false;          // U1.23 D4
   std::optional<TcpFlags> tcp_flags{};   // U1.30 D15
   std::optional<RuleAction> action{};    // U1.29 D15 exactly-one
+  // U1.28 / C6.5: unresolved `src_subnet` reference. Populated by the
+  // parser when a rule carries `"src_subnet": "<name>"`; the C8
+  // validator maps the name to an entry in `objects.subnets`.
+  std::optional<SubnetRef> src_subnet{};
 };
 
 // -------------------------------------------------------------------------
