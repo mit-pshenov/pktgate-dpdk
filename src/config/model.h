@@ -189,6 +189,14 @@ struct Rule {
   // parser when a rule carries `"src_subnet": "<name>"`; the C8
   // validator maps the name to an entry in `objects.subnets`.
   std::optional<SubnetRef> src_subnet{};
+  // C7 / U2.3 / U2.4 (D5): unresolved role name reference. Populated
+  // by the parser when a rule carries `"interface": "<name>"`; the
+  // validator maps the name to an entry in `interface_roles`.
+  // Named `interface_ref` rather than `interface` because `interface`
+  // is a reserved extension-identifier keyword under MSVC and the
+  // Objective-C dialect — avoiding the collision now keeps a future
+  // Windows host happy at zero cost.
+  std::optional<std::string> interface_ref{};
 };
 
 // -------------------------------------------------------------------------
@@ -248,6 +256,27 @@ struct Pipeline {
 };
 
 // -------------------------------------------------------------------------
+// cmd_socket (C7, D38 schema-only).
+//
+// `allow_gids` is an allow-list of gid values authorised to talk to
+// the control-plane Unix-domain socket. The real SO_PEERCRED check
+// against this list is M11 hot-plumbing work; C7 only wires the
+// schema + the validator-tier default.
+//
+// Why `std::optional<std::vector<...>>` and not a bare vector: the
+// validator has to distinguish three input shapes:
+//   1. section absent → fill with singleton `[getgid()]` default
+//   2. section present, no `allow_gids` key → same default (C8 may
+//      make this an error; C7 currently mirrors case 1)
+//   3. section present with explicit list → use verbatim
+// A bare vector collapses 1 and 3 ("empty means default"), which
+// would silently turn a typo'd empty list into full-open access.
+
+struct CmdSocket {
+  std::optional<std::vector<std::uint32_t>> allow_gids{};
+};
+
+// -------------------------------------------------------------------------
 // Top-level config
 
 struct Config {
@@ -258,6 +287,7 @@ struct Config {
   Pipeline pipeline{};
   Sizing sizing{};        // C6/D6 — filled with kSizingDevDefaults on absence
   ObjectPool objects{};   // C6 — unresolved; validator checks references (C7+)
+  CmdSocket cmd_socket{}; // C7/D38 — schema-only; validator fills default
 };
 
 }  // namespace pktgate::config

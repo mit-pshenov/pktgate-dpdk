@@ -24,3 +24,10 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_core
 )
+
+pktgate_add_test(
+  NAME    unit.test_validator
+  SOURCES test_validator.cpp
+  LABELS  unit
+  LINK    pktgate_core
+)

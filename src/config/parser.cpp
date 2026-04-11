@@ -45,7 +45,7 @@ using json = nlohmann::json;
 // Top-level key whitelist. Any key outside this set triggers kUnknownField.
 // Keep this in sync with model.h — when a new top-level field lands (e.g.
 // `sizing` in C6), add it here first, then wire its consumer.
-constexpr std::array<std::string_view, 7> kAllowedTopKeys = {
+constexpr std::array<std::string_view, 8> kAllowedTopKeys = {
     "version",          // required (D8 strict equality)
     "interface_roles",  // required (D5)
     "pipeline",         // required (empty in C1; layer_2/3/4 in C3+)
@@ -53,6 +53,7 @@ constexpr std::array<std::string_view, 7> kAllowedTopKeys = {
     "fragment_policy",  // optional (D17/P9 default l3_only)
     "sizing",           // optional (C6)
     "objects",          // optional (C6)
+    "cmd_socket",       // optional (C7/D38 schema-only)
 };
 
 // Tiny helper: build a ParseError in one expression.
@@ -414,12 +415,13 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   }
 
   // Strict per-rule whitelist. C5 adds id/action/hw_offload_hint/tcp_flags.
-  // C6.5 adds src_subnet (U1.28 — unresolved object reference,
-  // resolution happens in the C8 validator).
-  constexpr std::array<std::string_view, 9> kAllowedRuleKeys = {
-      "id",       "dst_port",        "dst_ports", "vlan_id",
-      "pcp",      "hw_offload_hint", "tcp_flags", "action",
-      "src_subnet"};
+  // C6.5 adds src_subnet (U1.28 — unresolved object reference).
+  // C7 adds `interface` (U2.3/U2.4 — unresolved interface_roles ref,
+  // resolution happens in the C7 validator).
+  constexpr std::array<std::string_view, 10> kAllowedRuleKeys = {
+      "id",         "dst_port",  "dst_ports",       "vlan_id",
+      "pcp",        "hw_offload_hint", "tcp_flags", "action",
+      "src_subnet", "interface"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     const std::string& key = it.key();
     bool allowed = false;
@@ -524,6 +526,91 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
     }
     out.src_subnet = SubnetRef{v.get<std::string>()};
   }
+
+  // C7 U2.3/U2.4 — `interface` unresolved role reference. Parser
+  // stores the raw name verbatim; the C7 validator maps it to an
+  // entry in `Config.interface_roles`. Parser stays dumb: only the
+  // structural type-check is enforced here (dangling detection is
+  // not parser business).
+  if (j.contains("interface")) {
+    const json& v = j["interface"];
+    if (!v.is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'interface' must be a string "
+                      "(role reference into interface_roles)");
+    }
+    out.interface_ref = v.get<std::string>();
+  }
+  return std::nullopt;
+}
+
+// -------------------------------------------------------------------------
+// parse_cmd_socket (C7, D38 schema-only). The section is strictly
+// whitelisted: only `allow_gids` is recognised. Absent key leaves
+// `out.allow_gids = nullopt` so the validator can distinguish it from
+// an explicit empty list. Validator tier applies the `[getgid()]`
+// default on absence — the parser deliberately does not.
+std::optional<ParseError> parse_cmd_socket(const json& j, CmdSocket& out) {
+  if (!j.is_object()) {
+    return make_err(ParseError::kTypeMismatch,
+                    "top-level 'cmd_socket' must be a JSON object");
+  }
+
+  // Strict per-cmd_socket whitelist. Any unknown key → kUnknownField.
+  constexpr std::array<std::string_view, 1> kAllowedCmdSocketKeys = {
+      "allow_gids"};
+  for (auto it = j.begin(); it != j.end(); ++it) {
+    const std::string& key = it.key();
+    bool allowed = false;
+    for (const auto& w : kAllowedCmdSocketKeys) {
+      if (key == w) {
+        allowed = true;
+        break;
+      }
+    }
+    if (!allowed) {
+      return make_err(ParseError::kUnknownField,
+                      std::string{"unknown cmd_socket field: '"} + key + "'");
+    }
+  }
+
+  if (!j.contains("allow_gids")) {
+    // Field absent — leave the optional empty so the validator's
+    // default path kicks in.
+    out.allow_gids.reset();
+    return std::nullopt;
+  }
+
+  const json& v = j["allow_gids"];
+  if (!v.is_array()) {
+    return make_err(ParseError::kTypeMismatch,
+                    "'cmd_socket.allow_gids' must be a JSON array of "
+                    "non-negative integers");
+  }
+
+  std::vector<std::uint32_t> gids;
+  gids.reserve(v.size());
+  for (std::size_t i = 0; i < v.size(); ++i) {
+    const json& e = v[i];
+    if (!e.is_number_integer()) {
+      return make_err(ParseError::kTypeMismatch,
+                      std::string{"'cmd_socket.allow_gids' element "} +
+                          std::to_string(i) +
+                          " must be an integer");
+    }
+    const std::int64_t raw = e.get<std::int64_t>();
+    if (raw < 0 ||
+        raw > static_cast<std::int64_t>(
+                  std::numeric_limits<std::uint32_t>::max())) {
+      return make_err(
+          ParseError::kOutOfRange,
+          std::string{"'cmd_socket.allow_gids' element "} +
+              std::to_string(i) + " = " + std::to_string(raw) +
+              " out of range [0..4294967295]");
+    }
+    gids.push_back(static_cast<std::uint32_t>(raw));
+  }
+  out.allow_gids = std::move(gids);
   return std::nullopt;
 }
 
@@ -793,6 +880,17 @@ ParseResult parse(std::string_view json_text) {
   // accepts well-formed entries and fails on malformed CIDRs.
   if (doc.contains("objects")) {
     if (auto err = parse_objects(doc["objects"], cfg.objects); err) {
+      return *err;
+    }
+  }
+
+  // ---- 11. cmd_socket (C7 / D38 schema-only) ----------------------------
+  //
+  // Schema-only: the parser validates shape and bounds; the validator
+  // tier applies the `[getgid()]` default when the section is absent.
+  // Real SO_PEERCRED plumbing against allow_gids is M11.
+  if (doc.contains("cmd_socket")) {
+    if (auto err = parse_cmd_socket(doc["cmd_socket"], cfg.cmd_socket); err) {
       return *err;
     }
   }
