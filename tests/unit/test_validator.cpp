@@ -1,8 +1,8 @@
 // tests/unit/test_validator.cpp
 //
-// M1 C7 — validator scaffolding + object/role resolution + cmd_socket
-// schema. Transcribes `test-plan-drafts/unit.md` U2.1/U2.2/U2.3/U2.4/U2.18
-// into real gtest code.
+// M1 C7 / C7.5 — validator scaffolding + object/role resolution +
+// cmd_socket schema. Transcribes `test-plan-drafts/unit.md`
+// U2.1/U2.2/U2.3/U2.4/U2.18 into real gtest code.
 //
 // Target: `libpktgate_core.a` → `pktgate::config::validate`.
 // No EAL, no mempool, no DPDK includes — strictly pure-C++.
@@ -17,10 +17,23 @@
 //   * Two error kinds land in this cycle: `kUnresolvedObject` (U2.2)
 //     and `kUnresolvedInterfaceRef` (U2.4). Every other kind is out of
 //     C7 scope and lives in C8+.
-//   * U2.18 exercises the allow_gids schema parse + validator default.
-//     The parser stores the field as an optional-of-vector so the
-//     validator can distinguish "absent" (fill with singleton getgid())
-//     from "present but empty". Design rationale lives in validator.cpp.
+//   * C7.5 update: U2.18 is now a **negative assertion** — the parser
+//     and validator must NEVER resolve a gid default. The
+//     `std::nullopt` sentinel survives verbatim through parse+validate;
+//     real gid resolution happens at M11 cmd_socket bind time, after
+//     the daemon has dropped privileges to the pktgate user. Validating
+//     offline as root and then running as pktgate must not silently
+//     capture the wrong gid.
+//
+// CTEST-SCAN: no gid resolution at parse/validate tier.
+// A lint (grep for `getgid|getgrnam|getgrouplist|initgroups`) over
+// `src/config/` must return empty. U2.18 pins the behavioural half of
+// that invariant (sentinel survives); the grep lint pins the static
+// half (no syscall site exists to begin with). Path chosen: (a) —
+// see C7.5 supervisor prompt. Path (b) (injection-seam with a counting
+// fake resolver) was considered but rejected because it would add an
+// API surface that a future cycle could abuse; the grep lint + this
+// test together encode the rule at lower maintenance cost.
 
 #include <gtest/gtest.h>
 
@@ -241,18 +254,34 @@ TEST(ValidatorU2_4, InterfaceRefDangling) {
 }
 
 // -------------------------------------------------------------------------
-// U2.18 — `cmd_socket.allow_gids` parses and defaults (D38 schema-only).
+// U2.18 — `cmd_socket.allow_gids` parses; resolution deferred to daemon
+// init (C7.5 rewrite as **negative assertion**, D38).
 //
-// (a) Explicit list `[1, 2, 3]` survives parse + validate as-is.
-// (b) Absent section → validator fills a singleton `[getgid()]`.
+// This test pins two things:
 //
-// The "singleton [pktgate_gid]" in the U-test goal means the gid the
-// daemon runs as at validate time; the MVP approximation is `getgid()`
-// (same answer in a single-user dev VM, distinct in a prod drop-privs
-// setup — real SO_PEERCRED plumbing is M11, not M1).
+//   (a) Positive: an explicit list parses and survives validate verbatim
+//       as `std::optional<std::vector<gid_t>>` with the exact values.
+//       Explicit-empty `[]` is distinct from absent — the optional
+//       wrapper is load-bearing.
+//   (b) Negative: when `cmd_socket` is absent, or when `cmd_socket` is
+//       present with no `allow_gids` key, the optional stays
+//       `std::nullopt` after validate. **The validator must not invent
+//       a default.** Offline `--validate-config` may run as a different
+//       user than the final daemon; silently capturing `::getgid()` at
+//       validate time would drift from the gid that M11's SO_PEERCRED
+//       check will eventually use at cmd_socket bind (after drop-privs
+//       to the pktgate user).
+//
+// Path (a) was chosen over an injection-seam (path b): this test pins
+// "sentinel survives", and the static half — "no gid-resolution syscall
+// exists anywhere under `src/config/`" — is enforced by a grep lint
+// over `getgid|getgrnam|getgrouplist|initgroups`. Belt-and-suspenders
+// via a counting fake resolver would add an API surface that a future
+// cycle could accidentally wire up; the grep lint is cheaper and
+// strictly stronger.
 
-TEST(ValidatorU2_18, CmdSocketAllowGidsParsesAndDefaults) {
-  // (a) Explicit list.
+TEST(ValidatorU2_18, CmdSocketAllowGidsDefersResolution) {
+  // (a) Positive — explicit list survives parse+validate verbatim.
   {
     const std::string doc =
         make_doc_with_cmd_socket(R"({ "allow_gids": [1, 2, 3] })");
@@ -266,15 +295,17 @@ TEST(ValidatorU2_18, CmdSocketAllowGidsParsesAndDefaults) {
         << static_cast<int>(v_get_err(vr).kind)
         << " msg=" << v_get_err(vr).message;
 
-    ASSERT_TRUE(cfg.cmd_socket.allow_gids.has_value());
+    ASSERT_TRUE(cfg.cmd_socket.allow_gids.has_value())
+        << "explicit list must survive into the validated Config";
     const auto& gids = cfg.cmd_socket.allow_gids.value();
     ASSERT_EQ(gids.size(), 3u);
-    EXPECT_EQ(gids[0], 1u);
-    EXPECT_EQ(gids[1], 2u);
-    EXPECT_EQ(gids[2], 3u);
+    EXPECT_EQ(gids[0], static_cast<::gid_t>(1));
+    EXPECT_EQ(gids[1], static_cast<::gid_t>(2));
+    EXPECT_EQ(gids[2], static_cast<::gid_t>(3));
   }
 
-  // (b) Absent section → default-filled singleton.
+  // (b.1) Negative — `cmd_socket` section absent entirely: nullopt
+  // survives. The validator MUST NOT invent a default.
   {
     const std::string doc = make_doc_no_cmd_socket();
     const ParseResult pr = parse(doc);
@@ -287,10 +318,54 @@ TEST(ValidatorU2_18, CmdSocketAllowGidsParsesAndDefaults) {
         << static_cast<int>(v_get_err(vr).kind)
         << " msg=" << v_get_err(vr).message;
 
-    ASSERT_TRUE(cfg.cmd_socket.allow_gids.has_value());
-    const auto& gids = cfg.cmd_socket.allow_gids.value();
-    ASSERT_EQ(gids.size(), 1u);
-    EXPECT_EQ(gids[0], static_cast<std::uint32_t>(::getgid()));
+    ASSERT_FALSE(cfg.cmd_socket.allow_gids.has_value())
+        << "validator default-filled allow_gids when cmd_socket was "
+           "absent — resolution must be deferred to M11 daemon init, "
+           "not captured at validate time (offline --validate-config "
+           "running as a different user would drift silently).";
+  }
+
+  // (b.2) Negative — `cmd_socket` present but `allow_gids` absent:
+  // same rule. Presence of the section alone is not a request to
+  // resolve a default.
+  {
+    const std::string doc = make_doc_with_cmd_socket(R"({})");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected empty cmd_socket; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+
+    ASSERT_FALSE(cfg.cmd_socket.allow_gids.has_value())
+        << "validator invented a default for cmd_socket.allow_gids "
+           "when the section existed but the key was absent — the "
+           "std::nullopt sentinel must survive verbatim.";
+  }
+
+  // (c) Explicit empty list is distinct from absent. This is the
+  // whole reason `allow_gids` is wrapped in std::optional: an
+  // explicit `[]` means "deny all peers" and must not collapse
+  // into the "absent" sentinel.
+  {
+    const std::string doc =
+        make_doc_with_cmd_socket(R"({ "allow_gids": [] })");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected explicit empty allow_gids; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+
+    ASSERT_TRUE(cfg.cmd_socket.allow_gids.has_value())
+        << "explicit empty list must remain distinguishable from absent";
+    EXPECT_EQ(cfg.cmd_socket.allow_gids->size(), 0u);
   }
 }
 

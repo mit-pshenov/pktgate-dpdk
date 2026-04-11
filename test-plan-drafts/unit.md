@@ -328,10 +328,17 @@ No EAL, no mempool, no sockets.
   asserts it was never called.
 - Covers: D37.
 
-### U2.18 `cmd_socket.allow_gids` parses and defaults
-- Goal: schema field parses as a list of ints, default is
-  singleton `[pktgate_gid]`.
-- Covers: D38.
+### U2.18 `cmd_socket.allow_gids` parses; resolution deferred to daemon init
+- Goal: parser accepts an explicit `allow_gids` list (non-negative
+  integers → `gid_t`). Absent `cmd_socket` or absent `allow_gids`
+  leaves `Config.cmd_socket.allow_gids` as `std::nullopt` — the
+  sentinel "resolve at daemon init (M11)".
+- Negative assertion: neither parser nor validator may invoke
+  `::getgid()` / `::getgrnam()` / any gid-resolution syscall.
+  Resolution is M11 cmd_socket bind territory, after the daemon
+  has dropped to the pktgate user. Offline `--validate-config`
+  running as a different user must not capture the wrong gid.
+- Covers: D38 (schema-only at M1; real SO_PEERCRED in M11).
 
 ### U2.19 Layer evaluation order enforced by validator
 - Goal: a rule with `next_layer: "l2"` from inside layer_3 is

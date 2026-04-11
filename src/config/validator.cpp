@@ -1,6 +1,6 @@
 // src/config/validator.cpp
 //
-// M1 C7 GREEN — validator scaffolding. Implements exactly the contract
+// M1 C7 / C7.5 — validator scaffolding. Implements the contract
 // U2.1 / U2.2 / U2.3 / U2.4 / U2.18 exercise:
 //
 //   * Walk every Rule in Pipeline.layer_{2,3,4}. For each rule:
@@ -8,34 +8,46 @@
 //         `Config.objects.subnets`. Miss → kUnresolvedObject.
 //       - If `interface_ref` is set, look up the name in
 //         `Config.interface_roles`. Miss → kUnresolvedInterfaceRef.
-//   * If `Config.cmd_socket.allow_gids` is still nullopt after parse,
-//     fill it with a singleton `[getgid()]`.
+//   * `Config.cmd_socket.allow_gids` is **pass-through**. An explicit
+//     list survives verbatim; `std::nullopt` stays `std::nullopt`.
+//     The validator NEVER resolves a default and NEVER calls
+//     `::getgid()` / `::getgrnam()` / any gid-resolution syscall.
 //
 // D-refs: D5 (interface_roles), D8 (object model), D38 (allow_gids
-// schema-only, real SO_PEERCRED is M11).
+// schema-only; real SO_PEERCRED is M11).
 //
-// Why `getgid()` and not a compile-time constant: U2.18's goal sentence
-// reads "default is singleton [pktgate_gid]". In a single-user dev VM
-// the gid the daemon runs under IS `getgid()`; in a drop-privs prod
-// build (where pktgate runs as a dedicated service user) the daemon
-// still reads its own effective gid at startup. The key property
-// U2.18 pins is "one entry, matching the daemon's own gid" — which is
-// exactly `getgid()`. The real privilege-separation story (setgid +
-// SO_PEERCRED checks on the control-plane socket) is M11, not M1.
+// Why allow_gids resolution is deferred (C7.5 fix, overrides the C7
+// default-fill that lived here briefly):
+//
+//   Offline `--validate-config` may run as a different user than the
+//   daemon. If the validator captured `::getgid()` at validate time,
+//   an operator running `pktgate --validate-config foo.json` as root
+//   would silently store root's gid in the validated Config. The
+//   daemon — after drop-privs to the `pktgate` service user at M11
+//   bind time — would then diverge from what SO_PEERCRED eventually
+//   checks. The drift is silent: both the validate and the bind
+//   "succeed", but the wrong gid ends up on the allow-list.
+//
+//   Resolution is a runtime-context-dependent concern and belongs at
+//   cmd_socket bind time, after the process has already become the
+//   daemon user. The `std::nullopt` sentinel carries this intent
+//   through the AST: "I don't know yet, ask the bind path".
+//
+// CTEST-SCAN: no gid resolution at parse/validate tier.
+// A `grep -rE 'getgid|getgrnam|getgrouplist|initgroups' src/config/`
+// must return empty. U2.18 pins the behavioural half of the rule
+// (sentinel survives through validate); the grep lint pins the
+// static half (no syscall site exists).
 //
 // Invariant kept by this tier:
 //   * The validator does NOT touch any field the parser populated.
-//     The only mutation is the allow_gids default-fill. A future C8
-//     cycle may populate a resolved-index sidecar on Rule, but C7
-//     leaves the AST otherwise untouched.
+//     C7.5 makes this stricter: no default-fill, no mutation. A
+//     future C8+ cycle may populate a resolved-index sidecar on
+//     Rule, but the parser-populated fields stay immutable.
 
 #include "src/config/validator.h"
 
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <cstddef>
-#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -130,19 +142,14 @@ ValidateResult validate(Config& cfg) {
     return *err;
   }
 
-  // ---- cmd_socket.allow_gids default-fill (U2.18, D38 schema-only) ------
+  // ---- cmd_socket.allow_gids: PASS-THROUGH (U2.18, C7.5) -----------------
   //
-  // The parser leaves allow_gids as nullopt when:
-  //   * the top-level cmd_socket section is absent, OR
-  //   * cmd_socket is present but `allow_gids` is absent.
-  // In both cases the validator fills a singleton `[getgid()]` so the
-  // downstream control-plane code can treat `allow_gids.value()` as
-  // always-populated. An explicit empty list (`[]`) remains distinct —
-  // it survives into the runtime as "deny all" (tested by C8+).
-  if (!cfg.cmd_socket.allow_gids.has_value()) {
-    const std::uint32_t self_gid = static_cast<std::uint32_t>(::getgid());
-    cfg.cmd_socket.allow_gids = std::vector<std::uint32_t>{self_gid};
-  }
+  // No default-fill. If the parser left `allow_gids = std::nullopt`,
+  // it stays nullopt — the M11 cmd_socket bind path will resolve the
+  // default at the moment the process has dropped privileges to the
+  // pktgate service user. An explicit list (possibly empty) survives
+  // verbatim. See the file-top comment for the "offline validate as
+  // root captures wrong gid" drift argument this fix closes.
 
   return ValidateOk{};
 }

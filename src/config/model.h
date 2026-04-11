@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include <sys/types.h>  // ::gid_t (POSIX); used by CmdSocket.allow_gids.
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -256,24 +258,41 @@ struct Pipeline {
 };
 
 // -------------------------------------------------------------------------
-// cmd_socket (C7, D38 schema-only).
+// cmd_socket (C7, D38 schema-only; C7.5 defers resolution).
 //
 // `allow_gids` is an allow-list of gid values authorised to talk to
 // the control-plane Unix-domain socket. The real SO_PEERCRED check
-// against this list is M11 hot-plumbing work; C7 only wires the
-// schema + the validator-tier default.
+// against this list is M11 hot-plumbing work; M1 only wires the
+// schema.
+//
+// Element type is `::gid_t` (POSIX, unsigned on every Linux libc we
+// target). Keeping the native type here — rather than a bare
+// `uint32_t` — makes the M11 `getsockopt(SO_PEERCRED → ucred.gid)`
+// comparison a direct `==` with no casts, and documents at the type
+// level that these are process-credential gids, not arbitrary ints.
 //
 // Why `std::optional<std::vector<...>>` and not a bare vector: the
-// validator has to distinguish three input shapes:
-//   1. section absent → fill with singleton `[getgid()]` default
-//   2. section present, no `allow_gids` key → same default (C8 may
-//      make this an error; C7 currently mirrors case 1)
-//   3. section present with explicit list → use verbatim
-// A bare vector collapses 1 and 3 ("empty means default"), which
-// would silently turn a typo'd empty list into full-open access.
+// validator must distinguish three input shapes:
+//   1. section absent                         → std::nullopt
+//   2. section present, no `allow_gids` key    → std::nullopt
+//   3. section present with explicit list     → populated vector
+//                                                (possibly empty)
+// Case 3 with an empty list means "deny all" and is load-bearing —
+// collapsing it into "absent" would silently turn a typo'd empty
+// list into full-open access.
+//
+// **Sentinel `std::nullopt` means "resolve at daemon init (M11)".
+// Parser and validator never invent a default.** Doing gid
+// resolution at parse or validate time breaks offline
+// `--validate-config`: an operator running validate as root would
+// capture root's gid, and the runtime daemon — after drop-privs to
+// the `pktgate` service user — would silently diverge from the
+// list that SO_PEERCRED eventually checks. Resolution is a runtime-
+// context-dependent concern and belongs at cmd_socket bind time,
+// not here.
 
 struct CmdSocket {
-  std::optional<std::vector<std::uint32_t>> allow_gids{};
+  std::optional<std::vector<::gid_t>> allow_gids{};
 };
 
 // -------------------------------------------------------------------------

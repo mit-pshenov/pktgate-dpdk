@@ -545,11 +545,13 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
 }
 
 // -------------------------------------------------------------------------
-// parse_cmd_socket (C7, D38 schema-only). The section is strictly
-// whitelisted: only `allow_gids` is recognised. Absent key leaves
-// `out.allow_gids = nullopt` so the validator can distinguish it from
-// an explicit empty list. Validator tier applies the `[getgid()]`
-// default on absence — the parser deliberately does not.
+// parse_cmd_socket (C7, D38 schema-only; C7.5 defers resolution).
+// The section is strictly whitelisted: only `allow_gids` is
+// recognised. Absent key leaves `out.allow_gids = nullopt`; that
+// sentinel means "resolve at daemon init (M11)". Neither the parser
+// nor the validator ever invokes `::getgid()` / `::getgrnam()` / any
+// gid-resolution syscall — see the model.h CmdSocket comment for
+// the offline `--validate-config` drift argument.
 std::optional<ParseError> parse_cmd_socket(const json& j, CmdSocket& out) {
   if (!j.is_object()) {
     return make_err(ParseError::kTypeMismatch,
@@ -588,7 +590,13 @@ std::optional<ParseError> parse_cmd_socket(const json& j, CmdSocket& out) {
                     "non-negative integers");
   }
 
-  std::vector<std::uint32_t> gids;
+  // Element type is ::gid_t (POSIX, unsigned on every Linux libc).
+  // We still parse through int64_t so we can reject negative JSON
+  // numbers explicitly — the cast to an unsigned `gid_t` would
+  // silently wrap otherwise. Upper bound is uint32_t::max: ::gid_t
+  // is 32-bit on every libc we target (glibc, musl) and making the
+  // wire format tolerate a 64-bit gid would be meaningless.
+  std::vector<::gid_t> gids;
   gids.reserve(v.size());
   for (std::size_t i = 0; i < v.size(); ++i) {
     const json& e = v[i];
@@ -608,7 +616,7 @@ std::optional<ParseError> parse_cmd_socket(const json& j, CmdSocket& out) {
               std::to_string(i) + " = " + std::to_string(raw) +
               " out of range [0..4294967295]");
     }
-    gids.push_back(static_cast<std::uint32_t>(raw));
+    gids.push_back(static_cast<::gid_t>(raw));
   }
   out.allow_gids = std::move(gids);
   return std::nullopt;
@@ -884,11 +892,14 @@ ParseResult parse(std::string_view json_text) {
     }
   }
 
-  // ---- 11. cmd_socket (C7 / D38 schema-only) ----------------------------
+  // ---- 11. cmd_socket (C7 / D38 schema-only; C7.5 defers) ---------------
   //
-  // Schema-only: the parser validates shape and bounds; the validator
-  // tier applies the `[getgid()]` default when the section is absent.
-  // Real SO_PEERCRED plumbing against allow_gids is M11.
+  // Schema-only: the parser validates shape and bounds. When the
+  // section or `allow_gids` key is absent, `cfg.cmd_socket.allow_gids`
+  // stays `std::nullopt` — the sentinel means "resolve at daemon init
+  // (M11)". Parser/validator MUST NOT invent a default; see the
+  // model.h CmdSocket comment for the drift argument. Real SO_PEERCRED
+  // plumbing against allow_gids is M11.
   if (doc.contains("cmd_socket")) {
     if (auto err = parse_cmd_socket(doc["cmd_socket"], cfg.cmd_socket); err) {
       return *err;
