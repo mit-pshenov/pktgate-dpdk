@@ -3,14 +3,25 @@
 # Smoke tests — the "don't-ship-if-these-fail" floor. Run on every
 # preset, on every commit, via the `smoke` ctest label.
 
-function(pktgate_add_smoke_test name)
-  add_executable(smoke_${name} ${name}.cpp)
-  target_link_libraries(smoke_${name} PRIVATE GTest::gtest GTest::gtest_main)
-  pktgate_apply_warnings(smoke_${name})
-  pktgate_apply_sanitizer(smoke_${name})
-  add_test(NAME smoke.${name} COMMAND smoke_${name})
-  set_tests_properties(smoke.${name} PROPERTIES LABELS "smoke")
-endfunction()
+pktgate_add_test(
+  NAME    smoke.test_build
+  SOURCES test_build.cpp
+  LABELS  smoke
+)
 
-pktgate_add_smoke_test(test_build)
-pktgate_add_smoke_test(test_presets)
+pktgate_add_test(
+  NAME    smoke.test_presets
+  SOURCES test_presets.cpp
+  LABELS  smoke
+)
+
+# Label-reachability guard. Not a gtest binary — shell script that
+# runs `ctest -N -L <label>` and asserts each required label matches
+# >= 1 test. Runs on every smoke-label invocation, so label drift is
+# caught on every commit and under every preset.
+add_test(
+  NAME smoke.label_reachability
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/check-ctest-labels.sh"
+          "${CMAKE_BINARY_DIR}"
+)
+set_tests_properties(smoke.label_reachability PROPERTIES LABELS "smoke")

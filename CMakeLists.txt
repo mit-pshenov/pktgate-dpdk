@@ -21,6 +21,7 @@ project(pktgate_dpdk
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Warnings)
 include(Sanitizers)
+include(Gtest)
 
 # ---- C++ baseline (D2) ---------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
