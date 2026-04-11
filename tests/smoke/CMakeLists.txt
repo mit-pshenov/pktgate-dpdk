@@ -30,6 +30,20 @@ target_compile_definitions(smoke_counter_consistency
   PRIVATE "PKTGATE_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
 )
 
+# Fuzz preset scaffolding sentinel (M0 C5). Structural only — it
+# verifies cmake/Fuzz.cmake, fuzz/, and the "fuzz" preset entry
+# are all in place. Functional verification (the fuzz binary
+# actually building and running -runs=1) is the job of the
+# `ctest --preset fuzz -L smoke` cycle exit gate, not this test.
+pktgate_add_test(
+  NAME    smoke.fuzz_sanity
+  SOURCES test_fuzz_sanity.cpp
+  LABELS  smoke
+)
+target_compile_definitions(smoke_fuzz_sanity
+  PRIVATE "PKTGATE_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
+)
+
 # Label-reachability guard. Not a gtest binary — shell script that
 # runs `ctest -N -L <label>` and asserts each required label matches
 # >= 1 test. Runs on every smoke-label invocation, so label drift is

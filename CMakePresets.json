@@ -88,6 +88,19 @@
         "PKTGATE_PRESET_NAME": "dev-tsan",
         "PKTGATE_SANITIZER":   "tsan"
       }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base-clang",
+      "displayName": "fuzz (clang, libFuzzer + addr+ub)",
+      "description": "libFuzzer preset. Builds only fuzz/ (no product binary, no gtest tree — libFuzzer requires LLVMFuzzerTestOneInput rather than main, so dev-* trees cannot coexist under -fsanitize=fuzzer). harness.md §H2.9.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE":    "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS":     "-O1 -g -fno-omit-frame-pointer",
+        "PKTGATE_PRESET_NAME": "fuzz",
+        "PKTGATE_FUZZ":        "ON",
+        "PKTGATE_SANITIZER":   ""
+      }
     }
   ],
 
@@ -96,7 +109,8 @@
     { "name": "dev-release", "configurePreset": "dev-release" },
     { "name": "dev-asan",    "configurePreset": "dev-asan" },
     { "name": "dev-ubsan",   "configurePreset": "dev-ubsan" },
-    { "name": "dev-tsan",    "configurePreset": "dev-tsan" }
+    { "name": "dev-tsan",    "configurePreset": "dev-tsan" },
+    { "name": "fuzz",        "configurePreset": "fuzz" }
   ],
 
   "testPresets": [
@@ -135,6 +149,15 @@
       "environment": {
         "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7",
         "TSAN_SUPPRESSIONS": "${sourceDir}/tests/tsan.supp"
+      }
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz",
+      "output": { "outputOnFailure": true },
+      "environment": {
+        "ASAN_OPTIONS":  "detect_leaks=0:abort_on_error=1:symbolize=1:print_stacktrace=1",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1:symbolize=1"
       }
     }
   ]

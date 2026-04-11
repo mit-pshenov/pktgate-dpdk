@@ -158,8 +158,9 @@ suite, and is ready for RED tests to land.
   that greps `design.md §10.3` for all `pktgate_*` counter
   names and fails if any prose reference elsewhere is missing.
   This is M0 because it stops counter drift before code exists.
-- `harness.md` §H6 libFuzzer minimal harness — a dummy target
-  that exits clean with empty input.
+- `harness.md` §H2.9 libFuzzer minimal harness — a dummy target
+  (`smoke.fuzz_smoke`) that exits clean with empty input under
+  `-runs=1`. (§H6 is coverage, not fuzz — C4 caught the typo.)
 
 **GREEN impl.**
 - `CMakeLists.txt` + `cmake/presets.json` (`dev-release`,

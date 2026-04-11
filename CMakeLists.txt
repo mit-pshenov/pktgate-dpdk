@@ -23,6 +23,23 @@ include(Warnings)
 include(Sanitizers)
 include(Gtest)
 
+# ---- Fuzz preset gate (M0 C5) --------------------------------------------
+#
+# PKTGATE_FUZZ is set by the `fuzz` CMake preset (see CMakePresets.json,
+# harness.md §H2.9). When it is ON, this tree builds ONLY the fuzz
+# target subdirectory — the product binary, the gtest tree, and the
+# placeholder labels are all skipped. Reason: libFuzzer binaries use
+# LLVMFuzzerTestOneInput as the entry point, which is mutually
+# exclusive with gtest's `main()` under `-fsanitize=fuzzer`. Mixing
+# them in one build directory fails the link step in confusing ways,
+# so we keep `build/fuzz` and `build/dev-*` as disjoint worlds.
+option(PKTGATE_FUZZ
+  "Build the fuzz/ subtree (libFuzzer, clang-only) instead of product+tests"
+  OFF)
+if(PKTGATE_FUZZ)
+  include(Fuzz)
+endif()
+
 # ---- C++ baseline (D2) ---------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,10 +96,15 @@ endfunction()
 _pktgate_strip_missing_include_dirs(PkgConfig::DPDK)
 
 # ---- Product binary (empty in M0; main{return 0;}) ----------------------
-add_executable(pktgate_dpdk src/main.cpp)
-target_link_libraries(pktgate_dpdk PRIVATE PkgConfig::DPDK)
-pktgate_apply_warnings(pktgate_dpdk)
-pktgate_apply_sanitizer(pktgate_dpdk)
+#
+# Skipped under PKTGATE_FUZZ — the fuzz preset does not ship a product
+# binary, and linking main() next to LLVMFuzzerTestOneInput would fail.
+if(NOT PKTGATE_FUZZ)
+  add_executable(pktgate_dpdk src/main.cpp)
+  target_link_libraries(pktgate_dpdk PRIVATE PkgConfig::DPDK)
+  pktgate_apply_warnings(pktgate_dpdk)
+  pktgate_apply_sanitizer(pktgate_dpdk)
+endif()
 
 # ---- Tests ---------------------------------------------------------------
 #
@@ -90,4 +112,11 @@ pktgate_apply_sanitizer(pktgate_dpdk)
 # preset. Individual tests gate themselves on capabilities via labels.
 include(CTest)
 enable_testing()
-add_subdirectory(tests)
+if(PKTGATE_FUZZ)
+  # Fuzz preset — only the fuzz tree is wired. No dev-* smoke tests,
+  # no placeholder label scaffolding; `ctest --preset fuzz -L smoke`
+  # sees just the smoke.fuzz_smoke entry from fuzz/CMakeLists.txt.
+  add_subdirectory(fuzz)
+else()
+  add_subdirectory(tests)
+endif()
