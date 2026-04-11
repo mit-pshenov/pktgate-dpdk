@@ -36,8 +36,10 @@ using ::pktgate::config::is_ok;
 using ::pktgate::config::parse;
 using ::pktgate::config::ParseError;
 using ::pktgate::config::ParseResult;
+using ::pktgate::config::NameSelector;
 using ::pktgate::config::PciSelector;
 using ::pktgate::config::RoleSelector;
+using ::pktgate::config::VdevSelector;
 
 // -------------------------------------------------------------------------
 // JSON objects are semantically unordered (RFC 8259 §4), so the AST's
@@ -196,6 +198,139 @@ TEST(ParserU1_3, UnknownTopLevelFieldRejected) {
   EXPECT_NE(get_err(result).message.find("foo"), std::string::npos)
       << "error message must name the offending key: "
       << get_err(result).message;
+}
+
+// -------------------------------------------------------------------------
+// U1.4 — `interface_roles` sum-type: PCI selector decomposes to canonical BDF.
+//
+// A `{ "pci": "0000:03:00.0" }` entry must land in the AST as a PciSelector
+// whose `bdf` field round-trips the canonical domain:bus:device.function
+// string form (what DPDK's `-a` flag expects). C2 still only normalises the
+// string: no numeric decomposition into separate fields — the canonical
+// form *is* the canonical form.
+
+constexpr std::string_view kRolesPci = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:03:00.0" },
+    "downstream_port": { "pci": "0000:03:00.1" }
+  },
+  "pipeline": { "layer_2": [], "layer_3": [], "layer_4": [] },
+  "default_behavior": "drop"
+})json";
+
+TEST(ParserU1_4, PciSelectorParses) {
+  const ParseResult result = parse(kRolesPci);
+  ASSERT_TRUE(is_ok(result))
+      << "pci selector rejected; err kind="
+      << static_cast<int>(std::get<ParseError>(result).kind)
+      << " msg=" << std::get<ParseError>(result).message;
+
+  const Config& cfg = get_ok(result);
+  const auto* upstream = find_role(cfg, "upstream_port");
+  ASSERT_NE(upstream, nullptr);
+  ASSERT_TRUE(std::holds_alternative<PciSelector>(upstream->selector));
+  // Round-trip: the canonical BDF string survives parse verbatim.
+  EXPECT_EQ(std::get<PciSelector>(upstream->selector).bdf, "0000:03:00.0");
+
+  const auto* downstream = find_role(cfg, "downstream_port");
+  ASSERT_NE(downstream, nullptr);
+  ASSERT_TRUE(std::holds_alternative<PciSelector>(downstream->selector));
+  EXPECT_EQ(std::get<PciSelector>(downstream->selector).bdf, "0000:03:00.1");
+}
+
+// -------------------------------------------------------------------------
+// U1.5 — `interface_roles` sum-type: vdev selector, arg string verbatim.
+//
+// `{ "vdev": "net_pcap0,tx_iface=lo" }` → `VdevSelector{spec=...}`. The
+// arg portion (comma-separated DPDK vdev args) is preserved verbatim —
+// the parser does no tokenisation; that's DPDK's job at EAL init.
+
+constexpr std::string_view kRolesVdev = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "vdev": "net_pcap0,tx_iface=lo" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": { "layer_2": [], "layer_3": [], "layer_4": [] },
+  "default_behavior": "drop"
+})json";
+
+TEST(ParserU1_5, VdevSelectorParses) {
+  const ParseResult result = parse(kRolesVdev);
+  ASSERT_TRUE(is_ok(result))
+      << "vdev selector rejected; err kind="
+      << static_cast<int>(std::get<ParseError>(result).kind)
+      << " msg=" << std::get<ParseError>(result).message;
+
+  const Config& cfg = get_ok(result);
+  const auto* upstream = find_role(cfg, "upstream_port");
+  ASSERT_NE(upstream, nullptr);
+  ASSERT_TRUE(std::holds_alternative<VdevSelector>(upstream->selector));
+  // Verbatim: commas, `=`, everything preserved.
+  EXPECT_EQ(std::get<VdevSelector>(upstream->selector).spec,
+            "net_pcap0,tx_iface=lo");
+}
+
+// -------------------------------------------------------------------------
+// U1.6 — `interface_roles` sum-type: name selector.
+//
+// `{ "name": "net_tap0" }` → `NameSelector{name=...}`. Used when the
+// DPDK port already exists in the system (e.g. pre-created by another
+// process) and we just need to attach by name.
+
+constexpr std::string_view kRolesName = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "name": "net_tap0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": { "layer_2": [], "layer_3": [], "layer_4": [] },
+  "default_behavior": "drop"
+})json";
+
+TEST(ParserU1_6, NameSelectorParses) {
+  const ParseResult result = parse(kRolesName);
+  ASSERT_TRUE(is_ok(result))
+      << "name selector rejected; err kind="
+      << static_cast<int>(std::get<ParseError>(result).kind)
+      << " msg=" << std::get<ParseError>(result).message;
+
+  const Config& cfg = get_ok(result);
+  const auto* upstream = find_role(cfg, "upstream_port");
+  ASSERT_NE(upstream, nullptr);
+  ASSERT_TRUE(std::holds_alternative<NameSelector>(upstream->selector));
+  EXPECT_EQ(std::get<NameSelector>(upstream->selector).name, "net_tap0");
+}
+
+// -------------------------------------------------------------------------
+// U1.7 — `interface_roles` sum-type: mixed keys rejected.
+//
+// A selector object containing more than one of {pci, vdev, name} is
+// ambiguous — the parser must return `kInvalidRoleSelector`. The message
+// must name both offending keys so an operator can find the typo without
+// re-reading the whole doc.
+
+constexpr std::string_view kRolesMixedKeys = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0", "vdev": "net_pcap0,tx_iface=lo" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": { "layer_2": [], "layer_3": [], "layer_4": [] },
+  "default_behavior": "drop"
+})json";
+
+TEST(ParserU1_7, MixedKeysRejected) {
+  const ParseResult result = parse(kRolesMixedKeys);
+  ASSERT_FALSE(is_ok(result));
+  EXPECT_EQ(err_kind(result), ParseError::kInvalidRoleSelector);
+
+  const auto& msg = get_err(result).message;
+  EXPECT_NE(msg.find("pci"), std::string::npos)
+      << "error message must name the offending 'pci' key: " << msg;
+  EXPECT_NE(msg.find("vdev"), std::string::npos)
+      << "error message must name the offending 'vdev' key: " << msg;
 }
 
 }  // namespace

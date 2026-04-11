@@ -54,27 +54,73 @@ ParseError make_err(ParseError::Kind k, std::string msg) {
   return ParseError{k, std::move(msg)};
 }
 
-// Parse a single role entry. C1 only understands the PCI branch.
-// On success writes into `out` and returns nullopt; on failure returns
-// a populated ParseError.
+// Parse a single role entry. C2 covers the full sum-type (D5):
+// exactly one of {pci, vdev, name} must be present. Zero keys or two+
+// keys → kInvalidRoleSelector. The three branches are mutually
+// exclusive and the rejection message names every offending key so the
+// operator can jump to the typo.
 std::optional<ParseError> parse_role_selector(const json& j,
                                               RoleSelector& out) {
   if (!j.is_object()) {
     return make_err(ParseError::kTypeMismatch,
                     "interface_roles entry must be a JSON object");
   }
-  // C1 only supports the `pci` selector. C2 extends this to `vdev`,
-  // `name`, and the mixed-keys rejection.
-  if (!j.contains("pci")) {
+
+  // Inventory of recognised selector keys present in this entry.
+  // Order matches the declared variant alternatives so diagnostics are
+  // stable.
+  constexpr std::array<std::string_view, 3> kSelectorKeys = {
+      "pci", "vdev", "name"};
+
+  int present_count = 0;
+  std::string present_list;
+  for (const auto& key : kSelectorKeys) {
+    if (j.contains(std::string{key})) {
+      ++present_count;
+      if (!present_list.empty()) present_list += ", ";
+      present_list += "'";
+      present_list += key;
+      present_list += "'";
+    }
+  }
+
+  if (present_count == 0) {
     return make_err(ParseError::kInvalidRoleSelector,
-                    "interface_roles entry missing 'pci' selector "
-                    "(C1 only supports the pci branch)");
+                    "interface_roles entry missing selector: one of "
+                    "'pci', 'vdev', 'name' required");
   }
-  if (!j["pci"].is_string()) {
+  if (present_count > 1) {
+    return make_err(
+        ParseError::kInvalidRoleSelector,
+        std::string{"interface_roles entry has mixed selector keys: "} +
+            present_list +
+            " (exactly one of 'pci', 'vdev', 'name' allowed)");
+  }
+
+  // Exactly one selector key is present — dispatch on it.
+  if (j.contains("pci")) {
+    if (!j["pci"].is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "interface_roles 'pci' must be a string");
+    }
+    out = PciSelector{j["pci"].get<std::string>()};
+    return std::nullopt;
+  }
+  if (j.contains("vdev")) {
+    if (!j["vdev"].is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "interface_roles 'vdev' must be a string");
+    }
+    out = VdevSelector{j["vdev"].get<std::string>()};
+    return std::nullopt;
+  }
+  // Must be "name" — guaranteed by present_count == 1 and the branches
+  // above not matching.
+  if (!j["name"].is_string()) {
     return make_err(ParseError::kTypeMismatch,
-                    "interface_roles 'pci' must be a string");
+                    "interface_roles 'name' must be a string");
   }
-  out = PciSelector{j["pci"].get<std::string>()};
+  out = NameSelector{j["name"].get<std::string>()};
   return std::nullopt;
 }
 
