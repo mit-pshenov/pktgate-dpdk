@@ -223,6 +223,45 @@ No EAL, no mempool, no sockets.
   is the validator's job (C7+).
 - Covers: D8 (strict object dict parsing, object model).
 
+### U1.33 L2 compound key happy path
+- Goal: a single rule carries `src_mac`, `dst_mac`, `ethertype`
+  and `vlan_id` simultaneously and the parser populates all four
+  fields on the resulting `Rule`. Canonical "L2 compound key"
+  shape the C8 collision detector will build on. `filter_mask`
+  is NOT a JSON field — the M2 compiler derives it from which
+  secondary fields are present (design §4.1 L2CompoundEntry).
+- Inputs: layer_2 rule with `src_mac: "aa:bb:cc:dd:ee:ff"`,
+  `dst_mac: "11:22:33:44:55:66"`, `ethertype: 2048` (= 0x0800
+  IPv4), `vlan_id: 42`, `action: { "type": "drop" }`.
+- Assertions: `Rule.src_mac.has_value()` and bytes match;
+  `Rule.dst_mac` same; `Rule.ethertype == 0x0800`;
+  `Rule.vlan_id == 42`.
+- Covers: D8, D15 (L2 compound primary — parser half).
+
+### U1.34 L2 compound field negatives
+- Goal: malformed literals for the three new L2 fields are
+  rejected with the matching `ParseError` kind. Proves the
+  parser validates the fields rather than blindly storing
+  strings.
+- Inputs: `src_mac: "not_a_mac"` → `kBadMac`;
+  `dst_mac: "aa:bb:cc:dd:ee"` (five octets) → `kBadMac`;
+  `ethertype: 65536` → `kOutOfRange`;
+  `ethertype: -1` → `kOutOfRange`;
+  `ethertype: "0x0800"` (string) → `kTypeMismatch`.
+- Covers: D8.
+
+### U1.35 `next_layer` enum parses
+- Goal: `next_layer` accepts `"l2"`, `"l3"`, `"l4"` and
+  populates `Rule.next_layer` as `std::optional<NextLayer>`.
+  Rejects any other literal and non-string types. The parser
+  does NOT enforce ordering — cross-layer validity ("l2 on a
+  layer_3 rule is illegal") is the C8 validator's job (U2.19).
+  Absent field → `Rule.next_layer.has_value()` false.
+- Inputs: `"l2"`/`"l3"`/`"l4"` each parses to the matching
+  `NextLayer` enum value; `"l5"` → `kBadEnum`; `3` (integer) →
+  `kTypeMismatch`; field omitted → optional stays empty.
+- Covers: F1 (pipeline order, parser half), D8.
+
 ---
 
 ## U2 — Validator (`src/config/validator.*`)
@@ -1249,7 +1288,7 @@ function taking struct values. No real socket, no real fork.
 | **D5** | HA compat: interface_roles, --standby | U1.4–U1.7, U2.3, U2.4, U2.11 | integration for --standby park/activate end-to-end |
 | **D6** | Runtime sizing, dev vs prod | U1.25–U1.27, U4.1 | — |
 | **D7** | Mirror schema full, MVP reject | U2.12, U3.17 | functional: once mirror actually ships |
-| **D8** | Clean schema, no pktgate compat | U1.2–U1.32, U2.1–U2.20 | — |
+| **D8** | Clean schema, no pktgate compat | U1.2–U1.35, U2.1–U2.20 | — |
 | **D9** | Single global `g_active`, no per-lcore slot | U6.42, U6.43 | integration: real RCU swap with EAL |
 | **D10** | Rewrite §4.4/§5.5 per D1 | U5.*, U6.58 | same as D1 |
 | **D11** | rl_arena GC ordering after synchronize | U4.11, U4.13 | integration: real RCU synchronize |

@@ -76,6 +76,16 @@ struct InterfaceRole {
 enum class DefaultBehavior : std::uint8_t { kAllow, kDrop };
 enum class FragmentPolicy : std::uint8_t { kL3Only, kDrop, kAllow };
 
+// C7.6 / U1.35. `next_layer` scopes a rule to the subsequent pipeline
+// layer for staged progression (l2 → l3 → l4). The parser only
+// validates the enum value space — it never enforces ordering against
+// the hosting layer (l2 on a `layer_3` rule). That cross-layer
+// invariant belongs to the C8 validator (U2.19). Keeping the enum
+// values exhaustive (no kNone sentinel) is deliberate: absence is
+// modelled via `std::optional<NextLayer>` on Rule, not via a
+// distinguished enum value.
+enum class NextLayer : std::uint8_t { kL2, kL3, kL4 };
+
 // -------------------------------------------------------------------------
 // RuleAction sum-type (D15 exactly-one / D7 mirror-accept / D1 rate).
 //
@@ -199,6 +209,21 @@ struct Rule {
   // Objective-C dialect — avoiding the collision now keeps a future
   // Windows host happy at zero cost.
   std::optional<std::string> interface_ref{};
+  // C7.6 / U1.33/U1.34/U1.35. L2 compound key fields + next_layer.
+  // These close a plan-drift gap: C1-C6 never added them because no
+  // U1 test exercised them, and C8 (compound collision + layer order)
+  // would have tripped on their absence. The parser only stores the
+  // values; filter_mask derivation (design §4.1 L2CompoundEntry) is
+  // the M2 compiler's job and is NOT represented as a JSON field.
+  //
+  // `ethertype` is stored as uint16_t (wire-format width). Common
+  // values: 0x0800 IPv4, 0x86DD IPv6, 0x8100 VLAN, 0x88A8 QinQ.
+  std::optional<Mac> src_mac{};               // U1.33/U1.34 D15 (L2 primary)
+  std::optional<Mac> dst_mac{};               // U1.33/U1.34 D15 (L2 secondary)
+  std::optional<std::uint16_t> ethertype{};   // U1.33/U1.34 D8
+  // `next_layer` is scope-only at parser tier. Ordering (l2 cannot
+  // appear on a layer_3 rule) is the C8 validator's problem.
+  std::optional<NextLayer> next_layer{};      // U1.35 F1/D8
 };
 
 // -------------------------------------------------------------------------

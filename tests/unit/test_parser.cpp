@@ -42,6 +42,7 @@ using ::pktgate::config::parse;
 using ::pktgate::config::ParseError;
 using ::pktgate::config::ParseResult;
 using ::pktgate::config::NameSelector;
+using ::pktgate::config::NextLayer;
 using ::pktgate::config::PciSelector;
 using ::pktgate::config::RoleSelector;
 using ::pktgate::config::VdevSelector;
@@ -1553,6 +1554,201 @@ TEST(ParserU1_31, StressLite4096Plus4096) {
   // we're trending toward the budget.
   ::testing::Test::RecordProperty("stress_lite_parse_ms",
                                   static_cast<int>(elapsed_ms));
+}
+
+// =========================================================================
+// M1 C7.6 — parser surface for L2 compound fields + next_layer
+// =========================================================================
+//
+// Plan-drift fix. C1-C6 closed the parser surface for every field that
+// had a U1 test. The L2 compound key trio (`src_mac`/`dst_mac`/
+// `ethertype`) and the `next_layer` scope field had none — nobody
+// wrote U1 tests, so the Rule struct and parse_rule() grew without
+// them. C8 (compound collision + layer order) expects these fields to
+// already exist in the AST. C7.6 retro-fits the parser surface AND
+// the U1 tests in the same commit.
+//
+// Authority anchors:
+//   * design.md §4.1 — L2CompoundEntry derives filter_mask at compile
+//     time from which secondary fields are present in the rule; JSON
+//     never ships filter_mask. That's why there is no U1 test for it.
+//   * D15 — compound primary + filter_mask semantics (L4 today,
+//     symmetric L2 is latent; see review-notes.md).
+//   * D8 — clean schema, strict whitelist, every new key lands in
+//     kAllowedRuleKeys or bust.
+//
+// Scope strictly parser-only: ordering enforcement (U2.19 "l2 on a
+// layer_3 rule is illegal") lives in the C8 validator. The parser
+// MUST accept all three enum values on any layer.
+
+// -------------------------------------------------------------------------
+// U1.33 — L2 compound happy path
+//
+// A single rule carries src_mac + dst_mac + ethertype + vlan_id
+// simultaneously. This is the canonical "L2 compound key" rule the C8
+// collision detector will build on. Covers D8 (clean schema) and D15
+// (L2 compound primary — secondary fields populate future filter_mask
+// derivation at compile time).
+
+TEST(ParserU1_33, L2CompoundKeyHappyPath) {
+  const std::string doc = make_doc_with_layer2_rule(R"({
+    "src_mac": "aa:bb:cc:dd:ee:ff",
+    "dst_mac": "11:22:33:44:55:66",
+    "ethertype": 2048,
+    "vlan_id": 42,
+    "action": { "type": "drop" }
+  })");
+
+  const ParseResult result = parse(doc);
+  ASSERT_TRUE(is_ok(result))
+      << "L2 compound rule rejected; kind="
+      << static_cast<int>(get_err(result).kind)
+      << " msg=" << get_err(result).message;
+
+  const auto& cfg = get_ok(result);
+  ASSERT_EQ(cfg.pipeline.layer_2.size(), std::size_t{1});
+  const auto& r = cfg.pipeline.layer_2[0];
+
+  ASSERT_TRUE(r.src_mac.has_value());
+  const std::array<std::uint8_t, 6> expected_src{
+      {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}};
+  EXPECT_EQ(r.src_mac->bytes, expected_src);
+
+  ASSERT_TRUE(r.dst_mac.has_value());
+  const std::array<std::uint8_t, 6> expected_dst{
+      {0x11, 0x22, 0x33, 0x44, 0x55, 0x66}};
+  EXPECT_EQ(r.dst_mac->bytes, expected_dst);
+
+  ASSERT_TRUE(r.ethertype.has_value());
+  EXPECT_EQ(*r.ethertype, std::uint16_t{0x0800});
+
+  EXPECT_EQ(r.vlan_id, 42);
+}
+
+// -------------------------------------------------------------------------
+// U1.34 — L2 field negatives
+//
+// Malformed literals for the three new L2 fields are rejected with
+// the matching ParseError kind. Proves the parser actually validates
+// rather than blindly copying strings. Subcases:
+//
+//   * bad src_mac literal          → kBadMac
+//   * short dst_mac (5 octets)     → kBadMac
+//   * ethertype = 65536            → kOutOfRange
+//   * ethertype = -1               → kOutOfRange
+//   * ethertype = "0x0800" string  → kTypeMismatch (must be integer)
+//
+// Covers D8.
+
+TEST(ParserU1_34, L2FieldNegatives) {
+  {
+    const std::string doc = make_doc_with_layer2_rule(
+        R"({ "src_mac": "not_a_mac" })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r)) << "bad src_mac unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kBadMac)
+        << "msg=" << get_err(r).message;
+  }
+  {
+    const std::string doc = make_doc_with_layer2_rule(
+        R"({ "dst_mac": "aa:bb:cc:dd:ee" })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r)) << "short dst_mac unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kBadMac)
+        << "msg=" << get_err(r).message;
+  }
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "ethertype": 65536 })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r)) << "ethertype=65536 unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kOutOfRange)
+        << "msg=" << get_err(r).message;
+  }
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "ethertype": -1 })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r)) << "ethertype=-1 unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kOutOfRange)
+        << "msg=" << get_err(r).message;
+  }
+  {
+    const std::string doc = make_doc_with_layer2_rule(
+        R"({ "ethertype": "0x0800" })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r))
+        << "ethertype as string unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kTypeMismatch)
+        << "msg=" << get_err(r).message;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.35 — next_layer enum parsing
+//
+// Accept "l2"/"l3"/"l4"; reject every other literal and any non-
+// string type. Parser does NOT enforce ordering — that's C8/U2.19.
+// Absent field → std::nullopt survives. Covers F1 (pipeline order,
+// parser half) and D8.
+
+TEST(ParserU1_35, NextLayerEnumParse) {
+  struct Case {
+    std::string_view literal;
+    NextLayer expected;
+  };
+  const Case accepted[] = {
+      {R"("l2")", NextLayer::kL2},
+      {R"("l3")", NextLayer::kL3},
+      {R"("l4")", NextLayer::kL4},
+  };
+  for (const auto& c : accepted) {
+    std::string body = R"({ "next_layer": )";
+    body += c.literal;
+    body += R"( })";
+    const std::string doc = make_doc_with_layer2_rule(body);
+    const ParseResult r = parse(doc);
+    ASSERT_TRUE(is_ok(r))
+        << "next_layer=" << c.literal << " rejected; kind="
+        << static_cast<int>(get_err(r).kind)
+        << " msg=" << get_err(r).message;
+    const auto& cfg = get_ok(r);
+    ASSERT_EQ(cfg.pipeline.layer_2.size(), std::size_t{1});
+    ASSERT_TRUE(cfg.pipeline.layer_2[0].next_layer.has_value());
+    EXPECT_EQ(*cfg.pipeline.layer_2[0].next_layer, c.expected);
+  }
+
+  // Unknown enum literal → kBadEnum.
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "next_layer": "l5" })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r)) << "next_layer='l5' unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kBadEnum)
+        << "msg=" << get_err(r).message;
+  }
+
+  // Non-string type → kTypeMismatch.
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "next_layer": 3 })");
+    const ParseResult r = parse(doc);
+    ASSERT_FALSE(is_ok(r))
+        << "next_layer as integer unexpectedly accepted";
+    EXPECT_EQ(err_kind(r), ParseError::kTypeMismatch)
+        << "msg=" << get_err(r).message;
+  }
+
+  // Field absent → optional stays empty.
+  {
+    const std::string doc =
+        make_doc_with_layer2_rule(R"({ "vlan_id": 7 })");
+    const ParseResult r = parse(doc);
+    ASSERT_TRUE(is_ok(r)) << "msg=" << get_err(r).message;
+    const auto& cfg = get_ok(r);
+    ASSERT_EQ(cfg.pipeline.layer_2.size(), std::size_t{1});
+    EXPECT_FALSE(cfg.pipeline.layer_2[0].next_layer.has_value());
+  }
 }
 
 }  // namespace

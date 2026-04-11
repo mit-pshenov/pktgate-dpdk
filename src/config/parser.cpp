@@ -418,10 +418,18 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   // C6.5 adds src_subnet (U1.28 — unresolved object reference).
   // C7 adds `interface` (U2.3/U2.4 — unresolved interface_roles ref,
   // resolution happens in the C7 validator).
-  constexpr std::array<std::string_view, 10> kAllowedRuleKeys = {
-      "id",         "dst_port",  "dst_ports",       "vlan_id",
-      "pcp",        "hw_offload_hint", "tcp_flags", "action",
-      "src_subnet", "interface"};
+  // C7.6 adds the L2 compound key trio + `next_layer` (U1.33/U1.34/
+  // U1.35). These were a latent plan-drift gap: C1-C6 never landed
+  // them because no U1 test exercised them, and C8 (compound
+  // collision / layer order) needs them in the AST. The parser
+  // stores them verbatim; L2CompoundEntry filter_mask derivation
+  // (design §4.1) happens at M2 compile time, NOT here — there is
+  // deliberately no `filter_mask` JSON field.
+  constexpr std::array<std::string_view, 14> kAllowedRuleKeys = {
+      "id",         "dst_port",        "dst_ports",  "vlan_id",
+      "pcp",        "hw_offload_hint", "tcp_flags",  "action",
+      "src_subnet", "interface",       "src_mac",    "dst_mac",
+      "ethertype",  "next_layer"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     const std::string& key = it.key();
     bool allowed = false;
@@ -540,6 +548,97 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
                       "(role reference into interface_roles)");
     }
     out.interface_ref = v.get<std::string>();
+  }
+
+  // C7.6 U1.33/U1.34 — L2 compound key fields. `src_mac` / `dst_mac`
+  // go through the pure-stdlib parse_mac from addr.h; the
+  // AddrParseError variants collapse into the parser-facing
+  // `kBadMac` kind. We deliberately surface the offending literal
+  // in the diagnostic so operators can jump to the typo. The raw
+  // MAC bytes land on Rule; filter_mask derivation is a compiler-
+  // side concern (design §4.1 L2CompoundEntry), NOT a JSON field.
+  if (j.contains("src_mac")) {
+    const json& v = j["src_mac"];
+    if (!v.is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'src_mac' must be a string "
+                      "(colon-separated 6-octet MAC)");
+    }
+    const std::string lit = v.get<std::string>();
+    const auto res = parse_mac(lit);
+    if (!is_ok(res)) {
+      return make_err(ParseError::kBadMac,
+                      std::string{"rule field 'src_mac' invalid MAC literal: '"} +
+                          lit + "'");
+    }
+    out.src_mac = std::get<Mac>(res);
+  }
+
+  if (j.contains("dst_mac")) {
+    const json& v = j["dst_mac"];
+    if (!v.is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'dst_mac' must be a string "
+                      "(colon-separated 6-octet MAC)");
+    }
+    const std::string lit = v.get<std::string>();
+    const auto res = parse_mac(lit);
+    if (!is_ok(res)) {
+      return make_err(ParseError::kBadMac,
+                      std::string{"rule field 'dst_mac' invalid MAC literal: '"} +
+                          lit + "'");
+    }
+    out.dst_mac = std::get<Mac>(res);
+  }
+
+  // `ethertype` — 16-bit unsigned; nlohmann::json gives us int64,
+  // so we range-check through i64 to reject negatives and >0xFFFF
+  // explicitly rather than silently truncating via a uint narrow.
+  // Common values: 0x0800 IPv4, 0x86DD IPv6, 0x8100 VLAN, 0x88A8
+  // QinQ. Type-check before range-check so an operator typo like
+  // `"0x0800"` (string) surfaces kTypeMismatch rather than a
+  // confusing "out of range" for an unparsed numeric.
+  if (j.contains("ethertype")) {
+    const json& v = j["ethertype"];
+    if (!v.is_number_integer()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'ethertype' must be an integer "
+                      "in [0..65535]");
+    }
+    const std::int64_t raw = v.get<std::int64_t>();
+    if (raw < 0 || raw > 0xFFFF) {
+      return make_err(
+          ParseError::kOutOfRange,
+          std::string{"rule field 'ethertype' = "} + std::to_string(raw) +
+              " out of range [0..65535]");
+    }
+    out.ethertype = static_cast<std::uint16_t>(raw);
+  }
+
+  // C7.6 U1.35 — `next_layer` enum. Parser validates the value
+  // space only; cross-layer ordering ("l2 on a layer_3 rule is
+  // illegal") is the C8 validator's job (U2.19). Pattern mirrors
+  // `default_behavior` and `fragment_policy`.
+  if (j.contains("next_layer")) {
+    const json& v = j["next_layer"];
+    if (!v.is_string()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "rule field 'next_layer' must be a string enum "
+                      "('l2' | 'l3' | 'l4')");
+    }
+    const std::string nl = v.get<std::string>();
+    if (nl == "l2") {
+      out.next_layer = NextLayer::kL2;
+    } else if (nl == "l3") {
+      out.next_layer = NextLayer::kL3;
+    } else if (nl == "l4") {
+      out.next_layer = NextLayer::kL4;
+    } else {
+      return make_err(
+          ParseError::kBadEnum,
+          std::string{"rule field 'next_layer' must be 'l2'|'l3'|'l4', got '"} +
+              nl + "'");
+    }
   }
   return std::nullopt;
 }
