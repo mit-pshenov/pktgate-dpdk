@@ -24,6 +24,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "src/config/sizing.h"
+
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -747,6 +749,35 @@ ParseResult parse(std::string_view json_text) {
     }
   }
   // else: default already set in Config{} initializer.
+
+  // ---- 9. sizing (C6 / D6) ----------------------------------------------
+  //
+  // D6 anchor: two first-class columns (kSizingDevDefaults /
+  // kSizingProdDefaults) live in sizing.h. When the `sizing` section
+  // is absent from the document, fill Config.sizing with the dev
+  // column — the dev VM boot path stays zero-arg, and no "MVP
+  // limit" phrasing appears anywhere (M1 meta-principle). When the
+  // section is present, parse_sizing enforces the flat ten-key
+  // schema and the 16-rules-per-layer hard minimum (kSizingBelowMin).
+  if (doc.contains("sizing")) {
+    if (auto err = parse_sizing(doc["sizing"], cfg.sizing); err) {
+      return *err;
+    }
+  } else {
+    cfg.sizing = kSizingDevDefaults;
+  }
+
+  // ---- 10. objects (C6) -------------------------------------------------
+  //
+  // C6 implements only `objects.subnets` as an unresolved
+  // name → CIDR list map. The validator (C7+) resolves rule
+  // references into this pool; the parser only structurally
+  // accepts well-formed entries and fails on malformed CIDRs.
+  if (doc.contains("objects")) {
+    if (auto err = parse_objects(doc["objects"], cfg.objects); err) {
+      return *err;
+    }
+  }
 
   return cfg;
 }

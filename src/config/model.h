@@ -27,6 +27,8 @@
 #include <variant>
 #include <vector>
 
+#include "src/config/addr.h"
+
 namespace pktgate::config {
 
 // Compiled-in schema version. The parser rejects any document whose
@@ -172,6 +174,53 @@ struct Rule {
   std::optional<RuleAction> action{};    // U1.29 D15 exactly-one
 };
 
+// -------------------------------------------------------------------------
+// Objects pool (C6, D8). Unresolved form — names mapped to primitive
+// values. The parser accepts well-formed entries; dangling-reference
+// checks from rules into this pool are the validator's job (C7+).
+//
+// C6 only implements `subnets`: name → list of CIDRs. Each CIDR is a
+// sum type of (Cidr4, Cidr6) — mixing v4 and v6 inside one named
+// subnet is allowed at the parser tier (the validator enforces whatever
+// dual-stack rule semantics we want later). Other object classes
+// (mac_groups, port_groups, subnets6 split from subnets, etc.) land
+// in follow-up cycles when their consumers exist.
+
+// -------------------------------------------------------------------------
+// Sizing struct (C6, D6). Runtime-parameterised capacity ceilings.
+// Compile-time constants for dev/prod defaults and the schema-level
+// parse helper live in sizing.h — the struct itself lives here so
+// that Config can hold it by value without a circular include between
+// parser.h and sizing.h.
+//
+// D6 anchor: no compile-time ceilings; only a compile-time hard
+// minimum (sizing.h / kSizingRulesPerLayerHardMin). The fields below
+// map 1:1 to the D6 table in review-notes.md.
+
+struct Sizing {
+  std::uint32_t rules_per_layer_max{};
+  std::uint32_t mac_entries_max{};
+  std::uint32_t ipv4_prefixes_max{};
+  std::uint32_t ipv6_prefixes_max{};
+  std::uint32_t l4_entries_max{};
+  std::uint32_t vrf_entries_max{};
+  std::uint32_t rate_limit_rules_max{};
+  std::uint32_t ethertype_entries_max{};
+  std::uint32_t vlan_entries_max{};
+  std::uint32_t pcp_entries_max{};
+};
+
+using SubnetCidr = std::variant<Cidr4, Cidr6>;
+
+struct SubnetObject {
+  std::string name;                    // object key
+  std::vector<SubnetCidr> cidrs;       // heterogeneous v4/v6 allowed
+};
+
+struct ObjectPool {
+  std::vector<SubnetObject> subnets;   // unresolved, order-preserving
+};
+
 // Pipeline layer rule vectors. C1 shape-checked the layer arrays; C4
 // starts populating them with minimal Rule shells so the parser has
 // a home for the numeric-range fields U1.17..U1.20 land on.
@@ -190,6 +239,8 @@ struct Config {
   DefaultBehavior default_behavior = DefaultBehavior::kDrop;
   FragmentPolicy fragment_policy = FragmentPolicy::kL3Only;
   Pipeline pipeline{};
+  Sizing sizing{};        // C6/D6 — filled with kSizingDevDefaults on absence
+  ObjectPool objects{};   // C6 — unresolved; validator checks references (C7+)
 };
 
 }  // namespace pktgate::config

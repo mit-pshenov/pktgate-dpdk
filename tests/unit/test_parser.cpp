@@ -17,11 +17,16 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <sstream>
+#include <string>
 #include <string_view>
 #include <variant>
 
+#include "src/config/addr.h"
 #include "src/config/model.h"
 #include "src/config/parser.h"
+#include "src/config/sizing.h"
 
 namespace {
 
@@ -1079,6 +1084,392 @@ TEST(ParserU1_30, TcpFlagsMaskWantParse) {
     ASSERT_FALSE(is_ok(result));
     EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
   }
+}
+
+// =========================================================================
+// M1 C6 — sizing section, objects.subnets, stress-lite.
+//
+// Covers:
+//   * U1.25 — inline `sizing` parses and populates the ten D6 fields.
+//   * U1.26 — missing `sizing` applies kSizingDevDefaults (D6 dev column
+//             is a first-class constant, not an "MVP limit" — M1 meta).
+//   * U1.27 — values below the D6 §3a.2 hard minimum (16 rules/layer)
+//             are rejected with kSizingBelowMin.
+//   * U1.28 — `objects.subnets` name→CIDR map parses for both IPv4 and
+//             IPv6; malformed CIDRs propagate kBadCidr.
+//   * U1.31 — stress-lite: 4096 L3 + 4096 L4 rules parse under a
+//             preset-dependent budget (see kStressBudgetMs below).
+//
+// D-refs: D6 (sizing columns, hard min), D8 (strict schema, object
+// model), M1 meta-principle (dev vs prod as two equal columns, not
+// a phasing).
+
+using ::pktgate::config::Cidr4;
+using ::pktgate::config::Cidr6;
+using ::pktgate::config::kSizingDevDefaults;
+using ::pktgate::config::kSizingProdDefaults;
+using ::pktgate::config::kSizingRulesPerLayerHardMin;
+using ::pktgate::config::Sizing;
+using ::pktgate::config::SubnetCidr;
+
+// Build a minimal top-level document with an injectable `sizing` /
+// `objects` body. Empty string = section omitted. Lives in the outer
+// anonymous namespace alongside make_doc_with_layer{2,4}_rule.
+std::string make_doc_with_sections(std::string_view sizing_body,
+                                   std::string_view objects_body) {
+  std::ostringstream ss;
+  ss << R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": { "layer_2": [], "layer_3": [], "layer_4": [] },
+  "default_behavior": "drop")json";
+  if (!sizing_body.empty()) {
+    ss << ",\n  \"sizing\": " << sizing_body;
+  }
+  if (!objects_body.empty()) {
+    ss << ",\n  \"objects\": " << objects_body;
+  }
+  ss << "\n}";
+  return ss.str();
+}
+
+// -------------------------------------------------------------------------
+// U1.25 — inline `sizing` parses and populates every field. The values
+// in the document are deliberately a mix of dev and prod column numbers
+// so the assertion can't accidentally pass by checking the kSizingDev
+// constants. Every field must end up with exactly the JSON literal.
+
+TEST(ParserU1_25, InlineSizingPopulatesAllFields) {
+  constexpr std::string_view kSizing = R"json({
+    "rules_per_layer_max":   4096,
+    "mac_entries_max":       4096,
+    "ipv4_prefixes_max":    16384,
+    "ipv6_prefixes_max":    16384,
+    "l4_entries_max":        4096,
+    "vrf_entries_max":        256,
+    "rate_limit_rules_max":  4096,
+    "ethertype_entries_max":   64,
+    "vlan_entries_max":      4096,
+    "pcp_entries_max":          8
+  })json";
+
+  const std::string doc = make_doc_with_sections(kSizing, "");
+  const ParseResult result = parse(doc);
+  ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+  const Sizing& s = get_ok(result).sizing;
+
+  EXPECT_EQ(s.rules_per_layer_max, 4096u);
+  EXPECT_EQ(s.mac_entries_max, 4096u);
+  EXPECT_EQ(s.ipv4_prefixes_max, 16384u);
+  EXPECT_EQ(s.ipv6_prefixes_max, 16384u);
+  EXPECT_EQ(s.l4_entries_max, 4096u);
+  EXPECT_EQ(s.vrf_entries_max, 256u);
+  EXPECT_EQ(s.rate_limit_rules_max, 4096u);
+  EXPECT_EQ(s.ethertype_entries_max, 64u);
+  EXPECT_EQ(s.vlan_entries_max, 4096u);
+  EXPECT_EQ(s.pcp_entries_max, 8u);
+
+  // The inline values here happen to match kSizingProdDefaults. This
+  // is a sanity check: the prod column constant is first-class and
+  // addressable — no "MVP uses X" phasing. If this ever fails, the
+  // column table in sizing.h has drifted from D6.
+  EXPECT_EQ(s.rules_per_layer_max, kSizingProdDefaults.rules_per_layer_max);
+}
+
+// -------------------------------------------------------------------------
+// U1.26 — missing `sizing` section fills Config.sizing with the dev
+// column (kSizingDevDefaults). The assertion compares every field so
+// a silent drift in the dev constant is caught at parse time.
+
+TEST(ParserU1_26, MissingSizingAppliesDevDefaults) {
+  const std::string doc = make_doc_with_sections("", "");
+  const ParseResult result = parse(doc);
+  ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+  const Sizing& s = get_ok(result).sizing;
+
+  EXPECT_EQ(s.rules_per_layer_max, kSizingDevDefaults.rules_per_layer_max);
+  EXPECT_EQ(s.mac_entries_max, kSizingDevDefaults.mac_entries_max);
+  EXPECT_EQ(s.ipv4_prefixes_max, kSizingDevDefaults.ipv4_prefixes_max);
+  EXPECT_EQ(s.ipv6_prefixes_max, kSizingDevDefaults.ipv6_prefixes_max);
+  EXPECT_EQ(s.l4_entries_max, kSizingDevDefaults.l4_entries_max);
+  EXPECT_EQ(s.vrf_entries_max, kSizingDevDefaults.vrf_entries_max);
+  EXPECT_EQ(s.rate_limit_rules_max, kSizingDevDefaults.rate_limit_rules_max);
+  EXPECT_EQ(s.ethertype_entries_max, kSizingDevDefaults.ethertype_entries_max);
+  EXPECT_EQ(s.vlan_entries_max, kSizingDevDefaults.vlan_entries_max);
+  EXPECT_EQ(s.pcp_entries_max, kSizingDevDefaults.pcp_entries_max);
+
+  // Smoke: dev and prod columns really are distinct — if someone
+  // edits one into a copy of the other, this breaks and we notice.
+  EXPECT_NE(kSizingDevDefaults.rules_per_layer_max,
+            kSizingProdDefaults.rules_per_layer_max);
+}
+
+// -------------------------------------------------------------------------
+// U1.27 — rules_per_layer_max below the D6 §3a.2 hard minimum (16) is
+// rejected as kSizingBelowMin. The test uses 8 (the exact example
+// from unit.md) so the error path is tightly pinned. Additionally
+// verifies 16 itself is accepted (boundary on the allowed side) and
+// that the reject message names the offending value.
+
+TEST(ParserU1_27, SizingBelowHardMinRejected) {
+  // Below min → rejected.
+  {
+    const std::string doc = make_doc_with_sections(R"({
+      "rules_per_layer_max":      8,
+      "mac_entries_max":       4096,
+      "ipv4_prefixes_max":    16384,
+      "ipv6_prefixes_max":    16384,
+      "l4_entries_max":        4096,
+      "vrf_entries_max":        256,
+      "rate_limit_rules_max":  4096,
+      "ethertype_entries_max":   64,
+      "vlan_entries_max":      4096,
+      "pcp_entries_max":          8
+    })", "");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kSizingBelowMin);
+    const auto& msg = get_err(result).message;
+    EXPECT_NE(msg.find("8"), std::string::npos)
+        << "error must name offending value: " << msg;
+    EXPECT_NE(msg.find("16"), std::string::npos)
+        << "error must name the hard minimum: " << msg;
+  }
+
+  // Exactly the minimum → accepted.
+  {
+    const std::string doc = make_doc_with_sections(R"({
+      "rules_per_layer_max":     16,
+      "mac_entries_max":       4096,
+      "ipv4_prefixes_max":    16384,
+      "ipv6_prefixes_max":    16384,
+      "l4_entries_max":        4096,
+      "vrf_entries_max":        256,
+      "rate_limit_rules_max":  4096,
+      "ethertype_entries_max":   64,
+      "vlan_entries_max":      4096,
+      "pcp_entries_max":          8
+    })", "");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+    EXPECT_EQ(get_ok(result).sizing.rules_per_layer_max,
+              kSizingRulesPerLayerHardMin);
+  }
+
+  // Partial object (missing key) → rejected, not silently defaulted.
+  {
+    const std::string doc = make_doc_with_sections(R"({
+      "rules_per_layer_max": 256
+    })", "");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kUnknownField);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.28 — `objects.subnets` parses each name → CIDR list entry into
+// the unresolved ObjectPool. IPv4 entries land as Cidr4, IPv6 entries
+// as Cidr6. Malformed CIDRs surface kBadCidr. No dangling-ref check
+// here (that's the validator's C7+ job).
+
+TEST(ParserU1_28, ObjectsSubnetsParseAndRejectBadCidr) {
+  // Happy path — two named subnets, mixed IPv4 and IPv6.
+  {
+    const std::string doc = make_doc_with_sections("", R"({
+      "subnets": {
+        "corp_v4": ["10.0.0.0/8", "192.168.0.0/16"],
+        "corp_v6": ["2001:db8::/32"]
+      }
+    })");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+    const auto& pool = get_ok(result).objects;
+    ASSERT_EQ(pool.subnets.size(), 2u);
+
+    // Lookup by name (JSON object iteration order is implementation-
+    // defined per nlohmann::json's default std::map backend, which is
+    // lexicographic — but be defensive).
+    const auto* corp_v4 = [&]() -> const pktgate::config::SubnetObject* {
+      for (const auto& so : pool.subnets) {
+        if (so.name == "corp_v4") return &so;
+      }
+      return nullptr;
+    }();
+    ASSERT_NE(corp_v4, nullptr);
+    ASSERT_EQ(corp_v4->cidrs.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<Cidr4>(corp_v4->cidrs[0]));
+    EXPECT_EQ(std::get<Cidr4>(corp_v4->cidrs[0]).prefix, 8u);
+    ASSERT_TRUE(std::holds_alternative<Cidr4>(corp_v4->cidrs[1]));
+    EXPECT_EQ(std::get<Cidr4>(corp_v4->cidrs[1]).prefix, 16u);
+
+    const auto* corp_v6 = [&]() -> const pktgate::config::SubnetObject* {
+      for (const auto& so : pool.subnets) {
+        if (so.name == "corp_v6") return &so;
+      }
+      return nullptr;
+    }();
+    ASSERT_NE(corp_v6, nullptr);
+    ASSERT_EQ(corp_v6->cidrs.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<Cidr6>(corp_v6->cidrs[0]));
+    EXPECT_EQ(std::get<Cidr6>(corp_v6->cidrs[0]).prefix, 32u);
+  }
+
+  // Missing `objects` section → empty pool, no error.
+  {
+    const std::string doc = make_doc_with_sections("", "");
+    const ParseResult result = parse(doc);
+    ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+    EXPECT_TRUE(get_ok(result).objects.subnets.empty());
+  }
+
+  // Malformed CIDR → kBadCidr, offending literal named in message.
+  {
+    const std::string doc = make_doc_with_sections("", R"({
+      "subnets": {
+        "broken": ["10.0.0.0/33"]
+      }
+    })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kBadCidr);
+    EXPECT_NE(get_err(result).message.find("10.0.0.0/33"), std::string::npos)
+        << "msg=" << get_err(result).message;
+  }
+
+  // Non-string element in the CIDR list → kTypeMismatch.
+  {
+    const std::string doc = make_doc_with_sections("", R"({
+      "subnets": {
+        "typed": [42]
+      }
+    })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kTypeMismatch);
+  }
+
+  // Unknown key under `objects` → kUnknownField (only `subnets` is
+  // implemented in C6).
+  {
+    const std::string doc = make_doc_with_sections("", R"({
+      "mac_groups": { "gw": ["aa:bb:cc:dd:ee:ff"] }
+    })");
+    const ParseResult result = parse(doc);
+    ASSERT_FALSE(is_ok(result));
+    EXPECT_EQ(err_kind(result), ParseError::kUnknownField);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U1.31 — stress-lite. Generate a synthetic config with 4096 L3 rules
+// and 4096 L4 rules, parse it, and assert the wall-clock parse time
+// is below a preset-aware budget. This is not a microbenchmark: it's
+// a "parser is not accidentally O(n^2)" canary. A naive quadratic
+// walk over 8192 rules would blow the budget by two orders of
+// magnitude even on a fast host.
+//
+// Budget selection:
+//   * Release / debug: 500 ms (unit.md U1.31 target).
+//   * Sanitizer builds (asan / tsan / ubsan) are 2-6x slower —
+//     they get 2500 ms. Detected via __has_feature(address_sanitizer)
+//     and __has_feature(thread_sanitizer) where available, plus a
+//     __SANITIZE_ADDRESS__ fallback for GCC-style asan. The ubsan
+//     preset has no standard feature test — fold it into the release
+//     budget and hope the host can swing it; if it can't, we relax
+//     the else branch too.
+//
+// The test builds the JSON in-process via ostringstream (one alloc
+// per append is fine — this isn't on the hot path we're measuring;
+// the measurement window starts after the string is built). Each
+// rule gets a unique id so the validator (C7+) could in principle
+// stress the same config.
+
+TEST(ParserU1_31, StressLite4096Plus4096) {
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+      __has_feature(memory_sanitizer)
+#    define PKTGATE_STRESS_SANITIZER 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#  define PKTGATE_STRESS_SANITIZER 1
+#endif
+
+#ifdef PKTGATE_STRESS_SANITIZER
+  constexpr int kStressBudgetMs = 2500;
+#else
+  constexpr int kStressBudgetMs = 500;
+#endif
+
+  constexpr int kRulesPerLayer = 4096;
+
+  std::ostringstream ss;
+  ss << R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [)json";
+  for (int i = 0; i < kRulesPerLayer; ++i) {
+    if (i > 0) ss << ',';
+    ss << R"({"id":)" << (10000 + i)
+       << R"(,"vlan_id":)" << (i % 4096)
+       << R"(,"action":{"type":"allow"}})";
+  }
+  ss << R"json(],
+    "layer_4": [)json";
+  for (int i = 0; i < kRulesPerLayer; ++i) {
+    if (i > 0) ss << ',';
+    ss << R"({"id":)" << (20000 + i)
+       << R"(,"dst_port":)" << ((i % 65535) + 1)
+       << R"(,"action":{"type":"drop"}})";
+  }
+  ss << R"json(]
+  }
+})json";
+  const std::string doc = ss.str();
+
+  // Sanity check the fixture itself — catch a typo before blaming
+  // the parser for a slow path.
+  ASSERT_GT(doc.size(), static_cast<std::size_t>(kRulesPerLayer * 40));
+
+  const auto start = std::chrono::steady_clock::now();
+  const ParseResult result = parse(doc);
+  const auto end = std::chrono::steady_clock::now();
+
+  ASSERT_TRUE(is_ok(result)) << "msg=" << get_err(result).message;
+  const auto& cfg = get_ok(result);
+  EXPECT_EQ(cfg.pipeline.layer_3.size(),
+            static_cast<std::size_t>(kRulesPerLayer));
+  EXPECT_EQ(cfg.pipeline.layer_4.size(),
+            static_cast<std::size_t>(kRulesPerLayer));
+
+  const auto elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+          .count();
+  EXPECT_LT(elapsed_ms, kStressBudgetMs)
+      << "stress-lite parse took " << elapsed_ms
+      << " ms (budget " << kStressBudgetMs
+      << " ms; sanitizer=" <<
+#ifdef PKTGATE_STRESS_SANITIZER
+             "yes"
+#else
+             "no"
+#endif
+         << ")";
+
+  // Record actual timing in the log so a later run can see whether
+  // we're trending toward the budget.
+  ::testing::Test::RecordProperty("stress_lite_parse_ms",
+                                  static_cast<int>(elapsed_ms));
 }
 
 }  // namespace
