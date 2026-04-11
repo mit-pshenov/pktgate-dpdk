@@ -118,6 +118,7 @@ pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json)
 if(NOT PKTGATE_FUZZ)
   add_library(pktgate_core STATIC
     src/config/parser.cpp
+    src/config/addr.cpp
   )
   target_include_directories(pktgate_core PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)

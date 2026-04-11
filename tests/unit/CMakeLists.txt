@@ -17,3 +17,10 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_core
 )
+
+pktgate_add_test(
+  NAME    unit.test_addr
+  SOURCES test_addr.cpp
+  LABELS  unit
+  LINK    pktgate_core
+)
