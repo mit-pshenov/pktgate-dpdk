@@ -138,13 +138,30 @@ target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)
 pktgate_apply_warnings(pktgate_core)
 pktgate_apply_sanitizer(pktgate_core)
 
-# ---- Product binary (empty in M0; main{return 0;}) ----------------------
+# ---- libpktgate_dp (M3) — DPDK-dependent dataplane library ---------------
+#
+# Modules that require DPDK headers at compile time and rte_eal_init() at
+# runtime. Separated from pktgate_core (DPDK-free) so that unit tests of
+# the config/compiler layer continue to build and run without EAL.
+if(NOT PKTGATE_FUZZ)
+  add_library(pktgate_dp STATIC
+    src/eal/port_init.cpp
+    src/dataplane/worker.cpp
+    src/ctl/bootstrap.cpp
+  )
+  target_include_directories(pktgate_dp PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pktgate_dp PUBLIC PkgConfig::DPDK pktgate_core)
+  pktgate_apply_warnings(pktgate_dp)
+  pktgate_apply_sanitizer(pktgate_dp)
+endif()
+
+# ---- Product binary (M3: full boot — EAL init + worker skeleton) ---------
 #
 # Skipped under PKTGATE_FUZZ — the fuzz preset does not ship a product
 # binary, and linking main() next to LLVMFuzzerTestOneInput would fail.
 if(NOT PKTGATE_FUZZ)
   add_executable(pktgate_dpdk src/main.cpp)
-  target_link_libraries(pktgate_dpdk PRIVATE PkgConfig::DPDK pktgate_core)
+  target_link_libraries(pktgate_dpdk PRIVATE pktgate_dp)
   pktgate_apply_warnings(pktgate_dpdk)
   pktgate_apply_sanitizer(pktgate_dpdk)
 endif()

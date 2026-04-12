@@ -147,8 +147,7 @@
       "configurePreset": "dev-tsan",
       "output": { "outputOnFailure": true },
       "environment": {
-        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7",
-        "TSAN_SUPPRESSIONS": "${sourceDir}/tests/tsan.supp"
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7:suppressions=${sourceDir}/tests/tsan.supp"
       }
     },
     {

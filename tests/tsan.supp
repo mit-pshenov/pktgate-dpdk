@@ -6,3 +6,11 @@
 # starting M3+ when EAL comes up on worker lcores. Only DPDK-internal
 # symbols are permitted in here; any pktgate-owned code that TSan
 # flags is a real bug, not a suppression target.
+
+# M3 C1: DPDK mempool allocator internal — rte_eal_mp_wait_lcore()
+# synchronizes the worker→main join, but DPDK's malloc_elem_free
+# (called from rte_mempool_free) triggers a race because the internal
+# memory-region metadata was read by the worker's rte_eth_rx_burst
+# within DPDK's own lock-free paths. The memset inside malloc_elem_free
+# is not annotated with TSAN annotations in DPDK 25.11.
+race:malloc_elem_free
