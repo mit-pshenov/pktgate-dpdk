@@ -55,6 +55,7 @@
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "src/config/addr.h"
@@ -301,6 +302,45 @@ std::optional<ValidateError> check_layer_transitions(
   return std::nullopt;
 }
 
+// ---------------------------------------------------------------------------
+// C9 U2.11 — action target_port role resolution.
+//
+// ActionTargetPort and ActionMirror both carry a `role_name` field that
+// must resolve to one of `Config.interface_roles[*].name`. The
+// validator does NOT reject the mirror action type itself (that's the
+// compiler tier, D7, U3.17) — it only checks that the role reference
+// resolves.
+//
+// Returns an error on the first unresolved target_port, or nullopt.
+std::optional<ValidateError> check_action_target_port(
+    const Config& cfg, const Rule& r, const char* layer_name,
+    std::size_t idx) {
+  if (!r.action.has_value()) return std::nullopt;
+
+  const auto* tp = std::get_if<ActionTargetPort>(&*r.action);
+  const auto* mr = std::get_if<ActionMirror>(&*r.action);
+
+  const std::string* role_name = nullptr;
+  const char* action_type = nullptr;
+  if (tp) {
+    role_name = &tp->role_name;
+    action_type = "target-port";
+  } else if (mr) {
+    role_name = &mr->role_name;
+    action_type = "mirror";
+  }
+
+  if (role_name && !has_role_named(cfg, *role_name)) {
+    return make_err(
+        ValidateError::kUnresolvedTargetPort,
+        std::string{"rule id "} + std::to_string(r.id) + " at " +
+            layer_name + "[" + std::to_string(idx) + "] " + action_type +
+            " action references target_port '" + *role_name +
+            "' which is not declared in interface_roles");
+  }
+  return std::nullopt;
+}
+
 // Walk every rule in one layer vector and resolve both ref types.
 // Short-circuit on the first failure — the validator's contract is
 // "first reason the config is bad", not a full error list. A future
@@ -333,7 +373,10 @@ std::optional<ValidateError> validate_rules(const Config& cfg,
       }
     }
 
-    (void)i;  // index kept around for future diagnostics; unused in C7
+    // C9 U2.11 — action target_port / mirror role resolution.
+    if (auto err = check_action_target_port(cfg, r, layer_name, i)) {
+      return *err;
+    }
   }
   return std::nullopt;
 }

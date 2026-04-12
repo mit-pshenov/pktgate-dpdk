@@ -766,4 +766,241 @@ TEST(ValidatorU2_20, DefaultBehaviorEnumHappyPaths) {
   }
 }
 
+// -------------------------------------------------------------------------
+// U2.8 — Action parameter bounds: dscp 0..63.
+//
+// The parser already range-checks dscp via `parse_bounded_int(j, "dscp",
+// 0, 63, ...)` — values outside [0,63] (including the user writing
+// literal -1) are rejected at parse time. The `-1` default in
+// ActionTag.dscp is the "absent" sentinel; the parser only writes to
+// it when the JSON key is present.
+//
+// This test is **acceptance-only at the validator tier**: feed dscp
+// values 0 and 63 through parse+validate → ok. Rejection of 64/-1
+// is parser territory (test_parser.cpp).
+//
+// Covers: D8, F2 (TAG).
+
+TEST(ValidatorU2_8, DscpBoundsAcceptance) {
+  // dscp: 0 → accepted.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 800, "action": { "type": "tag", "dscp": 0 } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected dscp=0; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+
+  // dscp: 63 → accepted.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 801, "action": { "type": "tag", "dscp": 63 } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected dscp=63; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U2.9 — Action parameter bounds: pcp 0..7.
+//
+// Same tier analysis as U2.8: parser enforces [0,7] via
+// `parse_bounded_int(j, "pcp", 0, 7, ...)`. Acceptance test only.
+//
+// Covers: D8, F2.
+
+TEST(ValidatorU2_9, PcpBoundsAcceptance) {
+  // pcp: 0 → accepted.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 900, "action": { "type": "tag", "pcp": 0 } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected pcp=0; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+
+  // pcp: 7 → accepted.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 901, "action": { "type": "tag", "pcp": 7 } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected pcp=7; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U2.10 — Rate-limit `rate` > 0.
+//
+// The parser rejects zero-rate ("0bps" → "must be strictly positive")
+// and malformed rates ("-10Mbps" → no numeric prefix). Validator gets
+// acceptance-only: feed a valid rate-limit action through parse+validate
+// → ok.
+//
+// Covers: D1.
+
+TEST(ValidatorU2_10, RateLimitPositiveAcceptance) {
+  const std::string doc = make_doc_with_pipeline(
+      /*layer_2=*/"",
+      /*layer_3=*/
+      R"({ "id": 1000, "action": { "type": "rate-limit", "rate": "200Mbps", "burst_ms": 100 } })",
+      /*layer_4=*/"",
+      /*default_behavior=*/"drop");
+  const ParseResult pr = parse(doc);
+  expect_parse_ok(pr, doc);
+
+  Config cfg = get_ok(pr);
+  const ValidateResult vr = validate(cfg);
+  ASSERT_TRUE(v_is_ok(vr))
+      << "validator rejected valid rate-limit action; kind="
+      << static_cast<int>(v_get_err(vr).kind)
+      << " msg=" << v_get_err(vr).message;
+}
+
+// -------------------------------------------------------------------------
+// U2.11 — `target_port` must reference a role in `interface_roles`.
+//
+// This is a cross-reference check. The parser stores the raw role_name
+// string on ActionTargetPort / ActionMirror without resolving it. The
+// validator must check that `role_name` matches one of the declared
+// `Config.interface_roles[*].name` entries. On miss →
+// `kUnresolvedTargetPort`.
+//
+// Both ActionTargetPort and ActionMirror carry the same `role_name`
+// field and must both be resolved.
+//
+// Covers: D5.
+
+TEST(ValidatorU2_11, TargetPortRoleMustResolve) {
+  // Positive — `target_port` references an existing role.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 1100, "action": { "type": "target-port", "target_port": "upstream_port" } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected valid target-port referencing existing role; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+
+  // Negative — `target_port` references a non-existent role.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 1101, "action": { "type": "target-port", "target_port": "ghost_port" } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted target-port referencing nonexistent role";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kUnresolvedTargetPort);
+    const auto& msg = v_get_err(vr).message;
+    EXPECT_NE(msg.find("ghost_port"), std::string::npos)
+        << "error message must name the offending role: " << msg;
+  }
+
+  // Negative — mirror action's `target_port` must also resolve.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/
+        R"({ "id": 1102, "action": { "type": "mirror", "target_port": "phantom_port" } })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted mirror referencing nonexistent role";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kUnresolvedTargetPort);
+    const auto& msg = v_get_err(vr).message;
+    EXPECT_NE(msg.find("phantom_port"), std::string::npos)
+        << "error message must name the offending role: " << msg;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U2.12 — Mirror action accepted syntactically at validator.
+//
+// The validator must NOT reject `action: mirror` by type. That
+// rejection happens at the compiler tier (D7, future U3.17). This
+// test verifies that a config with a mirror action whose target_port
+// references a valid role passes validation cleanly.
+//
+// Covers: D7.
+
+TEST(ValidatorU2_12, MirrorAcceptedSyntactically) {
+  const std::string doc = make_doc_with_pipeline(
+      /*layer_2=*/"",
+      /*layer_3=*/
+      R"({ "id": 1200, "action": { "type": "mirror", "target_port": "downstream_port" } })",
+      /*layer_4=*/"",
+      /*default_behavior=*/"drop");
+  const ParseResult pr = parse(doc);
+  expect_parse_ok(pr, doc);
+
+  Config cfg = get_ok(pr);
+  const ValidateResult vr = validate(cfg);
+  ASSERT_TRUE(v_is_ok(vr))
+      << "validator rejected mirror action (D7: only compiler rejects "
+         "mirror in MVP, not validator); kind="
+      << static_cast<int>(v_get_err(vr).kind)
+      << " msg=" << v_get_err(vr).message;
+}
+
 }  // namespace
