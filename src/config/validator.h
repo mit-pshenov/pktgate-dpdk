@@ -56,6 +56,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <functional>
 #include <string>
 #include <variant>
 
@@ -73,6 +75,9 @@ struct ValidateError {
     kKeyCollision,            // U2.7 — identical L2 compound key (D15)
     kInvalidLayerTransition,  // U2.19 — next_layer not equal to layer+1
     kUnresolvedTargetPort,    // U2.11 — action target_port name not in interface_roles
+    kBudgetPerRuleExceeded,   // U2.13 — D37 gate 1: single rule expansion > ceiling
+    kBudgetAggregateExceeded, // U2.14 — D37 gate 2: total expansion > sizing cap
+    kBudgetHugepage,          // U2.15 — D37 gate 3: estimated bytes > available hugepages
   };
 
   Kind kind{};
@@ -91,5 +96,43 @@ using ValidateResult = std::variant<ValidateOk, ValidateError>;
 // U2.1 / U2.3 happy-path cases which assert their existing fields
 // survive unchanged.
 ValidateResult validate(Config& cfg);
+
+// -------------------------------------------------------------------------
+// D37 budget pre-flight (C10).
+//
+// Separate from `validate()` — runs AFTER validate() succeeds, BEFORE
+// the compiler touches any hugepage. Three gates, short-circuit on
+// first failure:
+//
+//   Gate 1 — per-rule expansion ceiling (default kDefaultPerRuleCeiling).
+//            Each port in `dst_ports` generates a separate L4 compound
+//            entry; a single rule exceeding the ceiling is flagged.
+//   Gate 2 — aggregate post-expansion ceiling. Sum of all L4 rule
+//            expansions must not exceed `sizing.l4_entries_max`.
+//   Gate 3 — hugepage budget estimate. A rough heuristic comparing
+//            the estimated ruleset memory footprint against available
+//            hugepages (injectable via `HugepageProbe`).
+//
+// Error kinds extend ValidateError::Kind additively.
+
+// Default per-rule expansion ceiling (D37 gate 1). A single rule whose
+// expansion exceeds this count is flagged before the compiler sees it.
+inline constexpr std::size_t kDefaultPerRuleCeiling = 4096;
+
+// Hugepage availability snapshot, injected at call site.
+struct HugepageInfo {
+  std::size_t available_bytes;  // free hugepages × page_size on CP socket
+};
+
+// Injection point for testing — production passes a real probe.
+using HugepageProbe = std::function<HugepageInfo()>;
+
+// Estimate the memory footprint of the compiled ruleset, in bytes.
+// Pure-arithmetic heuristic — see validator.cpp for the constants.
+// Exposed here so tests can call it directly if needed.
+std::size_t expected_ruleset_bytes(const Config& cfg);
+
+// D37 budget pre-flight. Separate gate — not folded into `validate()`.
+ValidateResult validate_budget(const Config& cfg, const HugepageProbe& probe);
 
 }  // namespace pktgate::config

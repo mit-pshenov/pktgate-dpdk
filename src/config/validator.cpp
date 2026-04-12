@@ -457,4 +457,117 @@ ValidateResult validate(Config& cfg) {
   return ValidateOk{};
 }
 
+// ---------------------------------------------------------------------------
+// D37 budget pre-flight (C10).
+//
+// Three gates, short-circuit on first failure. Runs after validate()
+// succeeds, before the compiler touches any hugepage.
+//
+// Expansion model (heuristic, not exact compiler):
+//   * L4 rules: expansion = max(1, dst_ports.size())
+//   * L2 / L3 rules: expansion = 1 per rule
+//
+// Memory estimation constants (rough heuristic — document as such):
+//   * L4CompoundEntry ≈ 64 bytes (design §4.1)
+//   * L2 hash entry   ≈ 32 bytes
+//   * L3 FIB entry    ≈ 48 bytes
+//   * Overhead         ≈ 4096 bytes (page-level metadata, hash tables, etc.)
+// These are estimates — the real structs don't exist yet in M1.
+
+namespace {
+
+constexpr std::size_t kL4EntryBytes = 64;
+constexpr std::size_t kL2EntryBytes = 32;
+constexpr std::size_t kL3EntryBytes = 48;
+constexpr std::size_t kOverheadBytes = 4096;
+
+// Estimate how many compiled entries a single rule will produce.
+// L4: each port in dst_ports generates a separate L4 compound entry.
+// L2 / L3: 1 entry per rule (no multi-entry explosion).
+std::size_t estimate_expansion(const Rule& r) {
+  // L4 expansion is driven by dst_ports. A rule with no dst_ports
+  // (but a dst_port scalar) still expands to 1.
+  if (r.dst_ports.empty()) return 1;
+  return r.dst_ports.size();
+}
+
+}  // namespace
+
+std::size_t expected_ruleset_bytes(const Config& cfg) {
+  std::size_t l4_entries = 0;
+  for (const auto& r : cfg.pipeline.layer_4) {
+    l4_entries += estimate_expansion(r);
+  }
+  const auto l2_entries = cfg.pipeline.layer_2.size();
+  const auto l3_entries = cfg.pipeline.layer_3.size();
+
+  return l4_entries * kL4EntryBytes + l2_entries * kL2EntryBytes +
+         l3_entries * kL3EntryBytes + kOverheadBytes;
+}
+
+ValidateResult validate_budget(const Config& cfg,
+                               const HugepageProbe& probe) {
+  // Gate 1 — per-rule expansion ceiling.
+  // Check every rule across all layers. L2/L3 always expand to 1
+  // (never exceeds any reasonable ceiling), but we check uniformly.
+  auto check_per_rule = [](const std::vector<Rule>& rules,
+                           const char* layer_name) -> std::optional<ValidateError> {
+    for (std::size_t i = 0; i < rules.size(); ++i) {
+      const auto expansion = estimate_expansion(rules[i]);
+      if (expansion > kDefaultPerRuleCeiling) {
+        return make_err(
+            ValidateError::kBudgetPerRuleExceeded,
+            std::string{"D37 gate 1: rule id "} +
+                std::to_string(rules[i].id) + " at " + layer_name + "[" +
+                std::to_string(i) + "] expands to " +
+                std::to_string(expansion) + " entries (ceiling is " +
+                std::to_string(kDefaultPerRuleCeiling) + ")");
+      }
+    }
+    return std::nullopt;
+  };
+
+  if (auto err = check_per_rule(cfg.pipeline.layer_2, "layer_2")) {
+    return *err;
+  }
+  if (auto err = check_per_rule(cfg.pipeline.layer_3, "layer_3")) {
+    return *err;
+  }
+  if (auto err = check_per_rule(cfg.pipeline.layer_4, "layer_4")) {
+    return *err;
+  }
+
+  // Gate 2 — aggregate post-expansion ceiling.
+  // L4 expansion sum must not exceed sizing.l4_entries_max.
+  // (L2 and L3 aggregate checks could be added but are trivial —
+  // each rule expands to 1, so the aggregate == rule count, which
+  // is already bounded by sizing.rules_per_layer_max at parse time.)
+  std::size_t l4_total = 0;
+  for (const auto& r : cfg.pipeline.layer_4) {
+    l4_total += estimate_expansion(r);
+  }
+  if (l4_total > cfg.sizing.l4_entries_max) {
+    return make_err(
+        ValidateError::kBudgetAggregateExceeded,
+        std::string{"D37 gate 2: aggregate L4 expansion is "} +
+            std::to_string(l4_total) +
+            " entries, exceeding sizing.l4_entries_max=" +
+            std::to_string(cfg.sizing.l4_entries_max));
+  }
+
+  // Gate 3 — hugepage budget estimate.
+  const std::size_t estimated = expected_ruleset_bytes(cfg);
+  const HugepageInfo hp = probe();
+  if (estimated > hp.available_bytes) {
+    return make_err(
+        ValidateError::kBudgetHugepage,
+        std::string{"D37 gate 3: estimated ruleset footprint is "} +
+            std::to_string(estimated) +
+            " bytes but only " + std::to_string(hp.available_bytes) +
+            " bytes of hugepage memory are available");
+  }
+
+  return ValidateOk{};
+}
+
 }  // namespace pktgate::config

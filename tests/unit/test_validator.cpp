@@ -74,6 +74,7 @@
 
 #include "src/config/model.h"
 #include "src/config/parser.h"
+#include "src/config/sizing.h"
 #include "src/config/validator.h"
 
 namespace {
@@ -1001,6 +1002,220 @@ TEST(ValidatorU2_12, MirrorAcceptedSyntactically) {
          "mirror in MVP, not validator); kind="
       << static_cast<int>(v_get_err(vr).kind)
       << " msg=" << v_get_err(vr).message;
+}
+
+// =========================================================================
+// C10 — D37 budget pre-flight (validate_budget).
+//
+// Five tests: U2.13..U2.17. These exercise the three-gate budget check
+// that runs AFTER validate() succeeds and BEFORE the compiler touches
+// hugepages. The function `validate_budget()` is separate from
+// `validate()` — it's a standalone gate (D37).
+//
+// Expansion model (heuristic, not exact compiler):
+//   * L4 rules: expansion = max(1, rule.dst_ports.size())
+//   * L2 / L3 rules: expansion = 1 per rule
+// Gate 1: per-rule expansion <= kDefaultPerRuleCeiling (4096).
+// Gate 2: aggregate L4 expansion <= sizing.l4_entries_max.
+// Gate 3: expected_ruleset_bytes() <= HugepageProbe().available_bytes.
+//
+// Spy approach: (a) implicit — test is the orchestrator, checks the
+// error return and never calls any compile function. See U2.17 comment.
+// =========================================================================
+
+using ::pktgate::config::HugepageInfo;
+using ::pktgate::config::HugepageProbe;
+using ::pktgate::config::kDefaultPerRuleCeiling;
+using ::pktgate::config::validate_budget;
+
+// Helper: build a Config directly (bypass parser) with N L4 rules, each
+// having `ports_per_rule` entries in dst_ports. Sizing is caller-set.
+// All other fields are minimal-valid (version=1, two interface roles,
+// default_behavior=drop).
+Config make_budget_config_l4(std::size_t n_rules,
+                             std::size_t ports_per_rule,
+                             ::pktgate::config::Sizing sizing) {
+  Config cfg;
+  cfg.version = ::pktgate::config::kSchemaVersion;
+  cfg.default_behavior = ::pktgate::config::DefaultBehavior::kDrop;
+  cfg.sizing = sizing;
+
+  // Two interface roles so any future cross-check doesn't trip.
+  cfg.interface_roles.push_back(
+      {"upstream_port", ::pktgate::config::PciSelector{"0000:00:00.0"}});
+  cfg.interface_roles.push_back(
+      {"downstream_port", ::pktgate::config::PciSelector{"0000:00:00.1"}});
+
+  for (std::size_t i = 0; i < n_rules; ++i) {
+    ::pktgate::config::Rule r;
+    r.id = static_cast<std::int32_t>(i + 1);
+    // Fill dst_ports with sequential port numbers.
+    r.dst_ports.reserve(ports_per_rule);
+    for (std::size_t p = 0; p < ports_per_rule; ++p) {
+      r.dst_ports.push_back(static_cast<std::int32_t>(p));
+    }
+    cfg.pipeline.layer_4.push_back(std::move(r));
+  }
+  return cfg;
+}
+
+// Generous hugepage probe that never triggers gate 3.
+HugepageProbe generous_probe() {
+  return [] { return HugepageInfo{1024ULL * 1024 * 1024}; };  // 1 GiB
+}
+
+// Tiny hugepage probe for gate 3 testing.
+HugepageProbe tiny_probe(std::size_t bytes) {
+  return [bytes] { return HugepageInfo{bytes}; };
+}
+
+// -------------------------------------------------------------------------
+// U2.13 — Budget pre-flight: per-rule expansion ceiling (D37 gate 1).
+//
+// A single rule with `dst_ports` expanding to 65 536 L4 entries —
+// well above the default ceiling of 4 096. validate_budget() must
+// return `BudgetPerRuleExceeded` and report the rule id + expansion.
+//
+// Note: building a 65536-element vector may be slow under ASan.
+// We use a smaller but still over-ceiling count (4097) to keep tests
+// fast while still exercising the contract "expansion > ceiling".
+//
+// Covers: D37.
+
+TEST(ValidatorBudgetU2_13, PerRuleExpansionCeilingExceeded) {
+  const std::size_t over_ceiling = kDefaultPerRuleCeiling + 1;  // 4097
+  auto sizing = ::pktgate::config::kSizingProdDefaults;
+  // Make aggregate ceiling generous so gate 2 doesn't fire first.
+  sizing.l4_entries_max = 100'000;
+
+  const Config cfg = make_budget_config_l4(/*n_rules=*/1,
+                                           /*ports_per_rule=*/over_ceiling,
+                                           sizing);
+  const ValidateResult vr = validate_budget(cfg, generous_probe());
+
+  ASSERT_FALSE(v_is_ok(vr))
+      << "validate_budget accepted a rule expanding to " << over_ceiling
+      << " entries (ceiling is " << kDefaultPerRuleCeiling << ")";
+  EXPECT_EQ(v_get_err(vr).kind, ValidateError::kBudgetPerRuleExceeded);
+  const auto& msg = v_get_err(vr).message;
+  // Message must report the rule id and the expansion count.
+  EXPECT_NE(msg.find("rule"), std::string::npos) << msg;
+  EXPECT_NE(msg.find(std::to_string(over_ceiling)), std::string::npos)
+      << "message must report expansion count: " << msg;
+}
+
+// -------------------------------------------------------------------------
+// U2.14 — Budget pre-flight: aggregate ceiling (D37 gate 2).
+//
+// 4 rules each expanding to 1 025 L4 entries (total 4 100). With
+// `sizing.l4_entries_max = 4096`, aggregate exceeds → error.
+//
+// Covers: D37.
+
+TEST(ValidatorBudgetU2_14, AggregateCeilingExceeded) {
+  auto sizing = ::pktgate::config::kSizingProdDefaults;
+  sizing.l4_entries_max = 4096;
+
+  const Config cfg = make_budget_config_l4(/*n_rules=*/4,
+                                           /*ports_per_rule=*/1025,
+                                           sizing);
+  const ValidateResult vr = validate_budget(cfg, generous_probe());
+
+  ASSERT_FALSE(v_is_ok(vr))
+      << "validate_budget accepted aggregate expansion 4100 > l4_entries_max=4096";
+  EXPECT_EQ(v_get_err(vr).kind, ValidateError::kBudgetAggregateExceeded);
+  const auto& msg = v_get_err(vr).message;
+  // Message must report the sum.
+  EXPECT_NE(msg.find("4100"), std::string::npos)
+      << "message must report aggregate expansion sum: " << msg;
+}
+
+// -------------------------------------------------------------------------
+// U2.15 — Budget pre-flight: hugepage estimate (D37 gate 3).
+//
+// Mock HugepageProbe returns { available_bytes: 1024 } (tiny). Sizing
+// inflated so expected_ruleset_bytes() > 1024. Call → BudgetHugepage.
+// Uses a test-only hugepage-probe injection point.
+//
+// Covers: D37.
+
+TEST(ValidatorBudgetU2_15, HugepageEstimateExceeded) {
+  auto sizing = ::pktgate::config::kSizingProdDefaults;
+  // Keep l4_entries_max generous so gates 1+2 don't fire.
+  sizing.l4_entries_max = 100'000;
+
+  // 100 rules × 10 ports = 1000 L4 entries. Even at 64 bytes each that's
+  // 64 KB — well above the 1024-byte mock. The exact threshold doesn't
+  // matter; the contract is "estimate > available → error".
+  const Config cfg = make_budget_config_l4(/*n_rules=*/100,
+                                           /*ports_per_rule=*/10,
+                                           sizing);
+  const ValidateResult vr = validate_budget(cfg, tiny_probe(1024));
+
+  ASSERT_FALSE(v_is_ok(vr))
+      << "validate_budget accepted a config whose estimated bytes exceed "
+         "the mocked 1024-byte hugepage budget";
+  EXPECT_EQ(v_get_err(vr).kind, ValidateError::kBudgetHugepage);
+  const auto& msg = v_get_err(vr).message;
+  // Message must report estimated vs available.
+  EXPECT_NE(msg.find("1024"), std::string::npos)
+      << "message must report available hugepage bytes: " << msg;
+}
+
+// -------------------------------------------------------------------------
+// U2.16 — Budget pre-flight: false-positive negative test.
+//
+// 100 rules each expanding to 30 entries (3 000 total). Well under
+// kDefaultPerRuleCeiling (4096) and under sizing.l4_entries_max (4096).
+// Generous hugepages. validate_budget() must succeed.
+//
+// Covers: D37.
+
+TEST(ValidatorBudgetU2_16, FalsePositiveNegativeTest) {
+  auto sizing = ::pktgate::config::kSizingProdDefaults;
+  sizing.l4_entries_max = 4096;
+
+  const Config cfg = make_budget_config_l4(/*n_rules=*/100,
+                                           /*ports_per_rule=*/30,
+                                           sizing);
+  const ValidateResult vr = validate_budget(cfg, generous_probe());
+
+  ASSERT_TRUE(v_is_ok(vr))
+      << "validate_budget rejected 100×30=3000 entries (well under 4096); kind="
+      << static_cast<int>(v_get_err(vr).kind)
+      << " msg=" << v_get_err(vr).message;
+}
+
+// -------------------------------------------------------------------------
+// U2.17 — Validator short-circuits on first budget failure.
+//
+// Same config as U2.13 (gate 1 fails). Assert is_error(result).
+// Implicit short-circuit: the test is the orchestrator — it checks
+// the error return and never proceeds to any compile function. This
+// is approach (a) from the spec. A comment documents the implicit
+// contract: "caller would not proceed to compile on error."
+//
+// Covers: D37.
+
+TEST(ValidatorBudgetU2_17, ShortCircuitsOnBudgetFailure) {
+  const std::size_t over_ceiling = kDefaultPerRuleCeiling + 1;
+  auto sizing = ::pktgate::config::kSizingProdDefaults;
+  sizing.l4_entries_max = 100'000;
+
+  const Config cfg = make_budget_config_l4(/*n_rules=*/1,
+                                           /*ports_per_rule=*/over_ceiling,
+                                           sizing);
+  const ValidateResult vr = validate_budget(cfg, generous_probe());
+
+  // Implicit short-circuit — the caller (this test, or the future M10
+  // reload orchestrator) checks the result and never proceeds to the
+  // compile stage on error. No explicit compiler spy needed: the test
+  // IS the orchestrator and it stops here.
+  ASSERT_FALSE(v_is_ok(vr))
+      << "validate_budget must return an error for over-ceiling expansion; "
+         "compile spy is implicit — caller would not proceed to compile";
+  // The error kind should be gate 1 (first gate to fire).
+  EXPECT_EQ(v_get_err(vr).kind, ValidateError::kBudgetPerRuleExceeded);
 }
 
 }  // namespace
