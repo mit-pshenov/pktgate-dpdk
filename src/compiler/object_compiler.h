@@ -22,7 +22,11 @@ CompiledObjects compile_objects(const config::ObjectPool& pool);
 
 // Compile a full pipeline: objects + rules → CompileResult.
 // Handles port-list expansion (U3.3), port-group expansion (U3.2),
-// and counter_slot dense assignment (U3.4).
-CompileResult compile(const config::Config& cfg);
+// counter_slot dense assignment (U3.4), and rule tiering (D4).
+//
+// The overload without CompileOptions uses default options (MVP:
+// hw_offload_enabled = false, all rules demoted to SW).
+CompileResult compile(const config::Config& cfg,
+                      const CompileOptions& opts = CompileOptions{});
 
 }  // namespace pktgate::compiler

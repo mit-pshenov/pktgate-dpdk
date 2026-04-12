@@ -73,7 +73,8 @@ static ActionVerb resolve_verb(const config::RuleAction& action) {
 // -------------------------------------------------------------------------
 // compile — full pipeline.
 
-CompileResult compile(const config::Config& cfg) {
+CompileResult compile(const config::Config& cfg,
+                      const CompileOptions& opts) {
   CompileResult result;
 
   // Phase 1: compile objects
@@ -83,14 +84,19 @@ CompileResult compile(const config::Config& cfg) {
   //
   // For each rule:
   //   1. Create a CompiledAction with monotonic counter_slot (U3.4).
-  //   2. If the rule has dst_ports (port-list), expand into N entries
+  //   2. Set execution_tier from hw_offload_hint (D4, U3.13/U3.14).
+  //      When hw_offload_enabled is false (MVP), all rules stay SW
+  //      regardless of hint (U3.15).
+  //   3. If the rule has dst_ports (port-list), expand into N entries
   //      each with a distinct dst_port, all sharing the same action
   //      index (U3.2, U3.3).
-  //   3. If the rule has a single dst_port, create one entry.
-  //   4. Otherwise, create one entry with dst_port = -1.
+  //   4. If the rule has a single dst_port, create one entry.
+  //   5. Otherwise, create one entry with dst_port = -1.
+
+  const bool hw_enabled = opts.hw_offload_enabled;
 
   auto compile_layer =
-      [](const std::vector<config::Rule>& rules, Layer layer,
+      [hw_enabled](const std::vector<config::Rule>& rules, Layer layer,
          std::vector<CompiledAction>& actions,
          std::vector<CompiledRuleEntry>& entries) {
         std::uint16_t slot = 0;
@@ -102,6 +108,12 @@ CompileResult compile(const config::Config& cfg) {
           action.counter_slot = slot++;
           action.verb = rule.action ? resolve_verb(*rule.action)
                                     : ActionVerb::kDrop;
+          // D4 tiering: honor hw_offload_hint only when globally enabled.
+          // MVP default: hw_enabled == false → everything stays kSw.
+          action.execution_tier =
+              (hw_enabled && rule.hw_offload_hint)
+                  ? ExecutionTier::kHw
+                  : ExecutionTier::kSw;
 
           const auto action_idx =
               static_cast<std::uint32_t>(actions.size());

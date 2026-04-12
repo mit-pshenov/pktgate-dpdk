@@ -69,10 +69,32 @@ enum class ActionVerb : std::uint8_t {
   kRedirect = 5,
 };
 
+// D4: execution tier — SW (software tables) vs HW (rte_flow offload).
+// Default is kSw. The compiler sets kHw when the rule's hw_offload_hint
+// is true AND global hw_offload_enabled is true. MVP ships with global
+// disable (all rules are SW regardless of hint).
+enum class ExecutionTier : std::uint8_t {
+  kSw = 0,
+  kHw = 1,
+};
+
 struct CompiledAction {
   std::int32_t rule_id{-1};
   std::uint16_t counter_slot{0};
   ActionVerb verb{ActionVerb::kDrop};
+  ExecutionTier execution_tier{ExecutionTier::kSw};  // D4: default SW
+};
+
+// -------------------------------------------------------------------------
+// CompileOptions — optional knobs for the compile() function.
+//
+// hw_offload_enabled: when false (MVP default), all rules are demoted
+// to execution_tier == SW regardless of per-rule hw_offload_hint.
+// When true, rules with hw_offload_hint produce execution_tier == HW.
+// Covers D4, §14 MVP.
+
+struct CompileOptions {
+  bool hw_offload_enabled = false;  // MVP default: all SW
 };
 
 // -------------------------------------------------------------------------

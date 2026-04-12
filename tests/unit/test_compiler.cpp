@@ -894,4 +894,164 @@ TEST(L4CompoundCorners, IcmpDestUnreachableCode3_C6_6) {
   EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kTcpFlags);
 }
 
+// =========================================================================
+// C6 — Rule tiering + first-match-wins
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U3.13 Rule tiering — default software
+//
+// Rules without hw_offload_hint get execution_tier == SW in the compiled
+// action output. Covers D4.
+// -------------------------------------------------------------------------
+TEST(RuleTiering, DefaultSoftware_U3_13) {
+  Config cfg = make_config();
+
+  // Rule with default hw_offload_hint (false)
+  auto& rule = append_rule(cfg.pipeline.layer_4, 7001, ActionAllow{});
+  rule.proto = 6;
+  rule.dst_port = 80;
+  // hw_offload_hint defaults to false — do NOT set it
+
+  auto result = compile(cfg);
+
+  // The L4 action must have execution_tier == kSw
+  ASSERT_EQ(result.l4_actions.size(), 1u);
+  EXPECT_EQ(result.l4_actions[0].execution_tier, ExecutionTier::kSw)
+      << "Rule without hw_offload_hint must get execution_tier == SW (D4)";
+}
+
+// -------------------------------------------------------------------------
+// U3.14 Rule tiering — operator hint honored
+//
+// hw_offload_hint: true produces execution_tier == HW in compiled action.
+// Covers D4.
+// -------------------------------------------------------------------------
+TEST(RuleTiering, OperatorHintHonored_U3_14) {
+  Config cfg = make_config();
+
+  auto& rule = append_rule(cfg.pipeline.layer_4, 7002, ActionDrop{});
+  rule.proto = 6;
+  rule.dst_port = 443;
+  rule.hw_offload_hint = true;
+
+  // Compile with hw_offload_enabled = true so the hint is honored
+  CompileOptions opts;
+  opts.hw_offload_enabled = true;
+  auto result = compile(cfg, opts);
+
+  ASSERT_EQ(result.l4_actions.size(), 1u);
+  EXPECT_EQ(result.l4_actions[0].execution_tier, ExecutionTier::kHw)
+      << "Rule with hw_offload_hint=true must get execution_tier == HW (D4)";
+}
+
+// -------------------------------------------------------------------------
+// U3.15 Rule tiering — MVP may globally disable
+//
+// With hw_offload_enabled == false (MVP default), compiler demotes all
+// rules back to SW at publish time. Even rules with hw_offload_hint=true
+// end up as SW. Covers D4, §14 MVP.
+// -------------------------------------------------------------------------
+TEST(RuleTiering, MvpGlobalDisable_U3_15) {
+  Config cfg = make_config();
+
+  // Two rules: one with hint=true, one default (false)
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 7003, ActionAllow{});
+  r1.proto = 6;
+  r1.dst_port = 80;
+  r1.hw_offload_hint = true;
+
+  auto& r2 = append_rule(cfg.pipeline.layer_4, 7004, ActionDrop{});
+  r2.proto = 17;
+  r2.dst_port = 53;
+  // hw_offload_hint defaults to false
+
+  // Compile with hw_offload_enabled = false (MVP default)
+  CompileOptions opts;
+  opts.hw_offload_enabled = false;
+  auto result = compile(cfg, opts);
+
+  ASSERT_EQ(result.l4_actions.size(), 2u);
+  EXPECT_EQ(result.l4_actions[0].execution_tier, ExecutionTier::kSw)
+      << "Even with hint=true, global disable must demote to SW (D4 MVP)";
+  EXPECT_EQ(result.l4_actions[1].execution_tier, ExecutionTier::kSw)
+      << "Default hint + global disable must remain SW (D4 MVP)";
+}
+
+// -------------------------------------------------------------------------
+// U3.16 First-match-wins iteration order preserved
+//
+// Within a layer, compiled RuleAction[] entries appear in the order rules
+// were declared in the config. The action_idx assigned to each primary-
+// hash entry reflects config order. Covers F1.
+// -------------------------------------------------------------------------
+TEST(RuleTiering, FirstMatchWinsOrder_U3_16) {
+  Config cfg = make_config();
+
+  // Add 4 L4 rules in a specific order
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 8001, ActionAllow{});
+  r1.proto = 6;
+  r1.dst_port = 80;
+
+  auto& r2 = append_rule(cfg.pipeline.layer_4, 8002, ActionDrop{});
+  r2.proto = 6;
+  r2.dst_port = 443;
+
+  auto& r3 = append_rule(cfg.pipeline.layer_4, 8003, ActionAllow{});
+  r3.proto = 17;
+  r3.dst_port = 53;
+
+  auto& r4 = append_rule(cfg.pipeline.layer_4, 8004, ActionDrop{});
+  r4.proto = 1;
+  r4.dst_port = 8;  // ICMP echo request via D29
+
+  auto result = compile(cfg);
+
+  // 4 actions in declaration order
+  ASSERT_EQ(result.l4_actions.size(), 4u);
+  EXPECT_EQ(result.l4_actions[0].rule_id, 8001);
+  EXPECT_EQ(result.l4_actions[1].rule_id, 8002);
+  EXPECT_EQ(result.l4_actions[2].rule_id, 8003);
+  EXPECT_EQ(result.l4_actions[3].rule_id, 8004);
+
+  // counter_slots must be dense and in order: 0, 1, 2, 3
+  EXPECT_EQ(result.l4_actions[0].counter_slot, 0u);
+  EXPECT_EQ(result.l4_actions[1].counter_slot, 1u);
+  EXPECT_EQ(result.l4_actions[2].counter_slot, 2u);
+  EXPECT_EQ(result.l4_actions[3].counter_slot, 3u);
+
+  // Entries must reference action indices in declaration order.
+  // Each rule produces one entry (no port-list expansion).
+  ASSERT_EQ(result.l4_entries.size(), 4u);
+  EXPECT_EQ(result.l4_entries[0].action_index, 0u);
+  EXPECT_EQ(result.l4_entries[1].action_index, 1u);
+  EXPECT_EQ(result.l4_entries[2].action_index, 2u);
+  EXPECT_EQ(result.l4_entries[3].action_index, 3u);
+
+  // Also check L2 layer: add 3 L2 rules and verify order
+  Config cfg2 = make_config();
+  auto& l2r1 = append_rule(cfg2.pipeline.layer_2, 9001, ActionAllow{});
+  l2r1.vlan_id = 100;
+
+  auto& l2r2 = append_rule(cfg2.pipeline.layer_2, 9002, ActionDrop{});
+  l2r2.vlan_id = 200;
+
+  auto& l2r3 = append_rule(cfg2.pipeline.layer_2, 9003, ActionAllow{});
+  l2r3.ethertype = 0x0800;
+
+  auto result2 = compile(cfg2);
+
+  // 3 L2 actions in declaration order
+  ASSERT_EQ(result2.l2_actions.size(), 3u);
+  EXPECT_EQ(result2.l2_actions[0].rule_id, 9001);
+  EXPECT_EQ(result2.l2_actions[1].rule_id, 9002);
+  EXPECT_EQ(result2.l2_actions[2].rule_id, 9003);
+
+  // Entries in order
+  ASSERT_EQ(result2.l2_entries.size(), 3u);
+  EXPECT_EQ(result2.l2_entries[0].action_index, 0u);
+  EXPECT_EQ(result2.l2_entries[1].action_index, 1u);
+  EXPECT_EQ(result2.l2_entries[2].action_index, 2u);
+}
+
 }  // namespace
