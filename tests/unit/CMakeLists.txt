@@ -38,3 +38,10 @@ pktgate_add_test(
   LABELS  unit corner
   LINK    pktgate_core
 )
+
+pktgate_add_test(
+  NAME    unit.test_compiler
+  SOURCES test_compiler.cpp
+  LABELS  unit
+  LINK    pktgate_core
+)

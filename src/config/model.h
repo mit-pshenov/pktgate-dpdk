@@ -269,8 +269,17 @@ struct SubnetObject {
   std::vector<SubnetCidr> cidrs;       // heterogeneous v4/v6 allowed
 };
 
+// M2 C1: named port group — a list of port numbers. The parser stores
+// them verbatim; the M2 compiler expands references during rule
+// compilation. Validator checks dangling refs (C7+).
+struct PortGroupObject {
+  std::string name;
+  std::vector<std::uint16_t> ports;
+};
+
 struct ObjectPool {
-  std::vector<SubnetObject> subnets;   // unresolved, order-preserving
+  std::vector<SubnetObject> subnets;       // unresolved, order-preserving
+  std::vector<PortGroupObject> port_groups; // M2 C1
 };
 
 // Pipeline layer rule vectors. C1 shape-checked the layer arrays; C4

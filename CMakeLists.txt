@@ -126,6 +126,7 @@ add_library(pktgate_core STATIC
   src/config/addr.cpp
   src/config/sizing.cpp
   src/config/validator.cpp
+  src/compiler/object_compiler.cpp
 )
 target_include_directories(pktgate_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)
