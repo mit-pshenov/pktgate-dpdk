@@ -1,6 +1,6 @@
 // tests/unit/test_eal_unit.cpp
 //
-// M3 C4 — EAL-needing unit tests.
+// M3 C4/C5 — EAL-needing unit tests.
 //
 // This binary has its own main() that calls rte_eal_init() once
 // via the EalFixture, then runs all gtest tests. Separate from
@@ -12,6 +12,7 @@
 
 #include <rte_mbuf.h>
 
+#include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 
 namespace pktgate::test {
@@ -73,6 +74,67 @@ TEST_F(DynfieldTest, U6_1_DynfieldRegistrationAndWritable) {
   EXPECT_EQ(cdyn->parsed_ethertype, 0x0800);
 
   rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.2a — D39 worker multi-seg drop: is_single_segment check + counter
+//
+// Synthesize a multi-seg mbuf (chain two mbufs), verify that
+// is_single_segment rejects it and that the WorkerCtx counter
+// increments correctly.
+// =========================================================================
+
+class WorkerMultiSegTest : public EalFixture {};
+
+TEST_F(WorkerMultiSegTest, U6_2a_SingleSegReturnsTrue) {
+  // Single-segment mbuf: is_single_segment must return true.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "test_singleseg_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr) << "mempool creation failed";
+
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  EXPECT_EQ(m->nb_segs, 1);
+  EXPECT_TRUE(dataplane::is_single_segment(m));
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+TEST_F(WorkerMultiSegTest, U6_2a_MultiSegReturnsFalse) {
+  // Chain two mbufs to create a multi-segment packet.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "test_multiseg_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr) << "mempool creation failed";
+
+  struct rte_mbuf* head = rte_pktmbuf_alloc(mp);
+  struct rte_mbuf* tail = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(head, nullptr);
+  ASSERT_NE(tail, nullptr);
+
+  // Manually chain: head->next = tail, nb_segs = 2.
+  head->next = tail;
+  head->nb_segs = 2;
+  head->pkt_len = head->data_len + tail->data_len;
+
+  EXPECT_FALSE(dataplane::is_single_segment(head));
+
+  // Verify WorkerCtx counter bookkeeping pattern.
+  // (Worker RX loop: if !is_single_segment → ++counter, free, continue.)
+  dataplane::WorkerCtx ctx{};
+  std::atomic<bool> running{true};
+  ctx.running = &running;
+  EXPECT_EQ(ctx.pkt_multiseg_drop_total, 0u);
+
+  // Simulate the drop path.
+  if (!dataplane::is_single_segment(head)) {
+    ++ctx.pkt_multiseg_drop_total;
+  }
+  EXPECT_EQ(ctx.pkt_multiseg_drop_total, 1u);
+
+  // Free the chained mbuf (rte_pktmbuf_free walks the chain).
+  rte_pktmbuf_free(head);
   rte_mempool_free(mp);
 }
 

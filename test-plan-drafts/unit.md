@@ -765,6 +765,17 @@ built in-process via U3/U4 helpers.
   `classify_l2` sets `verdict_layer = NEXT_L3`.
 - Covers: §5.2 control flow, F1 default.
 
+### U6.2a Worker — D39 multi-seg mbuf drop [needs EAL]
+- Goal: synthesize a multi-segment mbuf (chain two mbufs via
+  `head->next`, `nb_segs=2`), verify `is_single_segment()` returns
+  false, and that the WorkerCtx `pkt_multiseg_drop_total` counter
+  increments on the drop path. Single-segment mbuf must return true.
+- Inputs: two mbufs from `rte_pktmbuf_pool_create`, manually chained.
+- Assertions: `is_single_segment(single) == true`;
+  `is_single_segment(chained) == false`; counter goes from 0 to 1
+  after simulated drop.
+- Covers: D39, §5.1 (worker pre-classify check).
+
 ### U6.2 L2 — src_mac match → dispatch_l2
 - Goal: rule on src_mac aa:bb:cc:dd:ee:ff; packet with that
   src → compound entry hit → verdict_layer = TERMINAL_L2,

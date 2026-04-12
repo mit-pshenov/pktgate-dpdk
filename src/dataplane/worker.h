@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <atomic>
 
+#include <rte_mbuf.h>
+
 #include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {
@@ -22,7 +24,16 @@ struct WorkerCtx {
   std::uint16_t port_id;       // port to RX from
   std::uint16_t queue_id;      // RX queue assigned to this worker
   std::atomic<bool>* running;  // global stop flag (ctl::g_running)
+
+  // Per-worker counters (D3: per-lcore, zero atomics).
+  std::uint64_t pkt_multiseg_drop_total = 0;  // D39: nb_segs != 1
 };
+
+// D39: check if an mbuf is single-segment. If not, it must be dropped.
+// This is the pre-classify check; the actual classify_l2/l3/l4 is M4+.
+inline bool is_single_segment(const struct rte_mbuf* m) {
+  return m->nb_segs == 1;
+}
 
 // Worker entry point. Launched via rte_eal_remote_launch.
 // Signature matches rte_eal_remote_launch callback: int (*)(void*).

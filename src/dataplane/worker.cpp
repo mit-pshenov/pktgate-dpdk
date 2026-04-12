@@ -1,13 +1,15 @@
 // src/dataplane/worker.cpp
 //
-// M3 C1 — worker skeleton: RX + free (no classification).
+// M3 C1/C5 — worker skeleton: RX loop with D39 multi-seg drop.
 //
-// The worker polls a single RX queue, frees all received mbufs, and
+// The worker polls a single RX queue, drops multi-segment mbufs
+// (D39: headers-in-first-seg invariant), frees remaining mbufs, and
 // exits when the global running flag is cleared. Classification
 // (classify_l2/l3/l4) arrives in M4-M6.
 
 #include "src/dataplane/worker.h"
 
+#include <rte_debug.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 
@@ -33,8 +35,20 @@ int worker_main(void* arg) {
       continue;
     }
 
-    // M3: no classification, just free. M4+ adds classify_l2/l3/l4.
     for (std::uint16_t i = 0; i < nb_rx; ++i) {
+      // D39: drop multi-segment mbufs. Port validator (C3) ensures
+      // scatter is OFF and mempool fits max_rx_pkt_len, so multi-seg
+      // should never arrive in practice. This is the safety net.
+      if (!is_single_segment(bufs[i])) {
+        ++ctx->pkt_multiseg_drop_total;
+        rte_pktmbuf_free(bufs[i]);
+        continue;
+      }
+
+      // D39 debug assert: after passing the check, nb_segs MUST be 1.
+      RTE_ASSERT(bufs[i]->nb_segs == 1);
+
+      // M3: no classification, just free. M4+ adds classify_l2/l3/l4.
       rte_pktmbuf_free(bufs[i]);
     }
   }
