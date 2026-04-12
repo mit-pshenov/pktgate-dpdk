@@ -620,4 +620,278 @@ TEST(L4CompoundConstruction, CollisionDetection_U3_24) {
       << "Different filter_mask should NOT be reported as collision";
 }
 
+// =========================================================================
+// C5 — ICMP/D29 + L4 compound corners
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U3.12 L4 compound — ICMP type+code packing (D29)
+//
+// Rule matching `icmp type=8 code=0` packs type into dport slot, code
+// into sport slot; SRC_PORT bit set because code is constrained; no
+// separate want_icmp_code field. Covers D14, D29.
+//
+// Per D29 unification: ICMP type goes to dst_port, ICMP code goes to
+// src_port. The compiler treats them identically to TCP/UDP ports.
+// -------------------------------------------------------------------------
+TEST(L4CompoundICMP, IcmpTypeCodePacking_U3_12) {
+  Config cfg = make_config();
+
+  // ICMP = 1, type=8 (echo request) → dport slot, code=0 → sport slot
+  auto& rule = append_rule(cfg.pipeline.layer_4, 5001, ActionDrop{});
+  rule.proto = 1;        // ICMP
+  rule.dst_port = 8;     // type=8 in dport slot (D29)
+  rule.src_port = 0;     // code=0 in sport slot (D29)
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+  ASSERT_TRUE(l4out.collisions.empty());
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary: kProtoDport with key = (1 << 16) | 8
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  const std::uint32_t expected_key = (1u << 16) | 8u;
+  EXPECT_EQ(cr.primary_key, expected_key)
+      << "ICMP type=8 must pack as (proto=1 << 16) | type=8";
+
+  // SRC_PORT bit MUST be set: code=0 is a real constraint (code IS specified)
+  EXPECT_TRUE(cr.entry.filter_mask & l4_mask::kSrcPort)
+      << "SRC_PORT bit must be set when ICMP code is constrained (D29)";
+
+  // want_src_port holds the ICMP code value
+  EXPECT_EQ(cr.entry.want_src_port, 0u)
+      << "ICMP code=0 must be stored in want_src_port slot (D29)";
+
+  // No TCP_FLAGS bit (ICMP doesn't have TCP flags)
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kTcpFlags);
+}
+
+// -------------------------------------------------------------------------
+// C6.1 TCP SYN only, dport=443 (compiler-level)
+//
+// L4 rule {proto:tcp, dport:443, tcp_flags:{syn:true}, drop}. Assert
+// compiler produces entry with TCP_FLAGS bit in filter_mask. Covers
+// D15 compound with TCP_FLAGS secondary.
+// -------------------------------------------------------------------------
+TEST(L4CompoundCorners, TcpSynDport443_C6_1) {
+  Config cfg = make_config();
+
+  auto& rule = append_rule(cfg.pipeline.layer_4, 6001, ActionDrop{});
+  rule.proto = 6;         // TCP
+  rule.dst_port = 443;
+  // tcp_flags: syn=true → mask=0x02, want=0x02
+  TcpFlags flags;
+  flags.mask = 0x02;  // SYN bit in mask
+  flags.want = 0x02;  // SYN bit in want
+  rule.tcp_flags = flags;
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary: TCP/443
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  EXPECT_EQ(cr.primary_key, (6u << 16) | 443u);
+
+  // filter_mask MUST have TCP_FLAGS bit set
+  EXPECT_TRUE(cr.entry.filter_mask & l4_mask::kTcpFlags)
+      << "TCP_FLAGS bit must be set when tcp_flags is constrained (D15)";
+
+  // The stored flags values must match
+  EXPECT_EQ(cr.entry.tcp_flags_mask, 0x02u)
+      << "tcp_flags_mask must contain SYN bit";
+  EXPECT_EQ(cr.entry.tcp_flags_want, 0x02u)
+      << "tcp_flags_want must have SYN bit set (syn=true)";
+
+  // No SRC_PORT bit (no src_port constraint)
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kSrcPort);
+}
+
+// -------------------------------------------------------------------------
+// C6.2 TCP FIN, dport=443 (same rule structure, wrong flags)
+//
+// Same rule as C6.1. At compiler level: verify filter_mask has TCP_FLAGS
+// bit set so a FIN packet would NOT match at runtime. Covers D15.
+//
+// Note: actual runtime mismatch is M6 — here we just verify the entry
+// structure correctly encodes the constraint that distinguishes SYN
+// from FIN.
+// -------------------------------------------------------------------------
+TEST(L4CompoundCorners, TcpFinMiss_C6_2) {
+  Config cfg = make_config();
+
+  // Same rule as C6.1: TCP/443, tcp_flags={syn:true}
+  auto& rule = append_rule(cfg.pipeline.layer_4, 6002, ActionDrop{});
+  rule.proto = 6;
+  rule.dst_port = 443;
+  TcpFlags flags;
+  flags.mask = 0x02;  // SYN bit
+  flags.want = 0x02;  // SYN must be set
+  rule.tcp_flags = flags;
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // filter_mask has TCP_FLAGS — this is the gate that prevents a FIN
+  // packet (flags=0x01) from matching at runtime
+  EXPECT_TRUE(cr.entry.filter_mask & l4_mask::kTcpFlags)
+      << "TCP_FLAGS bit must be set — this is what blocks FIN at runtime";
+
+  // The constraint: mask=0x02 (check SYN), want=0x02 (SYN must be set)
+  // A FIN packet has flags=0x01: (0x01 & 0x02) == 0 != 0x02 → mismatch
+  EXPECT_EQ(cr.entry.tcp_flags_mask, 0x02u);
+  EXPECT_EQ(cr.entry.tcp_flags_want, 0x02u);
+
+  // Verify the runtime check would indeed reject FIN=0x01:
+  // (packet_flags & mask) == want  →  (0x01 & 0x02) == 0x02  →  false
+  constexpr std::uint8_t fin_flags = 0x01;
+  EXPECT_NE(fin_flags & cr.entry.tcp_flags_mask, cr.entry.tcp_flags_want)
+      << "FIN packet must NOT match the SYN-only constraint";
+}
+
+// -------------------------------------------------------------------------
+// C6.3 UDP dport=53 wildcard src (compiler-level)
+//
+// Rule {udp, dport:53, drop} with no src_port. Assert NO SRC_PORT bit
+// in filter_mask. Covers D15.
+// -------------------------------------------------------------------------
+TEST(L4CompoundCorners, UdpDport53WildcardSrc_C6_3) {
+  Config cfg = make_config();
+
+  auto& rule = append_rule(cfg.pipeline.layer_4, 6003, ActionDrop{});
+  rule.proto = 17;       // UDP
+  rule.dst_port = 53;    // DNS
+  // No src_port constraint
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary: UDP/53
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  EXPECT_EQ(cr.primary_key, (17u << 16) | 53u);
+
+  // NO SRC_PORT bit — wildcard matches any source port
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kSrcPort)
+      << "SRC_PORT bit must NOT be set when no src_port constraint (D15)";
+
+  // No TCP_FLAGS bit either (UDP)
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kTcpFlags);
+
+  // filter_mask should be completely zero (no secondary constraints)
+  EXPECT_EQ(cr.entry.filter_mask, 0u);
+}
+
+// -------------------------------------------------------------------------
+// C6.4 UDP dport=53 with src_port=1234 constraint (compiler-level)
+//
+// Assert SRC_PORT bit IS set and want_src_port=1234. Covers D15.
+// -------------------------------------------------------------------------
+TEST(L4CompoundCorners, UdpDport53WithSport_C6_4) {
+  Config cfg = make_config();
+
+  auto& rule = append_rule(cfg.pipeline.layer_4, 6004, ActionDrop{});
+  rule.proto = 17;        // UDP
+  rule.dst_port = 53;     // DNS
+  rule.src_port = 1234;   // Specific source port
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary: UDP/53
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  EXPECT_EQ(cr.primary_key, (17u << 16) | 53u);
+
+  // SRC_PORT bit MUST be set
+  EXPECT_TRUE(cr.entry.filter_mask & l4_mask::kSrcPort)
+      << "SRC_PORT bit must be set when src_port=1234 is constrained (D15)";
+
+  // want_src_port must hold the constraint value
+  EXPECT_EQ(cr.entry.want_src_port, 1234u);
+}
+
+// -------------------------------------------------------------------------
+// C6.5 ICMP echo request (type=8, code=0) — compiler-level
+//
+// Rule {proto:icmp, dst_port:8, drop} — type in dport slot per D29.
+// Assert proto_dport key = (1<<16)|8. Covers D29.
+// -------------------------------------------------------------------------
+TEST(L4CompoundCorners, IcmpEchoRequest_C6_5) {
+  Config cfg = make_config();
+
+  // ICMP echo: type=8 → dport slot, no code constraint (wildcard code)
+  auto& rule = append_rule(cfg.pipeline.layer_4, 6005, ActionDrop{});
+  rule.proto = 1;        // ICMP
+  rule.dst_port = 8;     // type=8 (echo request) in dport slot (D29)
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary: proto_dport key = (1 << 16) | 8
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  EXPECT_EQ(cr.primary_key, (1u << 16) | 8u)
+      << "ICMP type=8 packs as (proto=1 << 16) | type=8 (D29)";
+
+  // No SRC_PORT bit — code is not constrained (wildcard)
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kSrcPort)
+      << "No code constraint → SRC_PORT bit must NOT be set";
+
+  // filter_mask completely zero
+  EXPECT_EQ(cr.entry.filter_mask, 0u);
+}
+
+// -------------------------------------------------------------------------
+// C6.6 ICMP dest unreachable, code=3 (port unreachable) — compiler-level
+//
+// Rule {proto:icmp, dst_port:3, src_port:3, drop} — type=3→dport,
+// code=3→sport per D29 packing. Assert SRC_PORT bit set,
+// want_src_port=3. Covers D29.
+// -------------------------------------------------------------------------
+TEST(L4CompoundCorners, IcmpDestUnreachableCode3_C6_6) {
+  Config cfg = make_config();
+
+  // ICMP dest unreachable: type=3 → dport, code=3 → sport
+  auto& rule = append_rule(cfg.pipeline.layer_4, 6006, ActionDrop{});
+  rule.proto = 1;        // ICMP
+  rule.dst_port = 3;     // type=3 (dest unreachable) in dport slot (D29)
+  rule.src_port = 3;     // code=3 (port unreachable) in sport slot (D29)
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary: proto_dport key = (1 << 16) | 3
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  EXPECT_EQ(cr.primary_key, (1u << 16) | 3u)
+      << "ICMP type=3 packs as (proto=1 << 16) | type=3 (D29)";
+
+  // SRC_PORT bit MUST be set (code=3 is constrained)
+  EXPECT_TRUE(cr.entry.filter_mask & l4_mask::kSrcPort)
+      << "SRC_PORT bit must be set when ICMP code is constrained (D29)";
+
+  // want_src_port holds the ICMP code value
+  EXPECT_EQ(cr.entry.want_src_port, 3u)
+      << "ICMP code=3 must be in want_src_port slot (D29)";
+
+  // No TCP_FLAGS bit
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kTcpFlags);
+}
+
 }  // namespace
