@@ -20,13 +20,30 @@
 //     `Config.interface_roles` (kUnresolvedInterfaceRef on miss).
 //   * U2.18 — `cmd_socket.allow_gids` default-fill.
 //
-// Out of C7 scope (lives in C8+):
-//   * duplicate rule id detection
-//   * L2 compound key collision
-//   * layer ordering enforcement
-//   * default_behavior enum-bounding at validate tier
-//   * action param bounds
-//   * D37 budget pre-flight
+// Added in C8 (U2.5/U2.6/U2.7/U2.19/U2.20):
+//   * duplicate rule id within a single layer (kDuplicateRuleId).
+//     `(layer, rule_id)` is a composite key per §4.3 layer_base(),
+//     so re-using `id` across distinct layers stays legal.
+//   * L2 compound key collision detection (kKeyCollision). Two rules
+//     in `layer_2` with identical constrained-field shape AND values
+//     are flagged — the second would be dead code under first-match-
+//     wins. Derived from `std::optional::has_value()` on the L2
+//     compound fields; filter_mask itself is a compile-time concept
+//     and is NOT a JSON field. L3/L4 compound collision is later
+//     work (C9+).
+//   * Layer-evaluation-order enforcement (kInvalidLayerTransition).
+//     `next_layer` must advance by exactly one: a rule in layer_N
+//     may only carry `next_layer == layer_{N+1}`. Same-layer,
+//     backward, skip-ahead, and layer_4-advancement are all rejected.
+//   * `default_behavior` pass-through. Parser already enforces
+//     `{allow, drop}` at parse time; validator must not reject a
+//     value that made it through the AST (documentation-only test).
+//
+// Out of C8 scope (lives in C9+):
+//   * action param bounds (dscp 0..63, pcp 0..7, rate > 0)
+//   * target_port role resolution
+//   * mirror compile-time reject
+//   * D37 budget pre-flight (C10)
 //
 // Later cycles extend `ValidateError::Kind` additively — don't reorder.
 
@@ -45,6 +62,9 @@ struct ValidateError {
   enum Kind : std::uint8_t {
     kUnresolvedObject,        // U2.2 — rule.src_subnet name not in objects.subnets
     kUnresolvedInterfaceRef,  // U2.4 — rule.interface name not in interface_roles
+    kDuplicateRuleId,         // U2.5 — two rules in same layer share id
+    kKeyCollision,            // U2.7 — identical L2 compound key (D15)
+    kInvalidLayerTransition,  // U2.19 — next_layer not equal to layer+1
   };
 
   Kind kind{};

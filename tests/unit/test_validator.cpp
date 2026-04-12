@@ -1,8 +1,34 @@
 // tests/unit/test_validator.cpp
 //
-// M1 C7 / C7.5 — validator scaffolding + object/role resolution +
-// cmd_socket schema. Transcribes `test-plan-drafts/unit.md`
-// U2.1/U2.2/U2.3/U2.4/U2.18 into real gtest code.
+// M1 C7 / C7.5 / C8 — validator scaffolding + object/role resolution +
+// cmd_socket schema + rule-id dedup / L2 compound collision / layer
+// evaluation order. Transcribes `test-plan-drafts/unit.md`
+// U2.1/U2.2/U2.3/U2.4/U2.5/U2.6/U2.7/U2.18/U2.19/U2.20 into real gtest
+// code.
+//
+// C8 additions:
+//   * U2.5 — two rules in `layer_3` with identical `id` → DuplicateRuleId,
+//     error message names BOTH layer indices.
+//   * U2.6 — same `id` in `layer_2` and `layer_3` is NOT a collision,
+//     because (layer, rule_id) is the composite key §4.3 layer_base().
+//   * U2.7 — two `layer_2` rules constraining exactly the same set of
+//     L2 compound fields with identical values → KeyCollision. Adding
+//     any distinguishing constraint (different active-set) → no
+//     collision. "filter_mask" is derived from which optionals have
+//     a value; different constraint shapes are distinguishable at
+//     the primary-key level (§4.1 L2CompoundEntry semantics, D15).
+//   * U2.19 — `next_layer` must advance strictly by one (layer_N rule
+//     ⇒ next_layer == layer_{N+1}). Backward (l3→l2), same-layer
+//     (l3→l3), and skip (l2→l4) are all rejected. Absent next_layer
+//     is the "terminal" signal and always ok. Design §3a.2 anchors
+//     this: `next_layer` is 0=terminal|3|4 (see `uint8_t next_layer;`
+//     in the RuleAction struct, design.md §4.1) — a layer_4 rule
+//     cannot carry a next_layer at all (no further layer exists).
+//   * U2.20 — positive happy-path test only. `default_behavior` enum
+//     bounding is enforced by the parser (parser.cpp L892-L910, D8);
+//     validator is pass-through, the test pins "valid configs stay
+//     valid" so a future cycle can't accidentally add a validator-tier
+//     rejection for `"allow"` or `"drop"`.
 //
 // Target: `libpktgate_core.a` → `pktgate::config::validate`.
 // No EAL, no mempool, no DPDK includes — strictly pure-C++.
@@ -132,6 +158,37 @@ std::string make_doc_with_cmd_socket(std::string_view cmd_socket_body) {
   "cmd_socket": )json";
   out += cmd_socket_body;
   out += "\n}";
+  return out;
+}
+
+// C8 helpers — build a doc with caller-controlled contents for all
+// three layers. Matches the style of the C7 helpers but is generic
+// enough that U2.5..U2.19 don't need one helper each.
+std::string make_doc_with_pipeline(std::string_view layer_2_body,
+                                   std::string_view layer_3_body,
+                                   std::string_view layer_4_body,
+                                   std::string_view default_behavior) {
+  std::string out = R"json({
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "pipeline": {
+    "layer_2": [)json";
+  out += layer_2_body;
+  out += R"json(],
+    "layer_3": [)json";
+  out += layer_3_body;
+  out += R"json(],
+    "layer_4": [)json";
+  out += layer_4_body;
+  out += R"json(]
+  },
+  "default_behavior": ")json";
+  out += default_behavior;
+  out += R"json("
+})json";
   return out;
 }
 
@@ -366,6 +423,346 @@ TEST(ValidatorU2_18, CmdSocketAllowGidsDefersResolution) {
     ASSERT_TRUE(cfg.cmd_socket.allow_gids.has_value())
         << "explicit empty list must remain distinguishable from absent";
     EXPECT_EQ(cfg.cmd_socket.allow_gids->size(), 0u);
+  }
+}
+
+// -------------------------------------------------------------------------
+// U2.5 — duplicate rule `id` within a single layer rejected.
+//
+// Two rules in `layer_3` both carry `id: 2001`. The validator must
+// return `DuplicateRuleId` and the message must literally contain both
+// index strings ("layer_3[0]" and "layer_3[1]") so the operator can
+// locate BOTH offending rules. (nlohmann::json drops source line
+// numbers, so the vector index is the best locator we can produce —
+// see the error-message convention comment in validator.cpp.)
+//
+// Covers: D8.
+
+TEST(ValidatorU2_5, DuplicateRuleIdWithinLayerRejected) {
+  const std::string doc = make_doc_with_pipeline(
+      /*layer_2=*/"",
+      /*layer_3=*/R"({ "id": 2001 }, { "id": 2001 })",
+      /*layer_4=*/"",
+      /*default_behavior=*/"drop");
+  const ParseResult pr = parse(doc);
+  expect_parse_ok(pr, doc);
+
+  Config cfg = get_ok(pr);
+  const ValidateResult vr = validate(cfg);
+
+  ASSERT_FALSE(v_is_ok(vr))
+      << "validator accepted duplicate rule id within layer_3";
+  EXPECT_EQ(v_get_err(vr).kind, ValidateError::kDuplicateRuleId);
+  const auto& msg = v_get_err(vr).message;
+  EXPECT_NE(msg.find("layer_3[0]"), std::string::npos)
+      << "DuplicateRuleId message must name the first offending index: "
+      << msg;
+  EXPECT_NE(msg.find("layer_3[1]"), std::string::npos)
+      << "DuplicateRuleId message must name the second offending index: "
+      << msg;
+}
+
+// -------------------------------------------------------------------------
+// U2.6 — same rule `id` across different layers is allowed.
+//
+// Per design §4.3 `layer_base()`, the counter and rl_arena key is
+// composite `(layer, rule_id)`, not a global `rule_id`. Operators must
+// be free to reuse `id: 1001` in layer_2 and layer_3 without the
+// validator flagging a collision.
+//
+// Covers: D8, §4.3.
+
+TEST(ValidatorU2_6, SameRuleIdAcrossLayersAllowed) {
+  const std::string doc = make_doc_with_pipeline(
+      /*layer_2=*/R"({ "id": 1001 })",
+      /*layer_3=*/R"({ "id": 1001 })",
+      /*layer_4=*/"",
+      /*default_behavior=*/"drop");
+  const ParseResult pr = parse(doc);
+  expect_parse_ok(pr, doc);
+
+  Config cfg = get_ok(pr);
+  const ValidateResult vr = validate(cfg);
+
+  ASSERT_TRUE(v_is_ok(vr))
+      << "validator rejected rule-id reuse across distinct layers; kind="
+      << static_cast<int>(v_get_err(vr).kind)
+      << " msg=" << v_get_err(vr).message;
+}
+
+// -------------------------------------------------------------------------
+// U2.7 — L2 compound key collision rejected.
+//
+// Two rules in `layer_2` constrain exactly
+// `{ src_mac, vlan_id, ethertype }` with **identical values** and no
+// distinguishing field. Under first-match-wins the second rule is dead
+// code — the validator catches it so operators don't silently lose
+// rules. Rule ids differ (1, 2) so U2.5 doesn't fire first.
+//
+// Secondary assertion: a second config with the same two rules, but
+// one also carries a `dst_mac` constraint (different active-set) →
+// no collision, because filter_mask bits reflect which fields are
+// active and the constraint shapes are distinguishable at the primary
+// key level (§4.1 L2CompoundEntry, D15 compound model).
+//
+// Covers: D8, D15.
+
+TEST(ValidatorU2_7, L2CompoundKeyCollisionRejected) {
+  // Identical shape + identical values → collision.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/
+        R"({ "id": 1, "src_mac": "aa:bb:cc:dd:ee:ff", "vlan_id": 100, "ethertype": 2048 },
+           { "id": 2, "src_mac": "aa:bb:cc:dd:ee:ff", "vlan_id": 100, "ethertype": 2048 })",
+        /*layer_3=*/"",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted a colliding pair of L2 compound rules";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kKeyCollision);
+    const auto& msg = v_get_err(vr).message;
+    EXPECT_NE(msg.find("layer_2[0]"), std::string::npos)
+        << "KeyCollision message must name the first offending index: "
+        << msg;
+    EXPECT_NE(msg.find("layer_2[1]"), std::string::npos)
+        << "KeyCollision message must name the second offending index: "
+        << msg;
+  }
+
+  // Different active-set (second rule adds dst_mac) → not a collision.
+  // This pins "filter_mask bits reflect which fields are active, and
+  // two rules with different active-sets are distinguishable".
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/
+        R"({ "id": 1, "src_mac": "aa:bb:cc:dd:ee:ff", "vlan_id": 100, "ethertype": 2048 },
+           { "id": 2, "src_mac": "aa:bb:cc:dd:ee:ff", "vlan_id": 100, "ethertype": 2048, "dst_mac": "11:22:33:44:55:66" })",
+        /*layer_3=*/"",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator flagged a collision between rules with distinct "
+           "active-set (second rule has dst_mac, first does not); kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U2.19 — layer evaluation order enforced by validator.
+//
+// `next_layer` is an advancement directive. The rule lives in whichever
+// pipeline vector contains it (layer_2 / layer_3 / layer_4). A rule in
+// `layer_3` with `next_layer: "l2"` is rejected — the pipeline walks
+// strictly L2 → L3 → L4 (design §3a.2 / §4.1 schema: `uint8_t
+// next_layer; // 0=terminal | 3 | 4`). Strict advancement by one means
+// a layer_N rule may only set `next_layer` to layer_{N+1}. Same-layer,
+// backward, and skip-ahead are all rejected. A layer_4 rule has no
+// next layer at all and may not carry `next_layer`.
+//
+// Positive subcases pin the contract isn't over-eager:
+//   * layer_2 rule + `next_layer: "l3"` → ok
+//   * layer_3 rule + `next_layer: "l4"` → ok
+//   * any rule with no `next_layer` at all → ok
+//
+// Covers: F1.
+
+TEST(ValidatorU2_19, LayerEvaluationOrderEnforced) {
+  // Negative — backward advancement: layer_3 rule pointing at l2.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/R"({ "id": 3001, "next_layer": "l2" })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted backward next_layer advancement (l3→l2)";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kInvalidLayerTransition);
+    const auto& msg = v_get_err(vr).message;
+    EXPECT_NE(msg.find("layer_3"), std::string::npos)
+        << "InvalidLayerTransition message must name the hosting layer: "
+        << msg;
+  }
+
+  // Negative — same-layer advancement: layer_3 rule pointing at l3.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/R"({ "id": 3002, "next_layer": "l3" })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted same-layer next_layer (l3→l3)";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kInvalidLayerTransition);
+  }
+
+  // Negative — skip-ahead: layer_2 rule pointing at l4.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/R"({ "id": 2001, "next_layer": "l4" })",
+        /*layer_3=*/"",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted skip-ahead next_layer (l2→l4)";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kInvalidLayerTransition);
+  }
+
+  // Negative — layer_4 rule with next_layer set to anything. There is
+  // no layer beyond L4; the field must be absent.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/"",
+        /*layer_4=*/R"({ "id": 4001, "next_layer": "l4" })",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_FALSE(v_is_ok(vr))
+        << "validator accepted next_layer on a layer_4 rule (no further layer)";
+    EXPECT_EQ(v_get_err(vr).kind, ValidateError::kInvalidLayerTransition);
+  }
+
+  // Positive — strict +1 advancement: layer_2 → l3.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/R"({ "id": 2002, "next_layer": "l3" })",
+        /*layer_3=*/"",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected valid next_layer advancement (l2→l3); kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+
+  // Positive — strict +1 advancement: layer_3 → l4.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/R"({ "id": 3003, "next_layer": "l4" })",
+        /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected valid next_layer advancement (l3→l4); kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+
+  // Positive — absent next_layer is terminal and always ok.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"",
+        /*layer_3=*/R"({ "id": 3004 })",
+        /*layer_4=*/R"({ "id": 4002 })",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected terminal rules (no next_layer); kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+  }
+}
+
+// -------------------------------------------------------------------------
+// U2.20 — `default_behavior` happy paths.
+//
+// The parser already enforces `default_behavior ∈ {"allow","drop"}` at
+// parse time (parser.cpp ≈ L892-L910). If the AST reaches validate(),
+// the value is already one of those two. This test is **documentation**:
+// it pins the contract "validator accepts valid default_behavior" so a
+// future cycle cannot accidentally add a validator-tier rejection for
+// `"allow"` or `"drop"`. Rejection of `"banana"` is parser territory
+// and lives in test_parser.cpp (U1.-ish literal-enum negatives).
+//
+// Covers: D8, F1.
+
+TEST(ValidatorU2_20, DefaultBehaviorEnumHappyPaths) {
+  // "allow" accepted.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"", /*layer_3=*/"", /*layer_4=*/"",
+        /*default_behavior=*/"allow");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected default_behavior 'allow'; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+    EXPECT_EQ(cfg.default_behavior,
+              ::pktgate::config::DefaultBehavior::kAllow);
+  }
+
+  // "drop" accepted.
+  {
+    const std::string doc = make_doc_with_pipeline(
+        /*layer_2=*/"", /*layer_3=*/"", /*layer_4=*/"",
+        /*default_behavior=*/"drop");
+    const ParseResult pr = parse(doc);
+    expect_parse_ok(pr, doc);
+
+    Config cfg = get_ok(pr);
+    const ValidateResult vr = validate(cfg);
+    ASSERT_TRUE(v_is_ok(vr))
+        << "validator rejected default_behavior 'drop'; kind="
+        << static_cast<int>(v_get_err(vr).kind)
+        << " msg=" << v_get_err(vr).message;
+    EXPECT_EQ(cfg.default_behavior,
+              ::pktgate::config::DefaultBehavior::kDrop);
   }
 }
 
