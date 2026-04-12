@@ -74,10 +74,11 @@ int main(int argc, char* argv[]) {
   // passed to EAL.
   std::string config_path;
   unsigned requested_workers = 0;  // 0 = auto-detect from available lcores
+  unsigned mbuf_data_size = 0;     // 0 = RTE_MBUF_DEFAULT_BUF_SIZE
   int eal_argc = 0;
   std::vector<char*> eal_argv;
 
-  // Scan for --config and --workers in argv. Everything else goes to EAL.
+  // Scan for our flags in argv. Everything else goes to EAL.
   for (int i = 0; i < argc; ++i) {
     if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
       config_path = argv[i + 1];
@@ -86,6 +87,11 @@ int main(int argc, char* argv[]) {
     }
     if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
       requested_workers = static_cast<unsigned>(std::atoi(argv[i + 1]));
+      ++i;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--mbuf-size") == 0 && i + 1 < argc) {
+      mbuf_data_size = static_cast<unsigned>(std::atoi(argv[i + 1]));
       ++i;
       continue;
     }
@@ -173,11 +179,13 @@ int main(int argc, char* argv[]) {
   // 8192 is generous for the functional test with net_pcap.
   constexpr unsigned kMbufCount = 8191;  // prime, DPDK convention
   constexpr unsigned kMbufCacheSize = 256;
-  constexpr unsigned kMbufDataSize = RTE_MBUF_DEFAULT_BUF_SIZE;
+  unsigned actual_mbuf_size = (mbuf_data_size > 0) ? mbuf_data_size
+                                                    : RTE_MBUF_DEFAULT_BUF_SIZE;
 
   struct rte_mempool* mp = rte_pktmbuf_pool_create(
       "pktgate_pool", kMbufCount, kMbufCacheSize, 0,
-      kMbufDataSize, static_cast<int>(socket_id));
+      static_cast<std::uint16_t>(actual_mbuf_size),
+      static_cast<int>(socket_id));
   if (mp == nullptr) {
     log_json("{\"error\":\"mempool creation failed\"}");
     rte_eal_cleanup();
@@ -214,6 +222,18 @@ int main(int argc, char* argv[]) {
                sym.error + "\",\"port\":" + std::to_string(port_id) +
                ",\"max_tx_queues\":" + std::to_string(sym.max_tx_queues) +
                ",\"n_workers\":" + std::to_string(n_workers_u) + "}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+  }
+
+  // D39: scatter-off + mempool-fit pre-check.
+  for (auto port_id : port_ids) {
+    auto scatter = pktgate::eal::check_no_scatter(port_id, mp);
+    if (!scatter.ok) {
+      log_json("{\"error\":\"multiseg_rx_unsupported\",\"reason\":\"" +
+               scatter.error + "\"}");
       rte_mempool_free(mp);
       rte_eal_cleanup();
       return 1;

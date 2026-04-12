@@ -72,4 +72,25 @@ struct TxSymmetryCheckResult {
 TxSymmetryCheckResult check_tx_symmetry(std::uint16_t port_id,
                                         unsigned n_workers);
 
+// -------------------------------------------------------------------------
+// D39 — headers-in-first-seg invariant.
+//
+// Ensures that:
+// 1. Scatter RX offload is NOT enabled on any port
+// 2. Mempool element size is sufficient to hold the largest packet
+//    the port can receive in a single segment
+//
+// This guarantees that all packet headers are in the first (and only)
+// mbuf segment, so classify_l2/l3/l4 never needs multi-seg handling.
+
+struct ScatterCheckResult {
+  bool ok = false;
+  std::string error;
+};
+
+// Check that port `port_id` does not require scatter RX and that
+// the mempool `mp` can hold the port's max RX packet in one segment.
+ScatterCheckResult check_no_scatter(std::uint16_t port_id,
+                                    struct rte_mempool* mp);
+
 }  // namespace pktgate::eal

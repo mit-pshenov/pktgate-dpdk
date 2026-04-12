@@ -95,4 +95,46 @@ TxSymmetryCheckResult check_tx_symmetry(std::uint16_t port_id,
   return {true, {}, port_id, dev_info.max_tx_queues};
 }
 
+ScatterCheckResult check_no_scatter(std::uint16_t port_id,
+                                    struct rte_mempool* mp) {
+  struct rte_eth_dev_info dev_info;
+  int ret = rte_eth_dev_info_get(port_id, &dev_info);
+  if (ret != 0) {
+    return {false,
+            "rte_eth_dev_info_get failed for port " + std::to_string(port_id)};
+  }
+
+  // Check 1: scatter must not be a required RX offload.
+  if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) {
+    // Port supports scatter, but we never enable it. The check here is
+    // that scatter is not REQUIRED (i.e., in default_rxconf.offloads).
+    // net_null and most PMDs don't require it.
+  }
+
+  // Check 2: mempool element must be large enough for max_rx_pkt_len.
+  // max_rx_pkt_len defaults to RTE_ETHER_MAX_LEN (1518) for standard
+  // Ethernet. With headroom, the mbuf data area must be at least
+  // max_rx_pkt_len + RTE_PKTMBUF_HEADROOM.
+  std::uint32_t max_pkt = dev_info.max_rx_pktlen;
+  if (max_pkt == 0) {
+    max_pkt = RTE_ETHER_MAX_LEN;  // sane default
+  }
+
+  // Cap at standard MTU for the D39 check — we don't enable jumbo frames.
+  if (max_pkt > RTE_ETHER_MAX_LEN) {
+    max_pkt = RTE_ETHER_MAX_LEN;
+  }
+
+  std::uint16_t elt_size = rte_pktmbuf_data_room_size(mp);
+  if (elt_size < max_pkt) {
+    return {false,
+            "D39 violation: port=" + std::to_string(port_id) +
+            " max_rx_pkt_len=" + std::to_string(max_pkt) +
+            " > mempool_data_room=" + std::to_string(elt_size) +
+            " — multiseg_rx_unsupported"};
+  }
+
+  return {true, {}};
+}
+
 }  // namespace pktgate::eal

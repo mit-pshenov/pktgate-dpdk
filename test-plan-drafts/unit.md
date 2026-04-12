@@ -676,6 +676,17 @@ Link: `libpktgate_core.a` for the pure parts; `rte_hash` /
   exactly once.
 - Covers: D12 polish, §4.1 metadata.
 
+### U4.18 D39 port scatter-off + mempool-fit validator [needs EAL]
+- Goal: `check_no_scatter()` rejects when mempool data room is
+  smaller than `max_rx_pkt_len`, accepts when it fits.
+- Setup: EAL with `net_null` vdev; create two mempools: one with
+  `data_room=64` (too small), one with `data_room=2048` (fits).
+- Assertions:
+  - `check_no_scatter(port, small_mp)` returns `!ok` with error
+    containing "multiseg_rx_unsupported"
+  - `check_no_scatter(port, big_mp)` returns `ok`
+- Covers: D39, §6.1 port_init.
+
 ---
 
 ## U5 — Token bucket / rl_arena

@@ -39,3 +39,13 @@ set_tests_properties(functional.test_d28_tx_symmetry PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 30
 )
+
+add_test(
+  NAME functional.test_d39_scatter
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_d39_scatter.py"
+)
+set_tests_properties(functional.test_d39_scatter PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 30
+)

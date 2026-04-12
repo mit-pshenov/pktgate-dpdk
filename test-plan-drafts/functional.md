@@ -1129,6 +1129,14 @@ Add one missing test from the D28 row:
   state.
 - **Covers**: D28, §6.1 port_init
 
+### F1.14 D39 scatter-off + mempool-fit validator — small mempool rejected
+- **Setup**: happy config, `--mbuf-size=64` (deliberately too small
+  for standard Ethernet frames).
+- **Action**: start binary.
+- **Assertion**: exit non-zero; log contains `multiseg_rx_unsupported`;
+  no ports left in a running state.
+- **Covers**: D39, §6.1 port_init
+
 Decisions not directly functionally testable and deferred to unit
 tests are: **D2 (build), D18 (cycle budget — perf), D22 (EXT_MASK
 UB — static analysis / unit), D23 (NUMA — lab), D25 (switch-enum
