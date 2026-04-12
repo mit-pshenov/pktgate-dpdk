@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "pipeline": {
+    "layer_2": [
+      {
+        "id": 1,
+        "src_mac": "00:11:22:33:44:55",
+        "ethertype": 2048,
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 2,
+        "src_mac": "00:11:22:33:44:55",
+        "ethertype": 2048,
+        "action": { "type": "drop" }
+      }
+    ],
+    "layer_3": [],
+    "layer_4": []
+  }
+}

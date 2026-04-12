@@ -59,3 +59,19 @@ pktgate_add_fuzz_test(
   LABELS  fuzz
 )
 target_link_libraries(fuzz_validator_fuzz PRIVATE pktgate_core)
+
+# ---- compiler_fuzz (M2 C11, corner.md C7.3) --------------------------------
+#
+# Coverage-guided fuzz target for the full compile pipeline. Feeds raw
+# bytes into the parser; if parsing and validation succeed, runs compile()
+# and asserts (via ASan + UBSan) that no crash / UB / leak occurs.
+# Seed corpus lives in fuzz/seeds/compiler/.
+#
+# ctest smoke entry: `compiler_fuzz -runs=1` (wiring sanity).
+# CI shortrun: `compiler_fuzz fuzz/seeds/compiler/ -max_total_time=60`.
+pktgate_add_fuzz_test(
+  NAME    fuzz.compiler_fuzz
+  SOURCES compiler_fuzz.cc
+  LABELS  fuzz
+)
+target_link_libraries(fuzz_compiler_fuzz PRIVATE pktgate_core)

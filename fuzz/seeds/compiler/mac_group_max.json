@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "sizing": {
+    "rules_per_layer_max": 4096,
+    "mac_entries_max": 4096,
+    "ipv4_prefixes_max": 16384,
+    "ipv6_prefixes_max": 16384,
+    "l4_entries_max": 16384,
+    "vrf_entries_max": 256,
+    "rate_limit_rules_max": 4096,
+    "ethertype_entries_max": 64,
+    "vlan_entries_max": 4096,
+    "pcp_entries_max": 8
+  },
+  "pipeline": {
+    "layer_2": [
+      { "id": 1, "src_mac": "00:00:00:00:00:01", "action": { "type": "allow" } },
+      { "id": 2, "src_mac": "00:00:00:00:00:02", "action": { "type": "allow" } },
+      { "id": 3, "src_mac": "00:00:00:00:00:03", "action": { "type": "drop" } },
+      { "id": 4, "src_mac": "00:00:00:00:00:04", "action": { "type": "allow" } },
+      { "id": 5, "src_mac": "00:00:00:00:00:05", "action": { "type": "drop" } },
+      { "id": 6, "dst_mac": "ff:ff:ff:ff:ff:ff", "action": { "type": "drop" } },
+      { "id": 7, "src_mac": "00:00:00:00:00:07", "ethertype": 2048, "action": { "type": "allow" } },
+      { "id": 8, "src_mac": "00:00:00:00:00:08", "vlan_id": 100, "action": { "type": "allow" } }
+    ],
+    "layer_3": [],
+    "layer_4": []
+  }
+}

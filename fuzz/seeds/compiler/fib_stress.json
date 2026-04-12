@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "objects": {
+    "subnets": {
+      "wide":   ["10.0.0.0/8"],
+      "narrow": ["10.0.0.0/16", "10.1.0.0/16"],
+      "v6big":  ["2001:db8::/32"],
+      "v6small": ["2001:db8:1::/48", "2001:db8:2::/48"]
+    }
+  },
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [
+      {
+        "id": 1,
+        "src_subnet": "wide",
+        "interface": "upstream_port",
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 2,
+        "src_subnet": "narrow",
+        "interface": "upstream_port",
+        "action": { "type": "drop" }
+      },
+      {
+        "id": 3,
+        "src_subnet": "v6big",
+        "interface": "upstream_port",
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 4,
+        "src_subnet": "v6small",
+        "interface": "upstream_port",
+        "action": { "type": "drop" }
+      }
+    ],
+    "layer_4": [
+      {
+        "id": 100,
+        "proto": 6,
+        "dst_ports": [80, 443, 8080, 8443],
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 101,
+        "proto": 17,
+        "dst_port": 53,
+        "action": { "type": "drop" }
+      }
+    ]
+  }
+}

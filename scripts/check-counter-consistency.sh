@@ -103,14 +103,95 @@ canonical_count=$(wc -l < "$canonical")
 echo "pass1: canonical set = ${canonical_count} metric(s) from §10.3"
 
 # ---------------------------------------------------------------------
-# Pass 2 — §10.3 → src/ producers (deferred until M3)
+# Pass 2 — §10.3 → src/ producers (partial since M2 C11, C7.27)
 # ---------------------------------------------------------------------
 #
-# src/ has no metric-producing code yet (M0 ships only the empty
-# binary). Printing an explicit SKIPPED line is deliberate — a silent
-# no-op would let Pass 2 rot. When M3 lands the first producers,
-# replace this block with the loop described in harness.md §H7.2.
-echo "pass2: SKIPPED (src/ producers not yet populated — see harness.md §H7.2; wire in M3)"
+# M2 C11: the compiler assigns dense counter_slots per layer, mapping
+# to the pktgate_rule_* family in §10.3. We verify that the three
+# rule-counter base names exist in the canonical set — these are the
+# counters the compiler's output structures will eventually feed.
+#
+# All other counters (port_*, lcore_*, reload_*, system gauges) have
+# no src/ producer yet — those are deferred to M4-M10. We enumerate
+# them explicitly so the deferred list shrinks as milestones land.
+#
+# When M3+ lands real producer macros (stats_bump / metric_inc /
+# COUNTER_INC), extend this pass per harness.md §H7.2: for every
+# canonical name, assert >= 1 match under src/ against the producer
+# pattern.
+
+pass2_errors=0
+
+# Counter families the compiler output directly maps to (via
+# counter_slot → rule_id → pktgate_rule_{packets,bytes,drops}_total).
+# These base names MUST exist in §10.3.
+for family in pktgate_rule_packets_total \
+              pktgate_rule_bytes_total \
+              pktgate_rule_drops_total; do
+  if ! grep -Fxq -- "$family" "$canonical"; then
+    echo "pass2: ERROR — compiler counter family '$family' missing from §10.3" >&2
+    pass2_errors=$((pass2_errors + 1))
+  fi
+done
+
+# Counters deferred to later milestones (no src/ producer yet).
+# Tracked explicitly so the list shrinks as milestones land.
+deferred_families=(
+  # Port counters (M3 port init)
+  pktgate_port_rx_packets_total
+  pktgate_port_tx_packets_total
+  pktgate_port_rx_bytes_total
+  pktgate_port_tx_bytes_total
+  pktgate_port_rx_dropped_total
+  pktgate_port_tx_dropped_total
+  pktgate_port_link_up
+  # Lcore counters (M4-M6 dataplane)
+  pktgate_lcore_packets_total
+  pktgate_lcore_cycles_per_burst
+  pktgate_lcore_idle_iters_total
+  pktgate_lcore_l4_skipped_ipv6_extheader_total
+  pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total
+  pktgate_lcore_tag_pcp_noop_untagged_total
+  pktgate_lcore_dispatch_unreachable_total
+  pktgate_lcore_pkt_truncated_total
+  pktgate_lcore_qinq_outer_only_total
+  pktgate_lcore_pkt_multiseg_drop_total
+  pktgate_lcore_pkt_frag_skipped_total
+  pktgate_lcore_pkt_frag_dropped_total
+  # Redirect/mirror counters (M7+)
+  pktgate_redirect_dropped_total
+  pktgate_mirror_dropped_total
+  # Default action counter (M4 classify)
+  pktgate_default_action_total
+  # Reload counters (M8+ reload pipeline)
+  pktgate_reload_total
+  pktgate_reload_latency_seconds
+  pktgate_reload_pending_free_depth
+  # System gauges (M8+ runtime)
+  pktgate_active_generation
+  pktgate_active_rules
+  pktgate_cmd_socket_rejected_total
+  pktgate_mempool_in_use
+  pktgate_mempool_free
+  pktgate_watchdog_restarts_total
+  pktgate_bypass_active
+  pktgate_log_dropped_total
+)
+
+deferred_count=0
+for family in "${deferred_families[@]}"; do
+  if grep -Fxq -- "$family" "$canonical"; then
+    deferred_count=$((deferred_count + 1))
+  else
+    echo "pass2: WARNING — deferred counter '$family' not in §10.3 (stale deferred list?)" >&2
+  fi
+done
+
+if [[ "$pass2_errors" -gt 0 ]]; then
+  echo "pass2: FAIL — ${pass2_errors} compiler counter families missing from §10.3" >&2
+  exit 1
+fi
+echo "pass2: ok — 3 compiler counter families verified, ${deferred_count} deferred to M3-M10 (no src/ producer yet)"
 
 # ---------------------------------------------------------------------
 # Pass 3 — prose → §10.3

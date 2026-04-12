@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "allow",
+  "fragment_policy": "l3_only",
+  "objects": {
+    "subnets": {
+      "internal": ["10.0.0.0/8", "172.16.0.0/12"]
+    }
+  },
+  "pipeline": {
+    "layer_2": [
+      {
+        "id": 1,
+        "src_mac": "aa:bb:cc:dd:ee:f0",
+        "dst_mac": "11:22:33:44:55:66",
+        "ethertype": 2048,
+        "vlan_id": 100,
+        "pcp": 3,
+        "next_layer": "l3",
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 2,
+        "src_mac": "aa:bb:cc:dd:ee:f1",
+        "action": { "type": "drop" }
+      }
+    ],
+    "layer_3": [
+      {
+        "id": 100,
+        "src_subnet": "internal",
+        "interface": "upstream_port",
+        "action": { "type": "allow" }
+      }
+    ],
+    "layer_4": [
+      {
+        "id": 200,
+        "proto": 6,
+        "dst_port": 443,
+        "tcp_flags": { "syn": true },
+        "action": { "type": "tag", "dscp": 46, "pcp": 5 }
+      },
+      {
+        "id": 201,
+        "proto": 17,
+        "dst_port": 53,
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 202,
+        "proto": 1,
+        "dst_port": 8,
+        "action": { "type": "drop" }
+      }
+    ]
+  }
+}

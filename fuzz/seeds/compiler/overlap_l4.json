@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [],
+    "layer_4": [
+      {
+        "id": 1,
+        "proto": 6,
+        "dst_port": 443,
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 2,
+        "proto": 6,
+        "dst_port": 443,
+        "src_port": 12345,
+        "action": { "type": "drop" }
+      },
+      {
+        "id": 3,
+        "proto": 6,
+        "dst_port": 80,
+        "tcp_flags": { "syn": true, "ack": false },
+        "action": { "type": "drop" }
+      }
+    ]
+  }
+}
