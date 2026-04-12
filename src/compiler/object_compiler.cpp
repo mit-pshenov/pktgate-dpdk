@@ -156,6 +156,23 @@ CompileResult compile(const config::Config& cfg,
   compile_layer(cfg.pipeline.layer_4, Layer::kL4, result.l4_actions,
                 result.l4_entries);
 
+  // D7: reject mirror action in MVP. Scan all layers for kMirror.
+  auto check_mirror = [](const std::vector<CompiledAction>& actions)
+      -> bool {
+    for (const auto& a : actions) {
+      if (a.verb == ActionVerb::kMirror) return true;
+    }
+    return false;
+  };
+
+  if (check_mirror(result.l2_actions) ||
+      check_mirror(result.l3_actions) ||
+      check_mirror(result.l4_actions)) {
+    result.error = CompileError{
+        CompileErrorCode::kMirrorNotImplemented,
+        "mirror action not implemented in this build"};
+  }
+
   return result;
 }
 

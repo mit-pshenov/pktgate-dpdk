@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -121,6 +122,21 @@ struct CompiledRuleEntry {
 };
 
 // -------------------------------------------------------------------------
+// CompileErrorCode — compile-time error codes (D7 et al.).
+
+enum class CompileErrorCode : std::uint8_t {
+  kMirrorNotImplemented = 1,  // D7: mirror action not supported in this build
+};
+
+// -------------------------------------------------------------------------
+// CompileError — optional error carried by CompileResult.
+
+struct CompileError {
+  CompileErrorCode code;
+  std::string message;
+};
+
+// -------------------------------------------------------------------------
 // CompileResult — full compiler output.
 
 struct CompileResult {
@@ -135,6 +151,11 @@ struct CompileResult {
   std::vector<CompiledRuleEntry> l2_entries;
   std::vector<CompiledRuleEntry> l3_entries;
   std::vector<CompiledRuleEntry> l4_entries;
+
+  // D7: compile error (e.g., mirror not implemented in MVP).
+  // When set, the result is invalid — the caller must not use the
+  // compiled structures.
+  std::optional<CompileError> error;
 };
 
 }  // namespace pktgate::compiler

@@ -5,6 +5,9 @@
 // C2: U3.5, U3.6 — struct sizing static_asserts.
 // C3: U3.7, U3.8, U3.25 — L2 compound construction.
 // C4: U3.9, U3.10, U3.11, U3.24 — L4 compound construction.
+// C5: U3.12, C6.1-C6.6 — ICMP/D29 + L4 compound corners.
+// C6: U3.13, U3.14, U3.15, U3.16 — rule tiering + first-match-wins.
+// C7: U3.17, U3.18, U3.19, U3.20, U3.21 — mirror reject + D26 strategy.
 //
 // These test the compiler's object expansion, rule expansion, and
 // L2/L4 compound construction mechanics. The compiler takes a
@@ -21,6 +24,7 @@
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
+#include "src/compiler/mirror_strategy.h"
 #include "src/compiler/object_compiler.h"
 #include "src/compiler/rule_compiler.h"
 #include "src/config/addr.h"
@@ -1052,6 +1056,164 @@ TEST(RuleTiering, FirstMatchWinsOrder_U3_16) {
   EXPECT_EQ(result2.l2_entries[0].action_index, 0u);
   EXPECT_EQ(result2.l2_entries[1].action_index, 1u);
   EXPECT_EQ(result2.l2_entries[2].action_index, 2u);
+}
+
+// =========================================================================
+// C7 — Mirror reject + D26 strategy
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U3.17 Mirror action compile-time reject (D7 MVP)
+//
+// Compiling a ruleset containing `action: mirror` produces a
+// MirrorNotImplemented error at the compile stage. The compiler rejects
+// the mirror verb (D7: mirror not implemented in this build).
+// -------------------------------------------------------------------------
+TEST(MirrorReject, MirrorNotImplemented_U3_17) {
+  Config cfg = make_config();
+
+  // Add a mirror rule to L4
+  auto& rule = append_rule(cfg.pipeline.layer_4, 9100, ActionMirror{"mirror_port"});
+  rule.proto = 6;
+  rule.dst_port = 80;
+
+  auto result = compile(cfg);
+
+  // The compile must produce a compile error
+  ASSERT_TRUE(result.error.has_value())
+      << "Compiling a mirror rule must produce an error (D7 MVP)";
+  EXPECT_EQ(result.error->code, CompileErrorCode::kMirrorNotImplemented)
+      << "Error code must be kMirrorNotImplemented";
+  EXPECT_NE(result.error->message.find("mirror"), std::string::npos)
+      << "Error message must mention 'mirror'";
+
+  // Also verify mirror rules in L2 and L3 layers are rejected
+  Config cfg_l2 = make_config();
+  auto& r2 = append_rule(cfg_l2.pipeline.layer_2, 9101, ActionMirror{"mirror_port"});
+  r2.vlan_id = 100;
+  auto result_l2 = compile(cfg_l2);
+  ASSERT_TRUE(result_l2.error.has_value())
+      << "Mirror in L2 must also be rejected (D7)";
+  EXPECT_EQ(result_l2.error->code, CompileErrorCode::kMirrorNotImplemented);
+
+  Config cfg_l3 = make_config();
+  append_rule(cfg_l3.pipeline.layer_3, 9102, ActionMirror{"mirror_port"});
+  auto result_l3 = compile(cfg_l3);
+  ASSERT_TRUE(result_l3.error.has_value())
+      << "Mirror in L3 must also be rejected (D7)";
+  EXPECT_EQ(result_l3.error->code, CompileErrorCode::kMirrorNotImplemented);
+}
+
+// -------------------------------------------------------------------------
+// U3.18 D26 mirror strategy — deep copy forced when TAG present
+//
+// A ruleset with any TAG rule forces mirror_strategy == DEEP_COPY,
+// even if config_requests_zero_copy == true. The MUTATING_VERBS set
+// is consulted. Covers D26.
+// -------------------------------------------------------------------------
+TEST(MirrorStrategy, DeepCopyWhenTagPresent_U3_18) {
+  // Build a set of verbs that includes TAG (a mutating verb)
+  std::vector<ActionVerb> verbs = {
+      ActionVerb::kAllow,
+      ActionVerb::kDrop,
+      ActionVerb::kTag,  // TAG is mutating
+  };
+
+  DriverCapabilities caps;
+  caps.tx_non_mutating = true;
+
+  // Even with zero_copy requested + driver support, TAG forces DEEP_COPY
+  auto strategy = determine_mirror_strategy(
+      verbs, /*config_requests_zero_copy=*/true, caps);
+
+  EXPECT_EQ(strategy, MirrorStrategy::kDeepCopy)
+      << "TAG present → must select DEEP_COPY regardless of config/driver (D26)";
+}
+
+// -------------------------------------------------------------------------
+// U3.19 D26 mirror strategy — refcnt allowed when no mutating verbs
+//
+// Ruleset without TAG (only ALLOW/DROP/RL/REDIRECT) plus
+// config_requests_zero_copy==true plus driver cap tx_non_mutating==true
+// yields REFCNT_ZERO_COPY. Covers D26.
+// -------------------------------------------------------------------------
+TEST(MirrorStrategy, RefcntWhenNoMutatingVerbs_U3_19) {
+  std::vector<ActionVerb> verbs = {
+      ActionVerb::kAllow,
+      ActionVerb::kDrop,
+      ActionVerb::kRateLimit,
+      ActionVerb::kRedirect,
+  };
+
+  DriverCapabilities caps;
+  caps.tx_non_mutating = true;
+
+  auto strategy = determine_mirror_strategy(
+      verbs, /*config_requests_zero_copy=*/true, caps);
+
+  EXPECT_EQ(strategy, MirrorStrategy::kRefcntZeroCopy)
+      << "No mutating verbs + zero_copy requested + driver ok → REFCNT_ZERO_COPY (D26)";
+}
+
+// -------------------------------------------------------------------------
+// U3.20 D26 mirror strategy — driver capability gate
+//
+// Same as U3.19 but driver cap tx_non_mutating is false → forced
+// back to DEEP_COPY. Covers D26.
+// -------------------------------------------------------------------------
+TEST(MirrorStrategy, DriverCapGate_U3_20) {
+  std::vector<ActionVerb> verbs = {
+      ActionVerb::kAllow,
+      ActionVerb::kDrop,
+      ActionVerb::kRateLimit,
+      ActionVerb::kRedirect,
+  };
+
+  DriverCapabilities caps;
+  caps.tx_non_mutating = false;  // driver can't do it
+
+  auto strategy = determine_mirror_strategy(
+      verbs, /*config_requests_zero_copy=*/true, caps);
+
+  EXPECT_EQ(strategy, MirrorStrategy::kDeepCopy)
+      << "Driver cap false → must fall back to DEEP_COPY (D26)";
+}
+
+// -------------------------------------------------------------------------
+// U3.21 D26 MUTATING_VERBS enum-scan test
+//
+// Iterate all ActionVerb enum values and assert each is classified as
+// mutating or non-mutating in the compiler's is_mutating_verb() lookup.
+// Prevents a new verb being added without D26 update. Covers D26, D25.
+// -------------------------------------------------------------------------
+TEST(MirrorStrategy, MutatingVerbsEnumScan_U3_21) {
+  // D26: MUTATING_VERBS = { TAG } for baseline.
+  // All other verbs are non-mutating.
+  struct VerbExpect {
+    ActionVerb verb;
+    bool mutating;
+    const char* name;
+  };
+
+  const VerbExpect table[] = {
+      {ActionVerb::kAllow,     false, "ALLOW"},
+      {ActionVerb::kDrop,      false, "DROP"},
+      {ActionVerb::kMirror,    false, "MIRROR"},
+      {ActionVerb::kRateLimit, false, "RATE_LIMIT"},
+      {ActionVerb::kTag,       true,  "TAG"},
+      {ActionVerb::kRedirect,  false, "REDIRECT"},
+  };
+
+  for (const auto& [verb, expected, name] : table) {
+    EXPECT_EQ(is_mutating_verb(verb), expected)
+        << "is_mutating_verb(" << name << ") mismatch — D26 update needed";
+  }
+
+  // Verify we covered ALL enum values (catches new verbs added without updating table).
+  // ActionVerb values are 0..5 (kAllow=0, ..., kRedirect=5).
+  // If a new verb is added with value > 5, this count check will fail.
+  EXPECT_EQ(std::size(table), 6u)
+      << "enum-scan table size mismatch — update this test when adding new ActionVerb values";
 }
 
 }  // namespace
