@@ -158,4 +158,17 @@ struct CompileResult {
   std::optional<CompileError> error;
 };
 
+// -------------------------------------------------------------------------
+// Enum dispatch helpers — exhaustive -Wswitch-enum switches (D25).
+//
+// verb_label:  ActionVerb  → human-readable string.
+// layer_label: Layer       → human-readable string.
+//
+// Both use exhaustive switch statements so that adding a new enum value
+// without handling it triggers a compile error under -Wswitch-enum.
+// U3.22 / U3.23 verify runtime completeness via enum-scan tests.
+
+const char* verb_label(ActionVerb verb);
+const char* layer_label(Layer layer);
+
 }  // namespace pktgate::compiler

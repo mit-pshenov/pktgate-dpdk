@@ -126,6 +126,7 @@ add_library(pktgate_core STATIC
   src/config/addr.cpp
   src/config/sizing.cpp
   src/config/validator.cpp
+  src/compiler/compiler.cpp
   src/compiler/object_compiler.cpp
   src/compiler/rule_compiler.cpp
   src/compiler/mirror_strategy.cpp

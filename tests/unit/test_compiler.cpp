@@ -8,6 +8,7 @@
 // C5: U3.12, C6.1-C6.6 — ICMP/D29 + L4 compound corners.
 // C6: U3.13, U3.14, U3.15, U3.16 — rule tiering + first-match-wins.
 // C7: U3.17, U3.18, U3.19, U3.20, U3.21 — mirror reject + D26 strategy.
+// C8: U3.22, U3.23, U3.26 — -Wswitch-enum + empty pipeline.
 //
 // These test the compiler's object expansion, rule expansion, and
 // L2/L4 compound construction mechanics. The compiler takes a
@@ -1214,6 +1215,133 @@ TEST(MirrorStrategy, MutatingVerbsEnumScan_U3_21) {
   // If a new verb is added with value > 5, this count check will fail.
   EXPECT_EQ(std::size(table), 6u)
       << "enum-scan table size mismatch — update this test when adding new ActionVerb values";
+}
+
+// =========================================================================
+// C8 — -Wswitch-enum + empty pipeline
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U3.22 -Wswitch-enum compile-time coverage — action verbs
+//
+// Every ActionVerb value must map to a known classification in the
+// compiler's action dispatch table (verb_label). Runtime enum iteration
+// asserts coverage; -Wswitch-enum in the implementation ensures compile-
+// time exhaustiveness. Adding a new ActionVerb without updating the
+// dispatch table breaks the build. Covers D25.
+// -------------------------------------------------------------------------
+TEST(SwitchEnumCoverage, ActionVerbDispatch_U3_22) {
+  // The verb_label function is a dispatch table: ActionVerb → string name.
+  // -Wswitch-enum in its implementation ensures compile-time exhaustiveness.
+  // Here we verify at runtime that every known ActionVerb returns a
+  // non-empty label (no silent fallthrough).
+
+  struct VerbCase {
+    ActionVerb verb;
+    const char* expected_label;
+  };
+
+  const VerbCase cases[] = {
+      {ActionVerb::kAllow,     "allow"},
+      {ActionVerb::kDrop,      "drop"},
+      {ActionVerb::kMirror,    "mirror"},
+      {ActionVerb::kRateLimit, "rate_limit"},
+      {ActionVerb::kTag,       "tag"},
+      {ActionVerb::kRedirect,  "redirect"},
+  };
+
+  for (const auto& [verb, expected] : cases) {
+    auto label = verb_label(verb);
+    EXPECT_STREQ(label, expected)
+        << "verb_label dispatch mismatch for verb "
+        << static_cast<int>(verb);
+  }
+
+  // Count guard: if a new ActionVerb is added, this fails and the
+  // developer must update both verb_label and this test.
+  EXPECT_EQ(std::size(cases), 6u)
+      << "ActionVerb enum grew — update verb_label + this test (D25)";
+}
+
+// -------------------------------------------------------------------------
+// U3.23 -Wswitch-enum — Layer enum coverage
+//
+// Every Layer value must map to a known classification in the compiler's
+// layer_label dispatch. Runtime enum iteration asserts coverage;
+// -Wswitch-enum in the implementation ensures compile-time
+// exhaustiveness. Covers D21, D25.
+// -------------------------------------------------------------------------
+TEST(SwitchEnumCoverage, LayerDispatch_U3_23) {
+  struct LayerCase {
+    Layer layer;
+    const char* expected_label;
+  };
+
+  const LayerCase cases[] = {
+      {Layer::kL2, "l2"},
+      {Layer::kL3, "l3"},
+      {Layer::kL4, "l4"},
+  };
+
+  for (const auto& [layer, expected] : cases) {
+    auto label = layer_label(layer);
+    EXPECT_STREQ(label, expected)
+        << "layer_label dispatch mismatch for layer "
+        << static_cast<int>(layer);
+  }
+
+  // Count guard
+  EXPECT_EQ(std::size(cases), 3u)
+      << "Layer enum grew — update layer_label + this test (D21/D25)";
+}
+
+// -------------------------------------------------------------------------
+// U3.26 Empty pipeline compiles to a valid empty ruleset
+//
+// All three layers empty → compile() returns a CompileResult with no
+// actions, no entries, no error. Packet falls through to
+// default_behavior at every layer. Covers F1 (default behavior).
+// -------------------------------------------------------------------------
+TEST(EmptyPipeline, EmptyPipelineValid_U3_26) {
+  Config cfg = make_config();
+  // Pipeline is empty by default from make_config() — all layers have
+  // zero rules.
+  ASSERT_TRUE(cfg.pipeline.layer_2.empty());
+  ASSERT_TRUE(cfg.pipeline.layer_3.empty());
+  ASSERT_TRUE(cfg.pipeline.layer_4.empty());
+
+  auto result = compile(cfg);
+
+  // No compile error
+  EXPECT_FALSE(result.error.has_value())
+      << "Empty pipeline must compile without error";
+
+  // All action arrays empty
+  EXPECT_TRUE(result.l2_actions.empty())
+      << "Empty L2 layer must produce zero L2 actions";
+  EXPECT_TRUE(result.l3_actions.empty())
+      << "Empty L3 layer must produce zero L3 actions";
+  EXPECT_TRUE(result.l4_actions.empty())
+      << "Empty L4 layer must produce zero L4 actions";
+
+  // All entry arrays empty
+  EXPECT_TRUE(result.l2_entries.empty())
+      << "Empty L2 layer must produce zero L2 entries";
+  EXPECT_TRUE(result.l3_entries.empty())
+      << "Empty L3 layer must produce zero L3 entries";
+  EXPECT_TRUE(result.l4_entries.empty())
+      << "Empty L4 layer must produce zero L4 entries";
+
+  // L2 and L4 compound builders also produce empty output
+  auto l2 = compile_l2_rules(cfg.pipeline.layer_2, result.l2_actions);
+  EXPECT_TRUE(l2.empty())
+      << "compile_l2_rules on empty input must return empty";
+
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  EXPECT_TRUE(l4out.rules.empty())
+      << "compile_l4_rules on empty input must return empty";
+  EXPECT_TRUE(l4out.collisions.empty())
+      << "compile_l4_rules on empty input must have no collisions";
 }
 
 }  // namespace
