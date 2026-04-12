@@ -99,7 +99,7 @@
         "CMAKE_CXX_FLAGS":     "-O1 -g -fno-omit-frame-pointer",
         "PKTGATE_PRESET_NAME": "fuzz",
         "PKTGATE_FUZZ":        "ON",
-        "PKTGATE_SANITIZER":   ""
+        "PKTGATE_SANITIZER":   "asan"
       }
     }
   ],

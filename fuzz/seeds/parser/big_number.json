@@ -1,0 +1,1 @@
+{"version": 9007199254740993, "interface_roles": {"x": {"pci": "0000:00:00.0"}}, "pipeline": {"layer_2": [], "layer_3": [], "layer_4": []}, "default_behavior": "drop"}

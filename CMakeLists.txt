@@ -107,26 +107,30 @@ pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json)
 # ---- libpktgate_core (M1) -----------------------------------------------
 #
 # Pure C++ static library that the product binary, every unit test, and
-# (later) the fuzz harnesses all link against. No DPDK includes — kept
+# the fuzz harnesses all link against. No DPDK includes — kept
 # deliberately DPDK-free so unit tests run under the dev-* presets
 # without EAL init. The runtime / dataplane modules (M3+) live in a
 # separate library, added alongside this one when they land.
 #
+# Builds under BOTH dev-* and fuzz presets: fuzz targets (C12+) link
+# against pktgate_core to call parse() / validate(). Under the fuzz
+# preset, PKTGATE_SANITIZER=asan applies address+undefined sanitizer
+# flags to the library — the libFuzzer-specific `-fsanitize=fuzzer`
+# flag is only on fuzz executables (via Fuzz.cmake per-target).
+#
 # Source list grows one file per M1 cycle: C1 seeds parser.cpp; C6
 # adds sizing.cpp; C7 adds validator.cpp; etc. Keep it explicit (no
 # glob) so a missing file is a configure error, not a silent drop.
-if(NOT PKTGATE_FUZZ)
-  add_library(pktgate_core STATIC
-    src/config/parser.cpp
-    src/config/addr.cpp
-    src/config/sizing.cpp
-    src/config/validator.cpp
-  )
-  target_include_directories(pktgate_core PUBLIC ${CMAKE_SOURCE_DIR})
-  target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)
-  pktgate_apply_warnings(pktgate_core)
-  pktgate_apply_sanitizer(pktgate_core)
-endif()
+add_library(pktgate_core STATIC
+  src/config/parser.cpp
+  src/config/addr.cpp
+  src/config/sizing.cpp
+  src/config/validator.cpp
+)
+target_include_directories(pktgate_core PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)
+pktgate_apply_warnings(pktgate_core)
+pktgate_apply_sanitizer(pktgate_core)
 
 # ---- Product binary (empty in M0; main{return 0;}) ----------------------
 #

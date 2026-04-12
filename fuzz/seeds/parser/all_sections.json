@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port":   { "pci": "0000:01:00.0" },
+    "downstream_port": { "vdev": "net_pcap0,tx_iface=lo" },
+    "mgmt_port":       { "name": "net_tap0" }
+  },
+  "default_behavior": "allow",
+  "fragment_policy": "l3_only",
+  "sizing": {
+    "rules_per_layer_max": 512,
+    "mac_entries_max": 512,
+    "ipv4_prefixes_max": 2048,
+    "ipv6_prefixes_max": 2048,
+    "l4_entries_max": 512,
+    "vrf_entries_max": 64,
+    "rate_limit_rules_max": 512,
+    "ethertype_entries_max": 64,
+    "vlan_entries_max": 512,
+    "pcp_entries_max": 8
+  },
+  "objects": {
+    "subnets": {
+      "internal": ["10.0.0.0/8", "172.16.0.0/12"],
+      "external_v6": ["2001:db8::/32"]
+    }
+  },
+  "pipeline": {
+    "layer_2": [
+      {
+        "id": 1,
+        "src_mac": "00:11:22:33:44:55",
+        "dst_mac": "aa:bb:cc:dd:ee:ff",
+        "ethertype": 2048,
+        "vlan_id": 100,
+        "pcp": 3,
+        "next_layer": "l3",
+        "action": { "type": "allow" }
+      }
+    ],
+    "layer_3": [
+      {
+        "id": 100,
+        "src_subnet": "internal",
+        "interface": "upstream_port",
+        "action": { "type": "rate-limit", "rate": "100Mbps", "burst_ms": 500 }
+      }
+    ],
+    "layer_4": [
+      {
+        "id": 200,
+        "dst_port": 443,
+        "action": { "type": "drop" }
+      },
+      {
+        "id": 201,
+        "dst_ports": [80, 8080, 8443],
+        "tcp_flags": { "syn": true, "ack": false },
+        "action": { "type": "tag", "dscp": 46, "pcp": 5 }
+      },
+      {
+        "id": 202,
+        "dst_port": 53,
+        "action": { "type": "target-port", "target_port": "mgmt_port" }
+      }
+    ]
+  },
+  "cmd_socket": {
+    "allow_gids": [1000, 1001]
+  }
+}

@@ -27,3 +27,19 @@ pktgate_add_fuzz_test(
   SOURCES smoke_fuzz.cc
   LABELS  smoke
 )
+
+# ---- parser_fuzz (M1 C12, corner.md C7.1) --------------------------------
+#
+# Coverage-guided fuzz target for the config parser. Feeds raw bytes
+# into pktgate::config::parse() and asserts (via ASan + UBSan) that
+# no crash / UB / leak occurs on any input. Seed corpus lives in
+# fuzz/seeds/parser/.
+#
+# ctest smoke entry: `parser_fuzz -runs=1` (wiring sanity).
+# CI shortrun: `parser_fuzz fuzz/seeds/parser/ -max_total_time=60`.
+pktgate_add_fuzz_test(
+  NAME    fuzz.parser_fuzz
+  SOURCES parser_fuzz.cc
+  LABELS  fuzz
+)
+target_link_libraries(fuzz_parser_fuzz PRIVATE pktgate_core)
