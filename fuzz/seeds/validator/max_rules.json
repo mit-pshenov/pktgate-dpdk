@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port": { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "sizing": {
+    "rules_per_layer_max": 256,
+    "mac_entries_max": 256,
+    "ipv4_prefixes_max": 1024,
+    "ipv6_prefixes_max": 1024,
+    "l4_entries_max": 256,
+    "vrf_entries_max": 32,
+    "rate_limit_rules_max": 256,
+    "ethertype_entries_max": 32,
+    "vlan_entries_max": 256,
+    "pcp_entries_max": 8
+  },
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [],
+    "layer_4": [
+      { "id": 1, "dst_port": 80, "action": { "type": "allow" } },
+      { "id": 2, "dst_port": 443, "action": { "type": "allow" } },
+      { "id": 3, "dst_port": 8080, "action": { "type": "allow" } },
+      { "id": 4, "dst_port": 8443, "action": { "type": "allow" } },
+      { "id": 5, "dst_port": 53, "action": { "type": "drop" } },
+      { "id": 6, "dst_port": 22, "action": { "type": "drop" } },
+      { "id": 7, "dst_port": 25, "action": { "type": "drop" } },
+      { "id": 8, "dst_port": 110, "action": { "type": "drop" } },
+      { "id": 9, "dst_port": 143, "action": { "type": "drop" } },
+      { "id": 10, "dst_port": 993, "action": { "type": "drop" } }
+    ]
+  }
+}

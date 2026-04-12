@@ -821,6 +821,12 @@ ParseResult parse(std::string_view json_text) {
   } catch (const json::parse_error& e) {
     return make_err(ParseError::kJsonSyntax,
                     std::string{"JSON syntax error: "} + e.what());
+  } catch (const json::out_of_range& e) {
+    // nlohmann throws out_of_range (not parse_error) for number overflow
+    // during parsing — e.g. `888...e888...` triggers
+    // [json.exception.out_of_range.406]. Treat as a syntax-level error.
+    return make_err(ParseError::kJsonSyntax,
+                    std::string{"JSON number overflow: "} + e.what());
   }
 
   if (!doc.is_object()) {

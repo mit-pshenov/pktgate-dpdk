@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port": { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "sizing": {
+    "rules_per_layer_max": 4096,
+    "mac_entries_max": 4096,
+    "ipv4_prefixes_max": 16384,
+    "ipv6_prefixes_max": 16384,
+    "l4_entries_max": 16384,
+    "vrf_entries_max": 256,
+    "rate_limit_rules_max": 4096,
+    "ethertype_entries_max": 64,
+    "vlan_entries_max": 4096,
+    "pcp_entries_max": 8
+  },
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [],
+    "layer_4": [
+      {
+        "id": 1,
+        "dst_ports": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 80, 443, 8080, 8443, 3306, 5432, 6379, 27017, 9200, 9300],
+        "action": { "type": "drop" }
+      },
+      {
+        "id": 2,
+        "dst_ports": [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000],
+        "action": { "type": "allow" }
+      },
+      {
+        "id": 3,
+        "dst_ports": [5000, 5001, 5002, 5003, 5004, 5005, 5006, 5007, 5008, 5009, 5010, 5011, 5012, 5013, 5014, 5015, 5016, 5017, 5018, 5019],
+        "action": { "type": "drop" }
+      }
+    ]
+  }
+}

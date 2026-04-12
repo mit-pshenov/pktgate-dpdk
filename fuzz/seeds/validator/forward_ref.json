@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port": { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "pipeline": {
+    "layer_2": [],
+    "layer_3": [
+      {
+        "id": 1,
+        "src_subnet": "nonexistent_group",
+        "action": { "type": "drop" }
+      }
+    ],
+    "layer_4": []
+  }
+}

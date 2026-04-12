@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "interface_roles": {
+    "upstream_port": { "pci": "0000:00:00.0" },
+    "downstream_port": { "pci": "0000:00:00.1" }
+  },
+  "default_behavior": "drop",
+  "pipeline": {
+    "layer_2": [
+      {
+        "id": 1,
+        "vlan_id": 5000,
+        "action": { "type": "allow" }
+      }
+    ],
+    "layer_3": [],
+    "layer_4": []
+  }
+}

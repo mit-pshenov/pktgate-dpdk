@@ -43,3 +43,19 @@ pktgate_add_fuzz_test(
   LABELS  fuzz
 )
 target_link_libraries(fuzz_parser_fuzz PRIVATE pktgate_core)
+
+# ---- validator_fuzz (M1 C13, corner.md C7.2) --------------------------------
+#
+# Coverage-guided fuzz target for the config validator. Feeds raw bytes
+# into the parser; if parsing succeeds, runs validate() and
+# validate_budget() and asserts (via ASan + UBSan) that no crash / UB /
+# leak occurs. Seed corpus lives in fuzz/seeds/validator/.
+#
+# ctest smoke entry: `validator_fuzz -runs=1` (wiring sanity).
+# CI shortrun: `validator_fuzz fuzz/seeds/validator/ -max_total_time=60`.
+pktgate_add_fuzz_test(
+  NAME    fuzz.validator_fuzz
+  SOURCES validator_fuzz.cc
+  LABELS  fuzz
+)
+target_link_libraries(fuzz_validator_fuzz PRIVATE pktgate_core)
