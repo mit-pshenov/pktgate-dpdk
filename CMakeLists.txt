@@ -149,6 +149,7 @@ if(NOT PKTGATE_FUZZ)
     src/eal/dynfield.cpp
     src/dataplane/worker.cpp
     src/ctl/bootstrap.cpp
+    src/ruleset/builder_eal.cpp
   )
   target_include_directories(pktgate_dp PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(pktgate_dp PUBLIC PkgConfig::DPDK pktgate_core)

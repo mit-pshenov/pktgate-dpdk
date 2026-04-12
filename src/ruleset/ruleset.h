@@ -21,6 +21,16 @@
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
+#include "src/ruleset/types.h"
+
+// Forward declarations for DPDK handles (M4 C0 retrofit). We do NOT
+// include <rte_hash.h> / <rte_fib.h> here because this header is
+// consumed by `libpktgate_core` (DPDK-free). The actual creation +
+// population lives in `builder_eal.cpp` inside `libpktgate_dp` where
+// the DPDK headers are in scope.
+struct rte_hash;
+struct rte_fib;
+struct rte_fib6;
 
 namespace pktgate::ruleset {
 
@@ -80,6 +90,37 @@ struct Ruleset {
   std::uint32_t l4_actions_capacity = 0;
   std::uint32_t n_l4_rules = 0;
 
+  // ---- DPDK compound tables (M4 C0 retrofit) ----
+  //
+  // Pointer handles opened and populated by the EAL-aware builder stage
+  // (src/ruleset/builder_eal.cpp). The pure-C++ M2 builder leaves these
+  // nullptr; only the full production boot path (or a test that runs
+  // under EalFixture) calls `populate_ruleset_eal()` to open the hashes
+  // / FIBs and key them from the CompileResult compound vectors.
+  //
+  // l2_compound_entries / l3_compound_entries / l4_compound_entries
+  // are the backing arenas that own the values the hash tables / FIBs
+  // point at — the hash stores a pointer into the arena, not a copy,
+  // so the arena must outlive the hash. All four fields are freed in
+  // ~Ruleset through the DPDK destroy helpers (conditional on the
+  // `eal_owned` flag so a pure-C++ Ruleset doesn't call rte_hash_free
+  // on a nullptr it was never given).
+  rte_hash* l2_compound_hash = nullptr;
+  rte_fib*  l3_v4_fib = nullptr;
+  rte_fib6* l3_v6_fib = nullptr;
+  rte_hash* l4_compound_hash = nullptr;
+
+  L2CompoundEntry* l2_compound_entries = nullptr;
+  std::uint32_t    l2_compound_count = 0;
+  L3CompoundEntry* l3_compound_entries = nullptr;
+  std::uint32_t    l3_compound_count = 0;
+  L4CompoundEntry* l4_compound_entries = nullptr;
+  std::uint32_t    l4_compound_count = 0;
+
+  // Set when `populate_ruleset_eal` opened the DPDK handles, so the
+  // destructor knows whether to call rte_hash_free / rte_fib_free.
+  bool eal_owned = false;
+
   // ---- Default behavior / fragment policy ----
   std::uint8_t default_action = 0;   // ALLOW or DROP
   std::uint8_t fragment_policy = 0;  // L3_ONLY | DROP | ALLOW
@@ -100,6 +141,17 @@ struct Ruleset {
   using FreeFn = void (*)(void* ptr, void* ctx);
   FreeFn free_fn = nullptr;
   void* free_ctx = nullptr;
+
+  // ---- EAL handle deleter (M4 C0 retrofit) ----
+  //
+  // populate_ruleset_eal() fills this in so ~Ruleset can free the
+  // rte_hash / rte_fib handles without pulling DPDK headers into
+  // ruleset.cpp (which lives in libpktgate_core, the DPDK-free lib).
+  // The callback walks the Ruleset's EAL fields and calls the
+  // appropriate rte_*_free helpers. When nullptr (pure-C++ path),
+  // the destructor leaves all DPDK pointers alone.
+  using EalDeleterFn = void (*)(Ruleset& rs);
+  EalDeleterFn eal_deleter = nullptr;
 
   // Get the counter row for a given lcore.
   RuleCounter* counter_row(unsigned lcore_id) const {

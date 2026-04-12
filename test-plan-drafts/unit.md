@@ -774,6 +774,17 @@ Each uses a tiny test-only mempool (e.g. 256 mbufs) and a
 dynfield registered by a test fixture. Ruleset fixtures are
 built in-process via U3/U4 helpers.
 
+### U6.0a Mbuf dynfield registration [needs EAL]
+- Goal: after EAL boot, `eal::register_dynfield()` returns a
+  positive offset inside `sizeof(struct rte_mbuf)`, and every
+  field of `pktgate::eal::MbufDynfield` can be written and read
+  back through `eal::mbuf_dynfield(mbuf)`.
+- Note: originally scheduled as U6.1 in the M3 plan; renamed to
+  U6.0a in M4 C0 after the M4 plan re-assigned the U6.1 ID to
+  "L2 empty ruleset → NEXT_L3" (classify_l2 plumbing). See
+  scratch/m4-supervisor-handoff.md §Plan errata.
+- Covers: D27, §6.2 mbuf dynfield.
+
 ### U6.1 L2 — empty ruleset → NEXT_L3
 - Goal: plain IPv4/Ethernet frame, empty L2 ruleset,
   `classify_l2` sets `verdict_layer = NEXT_L3`.

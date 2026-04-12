@@ -1,6 +1,6 @@
 // tests/unit/test_eal_unit.cpp
 //
-// M3 C4/C5 — EAL-needing unit tests.
+// M3/M4 — EAL-needing unit tests.
 //
 // This binary has its own main() that calls rte_eal_init() once
 // via the EalFixture, then runs all gtest tests. Separate from
@@ -10,23 +10,44 @@
 
 #include <gtest/gtest.h>
 
-#include <rte_mbuf.h>
+#include <cstring>
 
+#include <rte_fib.h>
+#include <rte_fib6.h>
+#include <rte_hash.h>
+#include <rte_ip6.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+
+#include "src/compiler/compiler.h"
+#include "src/compiler/object_compiler.h"
+#include "src/compiler/rule_compiler.h"
+#include "src/config/model.h"
+#include "src/config/sizing.h"
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
+#include "src/eal/port_init.h"
+#include "src/ruleset/builder_eal.h"
+#include "src/ruleset/ruleset.h"
+#include "src/ruleset/types.h"
 
 namespace pktgate::test {
 
 // =========================================================================
-// U6.1 — dynfield registration and writability
+// U6.0a — dynfield registration and writability
 //
 // After EAL boot, register the dynfield, verify offset is valid,
 // allocate an mbuf, write to the dynfield, read back.
+//
+// NOTE: originally labeled U6.1 in the M3 plan. Renamed to U6.0a in
+// M4 C0 because the real U6.1 test ID was re-assigned by the M4
+// plan to "L2 empty ruleset → NEXT_L3" (first classify_l2 cycle).
+// See scratch/m4-supervisor-handoff.md "Plan errata".
 // =========================================================================
 
 class DynfieldTest : public EalFixture {};
 
-TEST_F(DynfieldTest, U6_1_DynfieldRegistrationAndWritable) {
+TEST_F(DynfieldTest, U6_0a_DynfieldRegistrationAndWritable) {
   // Register dynfield.
   int offset = eal::register_dynfield();
   ASSERT_GE(offset, 0) << "dynfield registration failed";
@@ -136,6 +157,376 @@ TEST_F(WorkerMultiSegTest, U6_2a_MultiSegReturnsFalse) {
   // Free the chained mbuf (rte_pktmbuf_free walks the chain).
   rte_pktmbuf_free(head);
   rte_mempool_free(mp);
+}
+
+// =========================================================================
+// Builder-EAL test helpers (M4 C0 — U4.2..U4.5)
+// =========================================================================
+//
+// Each test builds a tiny Config, runs the compiler pipeline, calls
+// populate_ruleset_eal() to open the DPDK tables, then queries the
+// tables to assert that primary keys / prefixes resolve to the right
+// compound entries.
+//
+// The rte_hash / rte_fib global namespace is shared process-wide, so
+// each test uses a unique `name_prefix` to avoid EEXIST on reruns.
+
+namespace builder_eal {
+
+using ::pktgate::compiler::CompileResult;
+using ::pktgate::compiler::compile;
+using ::pktgate::config::ActionAllow;
+using ::pktgate::config::ActionDrop;
+using ::pktgate::config::Cidr4;
+using ::pktgate::config::Cidr6;
+using ::pktgate::config::Config;
+using ::pktgate::config::DefaultBehavior;
+using ::pktgate::config::FragmentPolicy;
+using ::pktgate::config::InterfaceRole;
+using ::pktgate::config::Mac;
+using ::pktgate::config::PciSelector;
+using ::pktgate::config::Rule;
+using ::pktgate::config::RuleAction;
+using ::pktgate::config::SubnetObject;
+using ::pktgate::config::SubnetRef;
+using ::pktgate::config::kSchemaVersion;
+using ::pktgate::config::kSizingDevDefaults;
+using ::pktgate::ruleset::EalPopulateParams;
+using ::pktgate::ruleset::L3CompoundEntry;
+using ::pktgate::ruleset::Ruleset;
+using ::pktgate::ruleset::populate_ruleset_eal;
+
+inline Config make_config() {
+  Config cfg;
+  cfg.version = kSchemaVersion;
+  cfg.default_behavior = DefaultBehavior::kDrop;
+  cfg.fragment_policy = FragmentPolicy::kL3Only;
+  cfg.sizing = kSizingDevDefaults;
+  cfg.interface_roles = {
+      InterfaceRole{"upstream_port", PciSelector{"0000:00:00.0"}},
+      InterfaceRole{"downstream_port", PciSelector{"0000:00:00.1"}},
+  };
+  return cfg;
+}
+
+inline Rule& append_rule(std::vector<Rule>& layer, std::int32_t id,
+                         RuleAction action) {
+  auto& r = layer.emplace_back();
+  r.id = id;
+  r.action = std::move(action);
+  return r;
+}
+
+// Unpack an L3CompoundEntry from the FIB next_hop slot.
+inline L3CompoundEntry unpack_l3(std::uint64_t nh) {
+  L3CompoundEntry entry{};
+  std::memcpy(&entry, &nh, sizeof(entry));
+  return entry;
+}
+
+}  // namespace builder_eal
+
+class BuilderEalTest : public EalFixture {};
+
+// =========================================================================
+// U4.2 — FIB4 population [needs EAL]
+//
+// Three L3v4 rules with distinct destination prefixes (resolved via
+// src_subnet since M1 has no dst_subnet). After populate_ruleset_eal
+// the v4 FIB must return the correct action_idx for in-prefix addresses
+// and the default (no match) for an outside address.
+// =========================================================================
+
+TEST_F(BuilderEalTest, U4_2_Fib4Population) {
+  using namespace builder_eal;
+  Config cfg = make_config();
+
+  // Three subnets, one per L3 rule.
+  SubnetObject a;
+  a.name = "net_a";
+  a.cidrs.push_back(Cidr4{0x0A000000, 8});    // 10.0.0.0/8
+  cfg.objects.subnets.push_back(std::move(a));
+
+  SubnetObject b;
+  b.name = "net_b";
+  b.cidrs.push_back(Cidr4{0xAC100000, 12});   // 172.16.0.0/12
+  cfg.objects.subnets.push_back(std::move(b));
+
+  SubnetObject c;
+  c.name = "net_c";
+  c.cidrs.push_back(Cidr4{0xC0A80000, 16});   // 192.168.0.0/16
+  cfg.objects.subnets.push_back(std::move(c));
+
+  auto& r1 = append_rule(cfg.pipeline.layer_3, 3001, ActionDrop{});
+  r1.src_subnet = SubnetRef{"net_a"};
+  auto& r2 = append_rule(cfg.pipeline.layer_3, 3002, ActionAllow{});
+  r2.src_subnet = SubnetRef{"net_b"};
+  auto& r3 = append_rule(cfg.pipeline.layer_3, 3003, ActionDrop{});
+  r3.src_subnet = SubnetRef{"net_c"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+  ASSERT_EQ(cr.l3_compound.size(), 3u);
+
+  Ruleset rs;
+  EalPopulateParams params;
+  params.name_prefix = "u4_2";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v4_fib, nullptr);
+
+  // Lookup in-prefix addresses via rte_fib_lookup_bulk.
+  const std::uint32_t ips[4] = {
+      0x0A010203,   // 10.1.2.3 -> net_a (rule 0)
+      0xAC110001,   // 172.17.0.1 -> net_b (rule 1)
+      0xC0A80001,   // 192.168.0.1 -> net_c (rule 2)
+      0x08080808,   // 8.8.8.8 -> no match
+  };
+  std::uint64_t nh[4] = {0, 0, 0, 0};
+  int lret = rte_fib_lookup_bulk(rs.l3_v4_fib,
+                                 const_cast<std::uint32_t*>(ips), nh, 4);
+  ASSERT_EQ(lret, 0);
+
+  EXPECT_EQ(unpack_l3(nh[0]).action_idx, 0);
+  EXPECT_EQ(unpack_l3(nh[1]).action_idx, 1);
+  EXPECT_EQ(unpack_l3(nh[2]).action_idx, 2);
+  // Default next_hop is 0 (we set conf.default_nh = 0). action_idx==0
+  // in the default slot would alias rule 0, so we check the *entry*
+  // has prefix==8 (rule 0) only for ip[0].
+  EXPECT_EQ(nh[3], 0u) << "8.8.8.8 must not match any configured prefix";
+}
+
+// =========================================================================
+// U4.3 — FIB6 population [needs EAL]
+// =========================================================================
+
+TEST_F(BuilderEalTest, U4_3_Fib6Population) {
+  using namespace builder_eal;
+  Config cfg = make_config();
+
+  // 2001:db8::/32 and fd00::/8
+  SubnetObject a;
+  a.name = "v6_a";
+  {
+    Cidr6 c{};
+    c.bytes[0] = 0x20; c.bytes[1] = 0x01;
+    c.bytes[2] = 0x0d; c.bytes[3] = 0xb8;
+    c.prefix = 32;
+    a.cidrs.push_back(c);
+  }
+  cfg.objects.subnets.push_back(std::move(a));
+
+  SubnetObject b;
+  b.name = "v6_b";
+  {
+    Cidr6 c{};
+    c.bytes[0] = 0xfd;
+    c.prefix = 8;
+    b.cidrs.push_back(c);
+  }
+  cfg.objects.subnets.push_back(std::move(b));
+
+  auto& r1 = append_rule(cfg.pipeline.layer_3, 4001, ActionDrop{});
+  r1.src_subnet = SubnetRef{"v6_a"};
+  auto& r2 = append_rule(cfg.pipeline.layer_3, 4002, ActionAllow{});
+  r2.src_subnet = SubnetRef{"v6_b"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+  ASSERT_EQ(cr.l3_compound.size(), 2u);
+
+  Ruleset rs;
+  EalPopulateParams params;
+  params.name_prefix = "u4_3";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v6_fib, nullptr);
+
+  // Lookup: 2001:db8::1 → v6_a; fd12::1 → v6_b; 2001:470::1 → no match.
+  rte_ipv6_addr ips[3]{};
+  ips[0].a[0] = 0x20; ips[0].a[1] = 0x01;
+  ips[0].a[2] = 0x0d; ips[0].a[3] = 0xb8;
+  ips[0].a[15] = 0x01;
+
+  ips[1].a[0] = 0xfd; ips[1].a[1] = 0x12;
+  ips[1].a[15] = 0x01;
+
+  ips[2].a[0] = 0x20; ips[2].a[1] = 0x01;
+  ips[2].a[2] = 0x04; ips[2].a[3] = 0x70;
+  ips[2].a[15] = 0x01;
+
+  std::uint64_t nh[3] = {0, 0, 0};
+  int lret = rte_fib6_lookup_bulk(rs.l3_v6_fib, ips, nh, 3);
+  ASSERT_EQ(lret, 0);
+
+  EXPECT_EQ(unpack_l3(nh[0]).action_idx, 0);
+  EXPECT_EQ(unpack_l3(nh[1]).action_idx, 1);
+  EXPECT_EQ(nh[2], 0u) << "2001:470::1 must not match";
+}
+
+// =========================================================================
+// U4.4 — L2 rte_hash population [needs EAL]
+//
+// Two L2 rules with distinct src_mac. After populate_ruleset_eal the
+// rte_hash must resolve the packed MAC keys to the correct action_idx
+// and return -ENOENT for a random MAC.
+// =========================================================================
+
+TEST_F(BuilderEalTest, U4_4_L2HashPopulation) {
+  using namespace builder_eal;
+  Config cfg = make_config();
+
+  auto& r1 = append_rule(cfg.pipeline.layer_2, 1001, ActionAllow{});
+  r1.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}};
+  auto& r2 = append_rule(cfg.pipeline.layer_2, 1002, ActionDrop{});
+  r2.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+  ASSERT_EQ(cr.l2_compound.size(), 2u);
+
+  Ruleset rs;
+  EalPopulateParams params;
+  params.name_prefix = "u4_4";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l2_compound_hash, nullptr);
+
+  // Lookup the two configured keys.
+  std::uint64_t k1 = cr.l2_compound[0].primary_key;
+  std::uint64_t k2 = cr.l2_compound[1].primary_key;
+  std::uint64_t k_miss = 0xDEADBEEFCAFEBABEull;
+
+  void* data = nullptr;
+  ASSERT_GE(rte_hash_lookup_data(rs.l2_compound_hash, &k1, &data), 0);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(static_cast<pktgate::ruleset::L2CompoundEntry*>(data)->action_idx,
+            0);
+
+  data = nullptr;
+  ASSERT_GE(rte_hash_lookup_data(rs.l2_compound_hash, &k2, &data), 0);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(static_cast<pktgate::ruleset::L2CompoundEntry*>(data)->action_idx,
+            1);
+
+  data = nullptr;
+  int miss = rte_hash_lookup_data(rs.l2_compound_hash, &k_miss, &data);
+  EXPECT_LT(miss, 0) << "random key must miss";
+}
+
+// =========================================================================
+// U4.5 — L4 primary hash population [needs EAL]
+//
+// Two L4 rules: (tcp, dport=443) and icmp catch-all. Lookup each
+// primary key through rte_hash_lookup_data.
+// =========================================================================
+
+TEST_F(BuilderEalTest, U4_5_L4HashPopulation) {
+  using namespace builder_eal;
+  Config cfg = make_config();
+
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 2001, ActionDrop{});
+  r1.proto = 6;      // TCP
+  r1.dst_port = 443;
+
+  auto& r2 = append_rule(cfg.pipeline.layer_4, 2002, ActionAllow{});
+  r2.proto = 1;      // ICMP, no dport -> proto-only primary
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+  ASSERT_EQ(cr.l4_compound.size(), 2u);
+
+  Ruleset rs;
+  EalPopulateParams params;
+  params.name_prefix = "u4_5";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  std::uint32_t k1 = cr.l4_compound[0].primary_key;  // (6<<16)|443
+  std::uint32_t k2 = cr.l4_compound[1].primary_key;  // 1
+  std::uint32_t k_miss = 0xDEADBEEFu;
+
+  void* data = nullptr;
+  ASSERT_GE(rte_hash_lookup_data(rs.l4_compound_hash, &k1, &data), 0);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(static_cast<pktgate::ruleset::L4CompoundEntry*>(data)->action_idx,
+            0);
+
+  data = nullptr;
+  ASSERT_GE(rte_hash_lookup_data(rs.l4_compound_hash, &k2, &data), 0);
+  ASSERT_NE(data, nullptr);
+  EXPECT_EQ(static_cast<pktgate::ruleset::L4CompoundEntry*>(data)->action_idx,
+            1);
+
+  data = nullptr;
+  int miss = rte_hash_lookup_data(rs.l4_compound_hash, &k_miss, &data);
+  EXPECT_LT(miss, 0) << "random primary key must miss";
+}
+
+// =========================================================================
+// U4.18 — D39 port scatter-off + mempool-fit validator [needs EAL]
+//
+// Create two mempools: one with data_room too small for RTE_ETHER_MAX_LEN,
+// one with data_room large enough. check_no_scatter() must reject the
+// small one with "multiseg_rx_unsupported" in the error and accept the
+// large one.
+//
+// The net_null port from EalFixture has max_rx_pktlen set to a large
+// value (well over 64), so the "data_room=64" mempool forces the
+// violation path.
+// =========================================================================
+
+class ScatterValidatorTest : public EalFixture {};
+
+TEST_F(ScatterValidatorTest, U4_18_CheckNoScatterAcceptsAndRejects) {
+  // Resolve the net_null port spawned by the EalFixture.
+  auto resolve = eal::resolve_port_by_name("net_null0");
+  ASSERT_TRUE(resolve.ok) << resolve.error;
+  const std::uint16_t port_id = resolve.port_id;
+
+  // D39 specifies the mempool's element size must be >= max_rx_pktlen.
+  // A mempool with a too-small element cannot hold a standard Ethernet
+  // frame in one segment — check_no_scatter must reject it.
+  //
+  // rte_pktmbuf_pool_create takes `data_room` as the 5th parameter.
+  // data_room must be >= sizeof(struct rte_mbuf)'s headroom (128) per
+  // DPDK requirements, so we use 256 for the "too small" case (<1518
+  // but >= minimum headroom) and RTE_MBUF_DEFAULT_BUF_SIZE for the
+  // "fits" case.
+  struct rte_mempool* small_mp = rte_pktmbuf_pool_create(
+      "u4_18_small_pool", 63, 0, 0,
+      static_cast<uint16_t>(256), 0);
+  ASSERT_NE(small_mp, nullptr);
+
+  struct rte_mempool* big_mp = rte_pktmbuf_pool_create(
+      "u4_18_big_pool", 63, 0, 0,
+      RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(big_mp, nullptr);
+
+  auto small_res = eal::check_no_scatter(port_id, small_mp);
+  EXPECT_FALSE(small_res.ok);
+  EXPECT_NE(small_res.error.find("multiseg_rx_unsupported"), std::string::npos)
+      << "error must contain 'multiseg_rx_unsupported' sentinel, got: "
+      << small_res.error;
+
+  auto big_res = eal::check_no_scatter(port_id, big_mp);
+  EXPECT_TRUE(big_res.ok) << big_res.error;
+
+  rte_mempool_free(small_mp);
+  rte_mempool_free(big_mp);
 }
 
 }  // namespace pktgate::test
