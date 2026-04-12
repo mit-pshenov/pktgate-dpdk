@@ -45,3 +45,10 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_core
 )
+
+pktgate_add_test(
+  NAME    unit.test_builder
+  SOURCES test_builder.cpp
+  LABELS  unit
+  LINK    pktgate_core
+)

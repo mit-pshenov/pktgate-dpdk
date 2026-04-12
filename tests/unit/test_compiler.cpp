@@ -16,11 +16,13 @@
 #include <variant>
 #include <vector>
 
+#include "src/action/action.h"
 #include "src/compiler/compiler.h"
 #include "src/compiler/object_compiler.h"
 #include "src/config/addr.h"
 #include "src/config/model.h"
 #include "src/config/sizing.h"
+#include "src/ruleset/types.h"
 
 namespace {
 
@@ -230,6 +232,34 @@ TEST(ObjectCompiler, MonotonicCounterSlot_U3_4) {
     EXPECT_EQ(result.l4_actions[i].counter_slot, i)
         << "L4 action " << i << " has wrong counter_slot";
   }
+}
+
+// -------------------------------------------------------------------------
+// U3.5 Compiled RuleAction sizing invariant (static_assert)
+//
+// sizeof(RuleAction) == 20 and alignof(RuleAction) == 4. Covers D22.
+// The static_asserts live in action.h itself — this test is a runtime
+// witness that the header compiled successfully with the invariant
+// intact. If action.h changes and breaks the assertion, this TU fails
+// to compile, which is the intended signal.
+// -------------------------------------------------------------------------
+TEST(CompilerStructSizing, RuleActionSize_U3_5) {
+  static_assert(sizeof(pktgate::action::RuleAction) == 20,
+                "RuleAction layout drift — expected 20 B (D22)");
+  static_assert(alignof(pktgate::action::RuleAction) == 4,
+                "RuleAction alignment drift — expected 4 (D22)");
+  SUCCEED() << "RuleAction is 20 B, alignas(4) — D22 invariant holds";
+}
+
+// -------------------------------------------------------------------------
+// U3.6 Compiled L2CompoundEntry sizing invariant
+//
+// sizeof(L2CompoundEntry) == 16. Covers 2nd external review, §4.1.
+// -------------------------------------------------------------------------
+TEST(CompilerStructSizing, L2CompoundEntrySize_U3_6) {
+  static_assert(sizeof(pktgate::ruleset::L2CompoundEntry) == 16,
+                "L2CompoundEntry layout drift — expected 16 B");
+  SUCCEED() << "L2CompoundEntry is 16 B — §4.1 invariant holds";
 }
 
 }  // namespace
