@@ -26,6 +26,13 @@
 #include <tuple>
 #include <unordered_map>
 
+// compiler.h defines CompiledAction / CompiledObjects which rule_compiler.h
+// only forward-declares (to avoid a circular include — see rule_compiler.h
+// top comment and compiler.h M4 C0 retrofit notes). rule_compiler.cpp needs
+// full definitions of those types to call member functions like
+// `objects.subnets.by_name.find()`.
+#include "src/compiler/compiler.h"
+
 namespace pktgate::compiler {
 
 // Pack a Mac into a uint64_t: first 6 bytes in memory order, upper 2
@@ -234,6 +241,83 @@ L4CompileOutput compile_l4_rules(
   }
 
   return output;
+}
+
+// -------------------------------------------------------------------------
+// compile_l3_rules — L3 compound construction (M4 C0 retrofit, D41).
+//
+// Current M1 config model (src/config/model.h) only exposes
+// `src_subnet` as an unresolved SubnetRef on Rule — there is no
+// dst_subnet field yet. For parity with L2/L4 (D15 primary + mask),
+// we read the resolved src_subnet CIDRs from CompiledObjects and
+// emit one L3CompiledRule per CIDR. Rules with no subnet reference
+// at all produce no compound output (they will fall through to
+// default behaviour at classify_l3 time).
+//
+// This matches the "L3 rules need at least src_subnet or dst_subnet"
+// comment in tests/unit/test_builder.cpp U4.1 — the builder doesn't
+// enforce it, but the compound path skips address-less L3 rules.
+//
+// Planning note: when M1 grows `dst_subnet` on Rule, compile_l3_rules
+// must switch the primary key source and emit one entry per dst CIDR.
+// The L3CompoundEntry layout stays the same (filter_mask already has
+// a reserved slot for the secondary constraint).
+
+std::vector<L3CompiledRule> compile_l3_rules(
+    const std::vector<config::Rule>& rules,
+    const std::vector<CompiledAction>& /*actions*/,
+    const CompiledObjects& objects) {
+  std::vector<L3CompiledRule> result;
+  result.reserve(rules.size());
+
+  for (std::size_t ri = 0; ri < rules.size(); ++ri) {
+    const auto& rule = rules[ri];
+    if (!rule.src_subnet.has_value()) {
+      // No address constraint — skip. Classify_l3 will fall through
+      // to the default_behavior for packets this rule would have
+      // matched if it carried a prefix constraint.
+      continue;
+    }
+    const auto& subnet_name = rule.src_subnet->name;
+    auto it = objects.subnets.by_name.find(subnet_name);
+    if (it == objects.subnets.by_name.end()) {
+      // Unresolved reference. The validator (M1 C8) is supposed to
+      // catch dangling subnet refs, so reaching here means the caller
+      // bypassed validation. We silently skip rather than emit garbage.
+      continue;
+    }
+
+    const auto& cidrs = it->second;
+    for (const auto& cidr_variant : cidrs) {
+      L3CompiledRule compiled{};
+
+      std::visit(
+          [&compiled](const auto& c) {
+            using T = std::decay_t<decltype(c)>;
+            if constexpr (std::is_same_v<T, config::Cidr4>) {
+              compiled.primary_kind = L3PrimaryKind::kIpv4DstPrefix;
+              compiled.ipv4_prefix = c.addr;
+              compiled.prefix_len = c.prefix;
+            } else if constexpr (std::is_same_v<T, config::Cidr6>) {
+              compiled.primary_kind = L3PrimaryKind::kIpv6DstPrefix;
+              for (std::size_t i = 0; i < 16; ++i) {
+                compiled.ipv6_prefix[i] = c.bytes[i];
+              }
+              compiled.prefix_len = c.prefix;
+            }
+          },
+          cidr_variant);
+
+      compiled.entry.filter_mask = 0;
+      compiled.entry._pad0 = 0;
+      compiled.entry.action_idx = static_cast<std::uint16_t>(ri);
+      compiled.entry._pad1 = 0;
+
+      result.push_back(compiled);
+    }
+  }
+
+  return result;
 }
 
 }  // namespace pktgate::compiler

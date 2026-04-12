@@ -15,16 +15,22 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <variant>
 #include <vector>
 
-#include "src/compiler/compiler.h"
 #include "src/config/model.h"
 #include "src/ruleset/types.h"
 
 namespace pktgate::compiler {
+
+// Forward declarations to avoid a cycle with compiler.h (which itself
+// needs complete L{2,3,4}CompiledRule for CompileResult's vectors,
+// M4 C0 D41 retrofit).
+struct CompiledAction;
+struct CompiledObjects;
 
 // -------------------------------------------------------------------------
 // L2 filter_mask bit definitions (§4.1, D15).
@@ -95,6 +101,52 @@ struct L2CompiledRule {
 };
 
 // -------------------------------------------------------------------------
+// L3PrimaryKind — which FIB the rule's primary key lands in.
+//
+// M4 C0 retrofit (D41). Primary key is the destination prefix of
+// the rule. The current config AST (src/config/model.h) only carries
+// `src_subnet` as an unresolved SubnetRef — there is no dst_subnet
+// field yet. For parity with L2/L4, compile_l3_rules picks the
+// first CIDR of the resolved src_subnet object as the primary key
+// until M1 grows a dst_subnet field. Rules with no L3 address
+// constraint at all produce no L3 compound entry (no primary to
+// key on).
+//
+// See grabli_m4c0_l3_dst_missing.md — flagged as a plan-vs-model
+// inconsistency for the supervisor; worker did NOT silent-reinterpret
+// D15 (compound primary + filter_mask), only noted that M1 ships
+// without dst_subnet and L3 primary routing is deferred to the
+// first cycle that needs it on the dataplane path (M5 classify_l3).
+
+enum class L3PrimaryKind : std::uint8_t {
+  kIpv4DstPrefix,
+  kIpv6DstPrefix,
+};
+
+// -------------------------------------------------------------------------
+// L3CompiledRule — one L3 rule after compound construction (M4 C0).
+//
+// Holds the primary key (IPv4 32-bit or IPv6 128-bit prefix + depth),
+// the compound entry (action_idx + filter_mask for future secondary
+// constraints), and the kind discriminator. For the current M1 config
+// model without dst_subnet, compile_l3_rules reads src_subnet as a
+// provisional primary so L3 has *some* compound state to feed the
+// D41 smoke test and the C0b rte_fib populate path.
+
+struct L3CompiledRule {
+  L3PrimaryKind primary_kind;
+  std::uint8_t  prefix_len;
+
+  // IPv4 prefix (host order); valid when primary_kind == kIpv4DstPrefix.
+  std::uint32_t ipv4_prefix;
+
+  // IPv6 prefix (network byte order); valid when primary_kind == kIpv6DstPrefix.
+  std::array<std::uint8_t, 16> ipv6_prefix;
+
+  pktgate::ruleset::L3CompoundEntry entry;
+};
+
+// -------------------------------------------------------------------------
 // L4CompiledRule — one L4 rule after compound construction.
 //
 // Contains the primary key choice, the compound entry (filter_mask +
@@ -157,5 +209,27 @@ std::vector<L2CompiledRule> compile_l2_rules(
 L4CompileOutput compile_l4_rules(
     const std::vector<config::Rule>& rules,
     const std::vector<CompiledAction>& actions);
+
+// -------------------------------------------------------------------------
+// compile_l3_rules — build L3 compound entries from config rules (M4 C0).
+//
+// For each L3 rule, resolves the rule's destination prefix by looking
+// up the rule's primary address constraint in the compiled subnet pool.
+// Because the current M1 Rule AST only carries `src_subnet` (no
+// dst_subnet field), the primary key falls back to the first CIDR of
+// the resolved src_subnet entry; rules without any subnet ref produce
+// no compound output.
+//
+// Invariants:
+//   * Output order matches input rule order (first-match-wins preserved).
+//   * action_idx in each entry maps 1:1 to rule index (matches L2/L4).
+//   * Mixed-family subnets produce one L3CompiledRule per CIDR in the
+//     named subnet's order (so a subnet with two CIDRs yields two
+//     compiled rules sharing an action).
+
+std::vector<L3CompiledRule> compile_l3_rules(
+    const std::vector<config::Rule>& rules,
+    const std::vector<CompiledAction>& actions,
+    const CompiledObjects& objects);
 
 }  // namespace pktgate::compiler

@@ -396,6 +396,20 @@ Unit scope: pure-C++ transformations from validated AST to
 compiled-model structs. No `rte_hash`/`rte_fib` allocation in
 these tests — those live in U4 (`needs EAL`).
 
+### U3.Smoke1 Pipeline smoke — end-to-end top-level `compile()` (D41)
+- Goal: exercise the full compiler pipeline through the public
+  `compile()` entry point. Feed a config with one L2 rule (src_mac
+  + vlan), one L3 rule (src_subnet → resolved CIDR), and one L4
+  rule (proto + dst_port). Assert that `result.l2_compound`,
+  `result.l3_compound`, and `result.l4_compound` are all non-empty
+  and that the entries carry the expected primary_kind / action_idx.
+- Why: M2 closed green with `compile_l{2,4}_rules` orphaned — unit
+  tests on the stages passed while the top-level entry silently
+  skipped them. This smoke bites any future pipeline-wiring
+  regression in the one test case that doesn't call private
+  helpers.
+- Covers: D41 (pipeline smoke invariant).
+
 ### U3.1 Object compiler — subnet list flatten
 - Goal: `subnets.corp_v4 = ["10.0.0.0/8", "10.1.0.0/16"]`
   flattens to a 2-element `Cidr4[]` post-expansion.

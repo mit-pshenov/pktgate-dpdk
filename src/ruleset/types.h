@@ -34,6 +34,27 @@ struct L2CompoundEntry {
 
 static_assert(sizeof(L2CompoundEntry) == 16, "L2CompoundEntry layout drift");
 
+// L3CompoundEntry — value stored in the L3 FIB next_hop slot.
+//
+// M4 C0 retrofit (D41). Primary key is the destination prefix stored
+// directly in the rte_fib / rte_fib6 table; this entry holds the
+// action index plus any secondary filter bits (src prefix / vrf).
+// The FIB's next_hop slot is a 64-bit opaque value — we pack
+// action_idx + filter_mask + _pad into the low 32 bits and leave
+// the high 32 bits reserved (either unused or an arena index in a
+// later cycle when filter_mask grows).
+//
+// Keep the on-wire layout stable at 8 bytes so it fits the FIB
+// next_hop slot with `nh_sz = RTE_FIB_DIR24_8_8B`.
+struct L3CompoundEntry {
+  std::uint8_t  filter_mask;      // reserved for secondary (src_prefix, vrf)
+  std::uint8_t  _pad0;
+  std::uint16_t action_idx;       // index into l3_actions[]
+  std::uint32_t _pad1;            // reserved (e.g., src_prefix arena idx)
+};
+
+static_assert(sizeof(L3CompoundEntry) == 8, "L3CompoundEntry layout drift");
+
 // L4CompoundEntry — value stored in L4 primary hash.
 //
 // D29 — ICMP unification: §5.4 packs ICMP type into the dport slot

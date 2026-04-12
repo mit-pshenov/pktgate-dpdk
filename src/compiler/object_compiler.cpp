@@ -16,6 +16,8 @@
 #include <unordered_set>
 #include <variant>
 
+#include "src/compiler/rule_compiler.h"
+
 namespace pktgate::compiler {
 
 // -------------------------------------------------------------------------
@@ -172,6 +174,25 @@ CompileResult compile(const config::Config& cfg,
         CompileErrorCode::kMirrorNotImplemented,
         "mirror action not implemented in this build"};
   }
+
+  // M4 C0 retrofit (D41) — wire compound stages into the top-level
+  // pipeline. Before this cycle M2 shipped with compile_l{2,4}_rules
+  // orphaned: the unit tests in tests/unit/test_compiler.cpp called
+  // them directly, but compile() itself never did. The D41 invariant
+  // (review-notes) requires any multi-stage milestone to expose the
+  // full pipeline state through its public entry point — this is
+  // what the U3.Smoke1 test asserts on.
+  result.l2_compound =
+      compile_l2_rules(cfg.pipeline.layer_2, result.l2_actions);
+  result.l3_compound = compile_l3_rules(cfg.pipeline.layer_3,
+                                        result.l3_actions, result.objects);
+  auto l4_out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  result.l4_compound = std::move(l4_out.rules);
+  // L4 compound collisions are surfaced via the L4CompileOutput return
+  // path but intentionally NOT wired into result.error here — collision
+  // handling is a separate diagnostic stream (see tests/unit/test_compiler
+  // U3.24) and the C0 retrofit is limited to exposing the per-layer
+  // compound vectors, not changing error semantics.
 
   return result;
 }

@@ -1342,6 +1342,105 @@ TEST(EmptyPipeline, EmptyPipelineValid_U3_26) {
       << "compile_l4_rules on empty input must return empty";
   EXPECT_TRUE(l4out.collisions.empty())
       << "compile_l4_rules on empty input must have no collisions";
+
+  // M4 C0 retrofit (D41): the top-level compile() must also return
+  // empty compound vectors on an empty pipeline. This pins the
+  // happy-path contract so the U3.Smoke1 non-empty assertion has a
+  // matched negative.
+  EXPECT_TRUE(result.l2_compound.empty())
+      << "Empty L2 layer must produce zero l2_compound entries";
+  EXPECT_TRUE(result.l3_compound.empty())
+      << "Empty L3 layer must produce zero l3_compound entries";
+  EXPECT_TRUE(result.l4_compound.empty())
+      << "Empty L4 layer must produce zero l4_compound entries";
+}
+
+// =========================================================================
+// U3.Smoke1 — D41 pipeline smoke (M4 C0 retrofit)
+//
+// End-to-end smoke test through the public top-level compile() entry
+// point. Exercises the full compiler pipeline: objects → L2 compound
+// → L3 compound → L4 compound.
+//
+// This test is the D41 invariant: any multi-stage milestone ships
+// with at least one test that runs through the top-level entry point
+// and asserts on observable side effects of each internal stage.
+//
+// Prior art: M2 closed green with orphaned compile_l{2,4}_rules. The
+// unit tests above call those helpers directly, so they pass even
+// when compile() silently skips them. Calling compile() and asserting
+// on per-layer compound vectors is the one test that catches the
+// wiring bug.
+//
+// Input config intentionally has rules of all three layers (L2 with
+// src_mac, L3 with src_subnet, L4 with proto+dst_port) so the smoke
+// assertions on l{2,3,4}_compound non-emptiness bite.
+//
+// Covers: D41.
+// =========================================================================
+TEST(PipelineSmoke, CompileEndToEnd_U3_Smoke1) {
+  Config cfg = make_config();
+
+  // L2 rule: src_mac + vlan (compound with src_mac primary).
+  auto& r2 = append_rule(cfg.pipeline.layer_2, 1001, ActionAllow{});
+  r2.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}};
+  r2.vlan_id = 42;
+
+  // L3 rule: src_subnet "corp_v4" → 10.0.0.0/8.
+  // Populate the subnet object so compile_l3_rules can resolve the
+  // SubnetRef and produce a compound entry.
+  SubnetObject corp;
+  corp.name = "corp_v4";
+  Cidr4 c{};
+  c.addr = 0x0A000000;  // 10.0.0.0
+  c.prefix = 8;
+  corp.cidrs.push_back(c);
+  cfg.objects.subnets.push_back(std::move(corp));
+
+  auto& r3 = append_rule(cfg.pipeline.layer_3, 2001, ActionDrop{});
+  r3.src_subnet = SubnetRef{"corp_v4"};
+
+  // L4 rule: tcp/443 (compound with proto+dport primary).
+  auto& r4 = append_rule(cfg.pipeline.layer_4, 3001, ActionDrop{});
+  r4.proto = 6;     // TCP
+  r4.dst_port = 443;
+
+  // Top-level compile() — this is the D41 entry point.
+  auto result = compile(cfg);
+
+  ASSERT_FALSE(result.error.has_value())
+      << "Top-level compile() must succeed on a valid mixed-layer config";
+
+  // D41 core assertions: every layer with a rule produces a non-empty
+  // compound vector. If compile() silently skips any stage, one of
+  // these three assertions fires — which is the exact shape that would
+  // have caught the M2 silent gap at the time it was introduced.
+  EXPECT_FALSE(result.l2_compound.empty())
+      << "D41: L2 rule present but l2_compound empty — compile_l2_rules "
+         "not wired into top-level compile()";
+  EXPECT_FALSE(result.l3_compound.empty())
+      << "D41: L3 rule present but l3_compound empty — compile_l3_rules "
+         "not wired into top-level compile()";
+  EXPECT_FALSE(result.l4_compound.empty())
+      << "D41: L4 rule present but l4_compound empty — compile_l4_rules "
+         "not wired into top-level compile()";
+
+  // Cross-stage wiring checks: the compound entries must reference the
+  // matching action arrays the object compiler built. If they don't,
+  // the per-layer stages are running but on stale/disjoint state.
+  ASSERT_EQ(result.l2_compound.size(), 1u);
+  EXPECT_EQ(result.l2_compound[0].entry.action_idx, 0);
+  EXPECT_EQ(result.l2_compound[0].primary_kind, L2PrimaryKind::kSrcMac);
+
+  ASSERT_EQ(result.l3_compound.size(), 1u);
+  EXPECT_EQ(result.l3_compound[0].primary_kind, L3PrimaryKind::kIpv4DstPrefix);
+  EXPECT_EQ(result.l3_compound[0].ipv4_prefix, 0x0A000000u);
+  EXPECT_EQ(result.l3_compound[0].prefix_len, 8);
+  EXPECT_EQ(result.l3_compound[0].entry.action_idx, 0);
+
+  ASSERT_EQ(result.l4_compound.size(), 1u);
+  EXPECT_EQ(result.l4_compound[0].primary_kind, L4PrimaryKind::kProtoDport);
+  EXPECT_EQ(result.l4_compound[0].entry.action_idx, 0);
 }
 
 }  // namespace

@@ -27,6 +27,7 @@
 
 #include "src/config/addr.h"
 #include "src/config/model.h"
+#include "src/ruleset/types.h"
 
 namespace pktgate::compiler {
 
@@ -138,6 +139,19 @@ struct CompileError {
 
 // -------------------------------------------------------------------------
 // CompileResult — full compiler output.
+//
+// M4 C0 retrofit: CompileResult now holds L{2,3,4}CompiledRule vectors
+// so the public compile() entry point exposes the full pipeline state
+// end-to-end (D41 smoke invariant). The L*CompiledRule definitions
+// live in rule_compiler.h, which is included below after the
+// CompiledAction / CompiledObjects definitions above to break a
+// potential cycle.
+
+}  // namespace pktgate::compiler
+
+#include "src/compiler/rule_compiler.h"  // L{2,3,4}CompiledRule
+
+namespace pktgate::compiler {
 
 struct CompileResult {
   CompiledObjects objects;
@@ -151,6 +165,18 @@ struct CompileResult {
   std::vector<CompiledRuleEntry> l2_entries;
   std::vector<CompiledRuleEntry> l3_entries;
   std::vector<CompiledRuleEntry> l4_entries;
+
+  // M4 C0 retrofit (D41): compound rules per layer, produced by
+  // compile_l2_rules / compile_l3_rules / compile_l4_rules and
+  // populated by the top-level compile() entry point. The ruleset
+  // builder consumes these to populate rte_hash / rte_fib / rte_fib6.
+  //
+  // The per-layer `l{2,3,4}_entries` arrays above remain the port-
+  // expansion helpers (U3.2/U3.3). The `l{2,3,4}_compound` arrays
+  // are the compound-matching artefacts (D15).
+  std::vector<L2CompiledRule> l2_compound;
+  std::vector<L3CompiledRule> l3_compound;
+  std::vector<L4CompiledRule> l4_compound;
 
   // D7: compile error (e.g., mirror not implemented in MVP).
   // When set, the result is invalid — the caller must not use the
