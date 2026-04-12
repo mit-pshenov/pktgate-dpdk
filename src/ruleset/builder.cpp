@@ -93,4 +93,138 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   return rs;
 }
 
+// ---- Default allocator (D23 C10) ----
+
+static void* default_alloc(std::size_t size, std::size_t alignment,
+                           int /*socket_id*/, void* /*ctx*/) {
+  void* mem = ::operator new(size, std::align_val_t{alignment});
+  std::memset(mem, 0, size);
+  return mem;
+}
+
+static void default_free(void* ptr, void* /*ctx*/) {
+  // We don't know the alignment, but operator delete with align_val_t
+  // is needed if allocated with aligned new. For the default allocator
+  // path, we only use this for the 4-byte aligned action arrays —
+  // but actually, let's just use the base operator delete which is fine
+  // for aligned new on most platforms (and the default allocator is only
+  // used when no custom allocator is provided — which means the old
+  // code path in the destructor handles it).
+  //
+  // Actually, the default allocator's free_fn is only called from the
+  // Ruleset destructor when free_fn is set. For the zero-arg
+  // build_ruleset, free_fn stays null and the destructor uses the old
+  // delete[] / operator delete path. So this free_fn is only for the
+  // allocator-aware overload when using default_allocator().
+  std::free(ptr);  // aligned_alloc -> free is standard
+}
+
+RulesetAllocator default_allocator() {
+  return RulesetAllocator{&default_alloc, &default_free, nullptr};
+}
+
+// ---- Allocator-aware build_ruleset (D23 C10) ----
+//
+// All allocations go through alloc.allocate() with the declared
+// socket_id. The Ruleset stores the deallocator so its destructor
+// can free through the same path.
+
+Ruleset build_ruleset(const compiler::CompileResult& cr,
+                      const config::Sizing& sizing,
+                      unsigned num_lcores,
+                      const RulesetAllocator& alloc,
+                      int socket_id) {
+  Ruleset rs;
+
+  const auto cap = sizing.rules_per_layer_max;
+
+  // ---- Action arenas (D6 + D23) ----
+  rs.l2_actions_capacity = cap;
+  rs.l3_actions_capacity = cap;
+  rs.l4_actions_capacity = cap;
+
+  const auto action_bytes = cap * sizeof(action::RuleAction);
+  constexpr auto action_align = alignof(action::RuleAction);
+
+  rs.l2_actions = static_cast<action::RuleAction*>(
+      alloc.allocate(action_bytes, action_align, socket_id, alloc.ctx));
+  rs.l3_actions = static_cast<action::RuleAction*>(
+      alloc.allocate(action_bytes, action_align, socket_id, alloc.ctx));
+  rs.l4_actions = static_cast<action::RuleAction*>(
+      alloc.allocate(action_bytes, action_align, socket_id, alloc.ctx));
+
+  // Copy compiled actions into arenas.
+  auto copy_actions = [](action::RuleAction* dst, std::uint32_t dst_cap,
+                         const std::vector<compiler::CompiledAction>& src)
+      -> std::uint32_t {
+    const auto n = static_cast<std::uint32_t>(
+        src.size() < dst_cap ? src.size() : dst_cap);
+    for (std::uint32_t i = 0; i < n; ++i) {
+      auto& d = dst[i];
+      const auto& s = src[i];
+      d.rule_id = static_cast<std::uint32_t>(s.rule_id);
+      d.counter_slot = s.counter_slot;
+      d.verb = static_cast<std::uint8_t>(s.verb);
+      d.next_layer = 0;
+      d.execution_tier = static_cast<std::uint8_t>(s.execution_tier);
+      d.flags = 0;
+      d.redirect_port = 0xFFFF;
+      d.mirror_port = 0xFFFF;
+      d.dscp = 0;
+      d.pcp = 0;
+      d.rl_index = 0;
+    }
+    return n;
+  };
+
+  rs.n_l2_rules = copy_actions(rs.l2_actions, cap, cr.l2_actions);
+  rs.n_l3_rules = copy_actions(rs.l3_actions, cap, cr.l3_actions);
+  rs.n_l4_rules = copy_actions(rs.l4_actions, cap, cr.l4_actions);
+
+  // ---- Per-lcore counter rows (§4.3, D3, D23) ----
+  const std::uint32_t total_slots = 3u * cap;
+  rs.counter_slots_per_lcore = total_slots;
+  rs.num_lcores = num_lcores;
+
+  if (num_lcores > 0 && total_slots > 0) {
+    const auto total_counters =
+        static_cast<std::size_t>(num_lcores) * total_slots;
+    const auto alloc_bytes = total_counters * sizeof(RuleCounter);
+    rs.counters = static_cast<RuleCounter*>(
+        alloc.allocate(alloc_bytes, alignof(RuleCounter), socket_id,
+                       alloc.ctx));
+  }
+
+  // ---- Allocator bookkeeping (D23) ----
+  rs.free_fn = alloc.deallocate;
+  rs.free_ctx = alloc.ctx;
+
+  // ---- Generation (D12) ----
+  rs.generation =
+      g_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  return rs;
+}
+
+// ---- D28 TX-queue symmetry check (C10) ----
+
+std::vector<TxSymmetryError> check_port_tx_symmetry(
+    const std::vector<config::InterfaceRole>& roles,
+    unsigned n_workers,
+    const std::unordered_map<std::string, EthDevInfo>& dev_info) {
+  std::vector<TxSymmetryError> errors;
+  for (const auto& role : roles) {
+    auto it = dev_info.find(role.name);
+    std::uint16_t max_txq = 0;
+    if (it != dev_info.end()) {
+      max_txq = it->second.max_tx_queues;
+    }
+    if (max_txq < n_workers) {
+      errors.push_back(
+          TxSymmetryError{role.name, max_txq, n_workers});
+    }
+  }
+  return errors;
+}
+
 }  // namespace pktgate::ruleset

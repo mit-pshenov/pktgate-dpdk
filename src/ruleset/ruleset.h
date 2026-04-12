@@ -1,6 +1,6 @@
 // src/ruleset/ruleset.h
 //
-// M2 C9 — Ruleset struct and counter types.
+// M2 C9+C10 — Ruleset struct and counter types.
 //
 // The Ruleset is the compiled output consumed by the hot path. At M2
 // level it holds action arrays (sized from config), per-lcore counter
@@ -11,9 +11,11 @@
 //   * §4.3 — PerLcoreCounters, RuleCounter (D3)
 //   * D6   — arena sizing from runtime config
 //   * D12  — generation counter
+//   * D23  — NUMA awareness (allocator stored for proper deallocation)
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -90,13 +92,23 @@ struct Ruleset {
   std::uint32_t counter_slots_per_lcore = 0;
   std::uint32_t num_lcores = 0;
 
+  // ---- Allocator bookkeeping (D23, C10) ----
+  //
+  // When a custom allocator was used (build_ruleset with allocator),
+  // these are set so the destructor frees through the same path.
+  // When null, the destructor uses ::operator delete (C9 compat).
+  using FreeFn = void (*)(void* ptr, void* ctx);
+  FreeFn free_fn = nullptr;
+  void* free_ctx = nullptr;
+
   // Get the counter row for a given lcore.
   RuleCounter* counter_row(unsigned lcore_id) const {
     if (!counters || lcore_id >= num_lcores) return nullptr;
     return counters + static_cast<std::size_t>(lcore_id) * counter_slots_per_lcore;
   }
 
-  // Destructor — free owned memory (M2 uses standard allocators).
+  // Destructor — free owned memory. Uses free_fn if set (D23 custom
+  // allocator), otherwise ::operator delete (C9 standard path).
   ~Ruleset();
 
   // Move-only.

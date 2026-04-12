@@ -3,6 +3,7 @@
 // M2 builder-scope tests.
 // C2: U4.8 — struct sizing static_asserts.
 // C9: U4.1, U4.6, U4.17 — arena sizing, counter layout, generation.
+// C10: U4.7, U4.15, U4.16 — NUMA socket propagation, locality, D28.
 //
 // No DPDK. No EAL. Pure C++ unit tests.
 
@@ -10,8 +11,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
@@ -265,6 +270,194 @@ TEST(RulesetBuilder, GenerationMonotonic_U4_17) {
   // Monotonicity: each > previous.
   EXPECT_GT(rs2.generation, rs1.generation);
   EXPECT_GT(rs3.generation, rs2.generation);
+}
+
+// =========================================================================
+// Allocator spy for D23 NUMA tests (C10).
+//
+// Records every allocation with {size, alignment, socket_id, ptr}.
+// Uses std::aligned_alloc under the hood — no DPDK dependency.
+// =========================================================================
+
+struct AllocRecord {
+  std::size_t size;
+  std::size_t alignment;
+  int socket_id;
+  void* ptr;
+};
+
+struct AllocSpy {
+  std::vector<AllocRecord> records;
+  std::vector<void*> allocated;  // for cleanup
+
+  static void* alloc_fn(std::size_t size, std::size_t alignment,
+                         int socket_id, void* ctx) {
+    auto* spy = static_cast<AllocSpy*>(ctx);
+    // std::aligned_alloc requires size to be a multiple of alignment.
+    std::size_t alloc_size = size;
+    if (alloc_size % alignment != 0) {
+      alloc_size += alignment - (alloc_size % alignment);
+    }
+    void* ptr = std::aligned_alloc(alignment, alloc_size);
+    if (ptr) {
+      std::memset(ptr, 0, alloc_size);
+      spy->records.push_back({size, alignment, socket_id, ptr});
+      spy->allocated.push_back(ptr);
+    }
+    return ptr;
+  }
+
+  static void free_fn(void* ptr, void* /*ctx*/) {
+    // The spy tracks allocations; free individually.
+    std::free(ptr);
+  }
+
+  RulesetAllocator make_allocator() {
+    return RulesetAllocator{&AllocSpy::alloc_fn, &AllocSpy::free_fn, this};
+  }
+};
+
+// =========================================================================
+// U4.7 NUMA socket_id propagation (D23)
+//
+// Builder invoked with socket_id=1 allocates ALL Ruleset arrays on
+// socket 1. Verified via allocator spy that records each call's
+// socket_id. Covers D23.
+// =========================================================================
+TEST(RulesetBuilder, NumaSocketPropagation_U4_7) {
+  Config cfg = make_config();
+  cfg.sizing.rules_per_layer_max = 64;
+
+  auto& r = append_rule(cfg.pipeline.layer_4, 700, ActionAllow{});
+  r.proto = 6;
+  r.dst_port = 80;
+
+  auto cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile must succeed";
+
+  constexpr unsigned kNumLcores = 2;
+  constexpr int kTargetSocket = 1;
+
+  AllocSpy spy;
+  auto alloc = spy.make_allocator();
+  auto rs = build_ruleset(cr, cfg.sizing, kNumLcores, alloc, kTargetSocket);
+
+  // Must have recorded at least 4 allocations (l2, l3, l4 actions + counters).
+  ASSERT_GE(spy.records.size(), 4u)
+      << "Expected at least 4 allocations (3 action arenas + counters)";
+
+  // Every allocation must carry the declared socket_id.
+  for (std::size_t i = 0; i < spy.records.size(); ++i) {
+    EXPECT_EQ(spy.records[i].socket_id, kTargetSocket)
+        << "Allocation " << i << " (size=" << spy.records[i].size
+        << ") used wrong socket_id: " << spy.records[i].socket_id
+        << " (expected " << kTargetSocket << ")";
+  }
+}
+
+// =========================================================================
+// U4.15 Ruleset NUMA locality — every major pointer on expected socket
+//
+// After build, every major arena pointer in the Ruleset is on the
+// declared socket. Verified via allocator spy: each pointer in the
+// Ruleset matches one of the spy's recorded allocations, all of which
+// carry the declared socket_id. Covers D23.
+// =========================================================================
+TEST(RulesetBuilder, NumaLocality_U4_15) {
+  Config cfg = make_config();
+  cfg.sizing.rules_per_layer_max = 128;
+
+  auto& r2 = append_rule(cfg.pipeline.layer_2, 800, ActionAllow{});
+  r2.src_mac = Mac{{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}};
+
+  append_rule(cfg.pipeline.layer_3, 801, ActionDrop{});
+
+  auto& r4 = append_rule(cfg.pipeline.layer_4, 802, ActionAllow{});
+  r4.proto = 17;
+  r4.dst_port = 53;
+
+  auto cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile must succeed";
+
+  constexpr unsigned kNumLcores = 4;
+  constexpr int kTargetSocket = 1;
+
+  AllocSpy spy;
+  auto alloc = spy.make_allocator();
+  auto rs = build_ruleset(cr, cfg.sizing, kNumLcores, alloc, kTargetSocket);
+
+  // Collect all recorded pointers into a set for lookup.
+  auto ptr_on_socket = [&](void* p) -> bool {
+    for (const auto& rec : spy.records) {
+      if (rec.ptr == p) {
+        return rec.socket_id == kTargetSocket;
+      }
+    }
+    return false;  // not found in spy — not allocated through it
+  };
+
+  // Every major arena pointer must be in the spy's records, on the
+  // correct socket.
+  EXPECT_NE(rs.l2_actions, nullptr);
+  EXPECT_TRUE(ptr_on_socket(rs.l2_actions))
+      << "l2_actions not allocated on socket " << kTargetSocket;
+
+  EXPECT_NE(rs.l3_actions, nullptr);
+  EXPECT_TRUE(ptr_on_socket(rs.l3_actions))
+      << "l3_actions not allocated on socket " << kTargetSocket;
+
+  EXPECT_NE(rs.l4_actions, nullptr);
+  EXPECT_TRUE(ptr_on_socket(rs.l4_actions))
+      << "l4_actions not allocated on socket " << kTargetSocket;
+
+  EXPECT_NE(rs.counters, nullptr);
+  EXPECT_TRUE(ptr_on_socket(rs.counters))
+      << "counters not allocated on socket " << kTargetSocket;
+}
+
+// =========================================================================
+// U4.16 Port TX-queue symmetry pre-check (D28)
+//
+// check_port_tx_symmetry(roles, n_workers, dev_info_mock) rejects any
+// role whose mocked max_tx_queues < n_workers. Pure C++ with fake
+// EthDevInfo struct (no EAL). Covers D28.
+// =========================================================================
+TEST(RulesetBuilder, TxQueueSymmetry_U4_16) {
+  // Two roles: upstream and downstream.
+  std::vector<InterfaceRole> roles = {
+      InterfaceRole{"upstream_port", PciSelector{"0000:00:03.0"}},
+      InterfaceRole{"downstream_port", PciSelector{"0000:00:04.0"}},
+  };
+
+  // Mock dev info — upstream has enough queues, downstream does not.
+  std::unordered_map<std::string, EthDevInfo> dev_info;
+  dev_info["upstream_port"] = EthDevInfo{.max_tx_queues = 8};
+  dev_info["downstream_port"] = EthDevInfo{.max_tx_queues = 2};
+
+  constexpr unsigned kWorkers = 4;
+
+  // With 4 workers, downstream (max=2) must fail.
+  auto errors = check_port_tx_symmetry(roles, kWorkers, dev_info);
+  ASSERT_EQ(errors.size(), 1u)
+      << "Expected exactly 1 error (downstream_port)";
+  EXPECT_EQ(errors[0].role_name, "downstream_port");
+  EXPECT_EQ(errors[0].max_tx_queues, 2u);
+  EXPECT_EQ(errors[0].n_workers, kWorkers);
+
+  // With 2 workers, both pass.
+  auto errors2 = check_port_tx_symmetry(roles, 2, dev_info);
+  EXPECT_TRUE(errors2.empty())
+      << "Both ports have >=2 TX queues; expected no errors";
+
+  // Missing role in dev_info map — should report as error (0 queues).
+  std::vector<InterfaceRole> roles3 = {
+      InterfaceRole{"mirror_port", PciSelector{"0000:00:05.0"}},
+  };
+  auto errors3 = check_port_tx_symmetry(roles3, 1, dev_info);
+  ASSERT_EQ(errors3.size(), 1u)
+      << "Missing port in dev_info map must be an error";
+  EXPECT_EQ(errors3[0].role_name, "mirror_port");
+  EXPECT_EQ(errors3[0].max_tx_queues, 0u);
 }
 
 }  // namespace
