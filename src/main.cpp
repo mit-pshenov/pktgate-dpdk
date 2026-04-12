@@ -29,6 +29,7 @@
 #include "src/config/validator.h"
 #include "src/ctl/bootstrap.h"
 #include "src/dataplane/worker.h"
+#include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
 #include "src/ruleset/builder.h"
 #include "src/ruleset/ruleset.h"
@@ -143,6 +144,16 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   log_json("{\"event\":\"eal_init_ok\"}");
+
+  // Register mbuf dynfield (§5.1). Must happen before any worker starts.
+  int dyn_offset = pktgate::eal::register_dynfield();
+  if (dyn_offset < 0) {
+    log_json("{\"error\":\"dynfield registration failed\"}");
+    rte_eal_cleanup();
+    return 1;
+  }
+  log_json("{\"event\":\"dynfield_registered\",\"offset\":" +
+           std::to_string(dyn_offset) + "}");
 
   // Install signal handlers AFTER EAL init (EAL may install its own).
   pktgate::ctl::install_signal_handlers();

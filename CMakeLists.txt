@@ -146,6 +146,7 @@ pktgate_apply_sanitizer(pktgate_core)
 if(NOT PKTGATE_FUZZ)
   add_library(pktgate_dp STATIC
     src/eal/port_init.cpp
+    src/eal/dynfield.cpp
     src/dataplane/worker.cpp
     src/ctl/bootstrap.cpp
   )

@@ -52,3 +52,12 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_core
 )
+
+# M3 C4: EAL-needing unit tests. Separate binary because EAL can only
+# be initialized once per process. Links pktgate_dp (which includes DPDK).
+pktgate_add_test(
+  NAME    unit.test_eal_unit
+  SOURCES test_eal_unit.cpp
+  LABELS  "unit;needs-eal"
+  LINK    pktgate_dp
+)
