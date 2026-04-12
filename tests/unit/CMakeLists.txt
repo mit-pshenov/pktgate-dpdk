@@ -31,3 +31,10 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_core
 )
+
+pktgate_add_test(
+  NAME    unit.test_budget_corners
+  SOURCES test_budget_corners.cpp
+  LABELS  unit corner
+  LINK    pktgate_core
+)
