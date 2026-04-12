@@ -73,15 +73,20 @@ int main(int argc, char* argv[]) {
   // to extract --config before that happens. Everything after -- is
   // passed to EAL.
   std::string config_path;
+  unsigned requested_workers = 0;  // 0 = auto-detect from available lcores
   int eal_argc = 0;
   std::vector<char*> eal_argv;
 
-  // Scan for --config <path> and build EAL argv from the rest.
-  // Convention: --config is our flag; everything else goes to EAL.
+  // Scan for --config and --workers in argv. Everything else goes to EAL.
   for (int i = 0; i < argc; ++i) {
     if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
       config_path = argv[i + 1];
-      ++i;  // skip value
+      ++i;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+      requested_workers = static_cast<unsigned>(std::atoi(argv[i + 1]));
+      ++i;
       continue;
     }
     eal_argv.push_back(argv[i]);
@@ -145,8 +150,23 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  // Determine worker count: from --workers or auto-detect from available lcores.
+  unsigned n_workers_u;
+  if (requested_workers > 0) {
+    n_workers_u = requested_workers;
+  } else {
+    // Count available worker lcores.
+    n_workers_u = 0;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+    unsigned lid;
+    RTE_LCORE_FOREACH_WORKER(lid) { ++n_workers_u; }
+#pragma GCC diagnostic pop
+    if (n_workers_u == 0) n_workers_u = 1;  // fallback to main-thread worker
+  }
+  auto n_workers = static_cast<std::uint16_t>(n_workers_u);
+
   // D23: NUMA-aware mempool. For dev VM (single NUMA node), socket 0.
-  std::uint16_t n_workers = 1;  // M3: single worker
   unsigned socket_id = rte_socket_id();
 
   // mbuf count: enough for all RX/TX descriptors + burst headroom.
@@ -185,12 +205,27 @@ int main(int argc, char* argv[]) {
 #pragma GCC diagnostic pop
   }
 
+  // D28: TX-queue symmetry pre-check. Every port must support
+  // at least n_workers TX queues before we configure anything.
+  for (auto port_id : port_ids) {
+    auto sym = pktgate::eal::check_tx_symmetry(port_id, n_workers_u);
+    if (!sym.ok) {
+      log_json("{\"error\":\"tx_queue_symmetry\",\"reason\":\"" +
+               sym.error + "\",\"port\":" + std::to_string(port_id) +
+               ",\"max_tx_queues\":" + std::to_string(sym.max_tx_queues) +
+               ",\"n_workers\":" + std::to_string(n_workers_u) + "}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+  }
+
   for (auto port_id : port_ids) {
     auto result = pktgate::eal::port_init(port_id, n_workers, n_workers, mp);
     if (!result.ok) {
-      log_json(("{\"error\":\"port_init_failed\",\"port\":" +
-                std::to_string(port_id) + ",\"reason\":\"" +
-                result.error + "\"}").c_str());
+      log_json("{\"error\":\"port_init_failed\",\"port\":" +
+               std::to_string(port_id) + ",\"reason\":\"" +
+               result.error + "\"}");
       rte_mempool_free(mp);
       rte_eal_cleanup();
       return 1;

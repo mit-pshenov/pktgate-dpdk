@@ -29,3 +29,13 @@ set_tests_properties(functional.test_boot PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 30
 )
+
+add_test(
+  NAME functional.test_d28_tx_symmetry
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_d28_tx_symmetry.py"
+)
+set_tests_properties(functional.test_d28_tx_symmetry PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 30
+)

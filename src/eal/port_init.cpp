@@ -74,4 +74,25 @@ void port_stop(std::uint16_t port_id) {
   rte_eth_dev_close(port_id);
 }
 
+TxSymmetryCheckResult check_tx_symmetry(std::uint16_t port_id,
+                                        unsigned n_workers) {
+  struct rte_eth_dev_info dev_info;
+  int ret = rte_eth_dev_info_get(port_id, &dev_info);
+  if (ret != 0) {
+    return {false,
+            "rte_eth_dev_info_get failed for port " + std::to_string(port_id),
+            port_id, 0};
+  }
+
+  if (dev_info.max_tx_queues < n_workers) {
+    return {false,
+            "D28 violation: port=" + std::to_string(port_id) +
+            " max_tx_queues=" + std::to_string(dev_info.max_tx_queues) +
+            " < n_workers=" + std::to_string(n_workers),
+            port_id, dev_info.max_tx_queues};
+  }
+
+  return {true, {}, port_id, dev_info.max_tx_queues};
+}
+
 }  // namespace pktgate::eal

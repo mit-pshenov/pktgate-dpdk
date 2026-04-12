@@ -52,4 +52,24 @@ PortResolveResult resolve_port_by_name(const std::string& name);
 // Stop and close a port. Called during shutdown (§6.4).
 void port_stop(std::uint16_t port_id);
 
+// -------------------------------------------------------------------------
+// D28 — TX-queue symmetry pre-check.
+//
+// Every port must have max_tx_queues >= n_workers. This is checked at
+// startup time before port_init() configures queues. If any port
+// violates the invariant, the binary exits with a clear error.
+
+struct TxSymmetryCheckResult {
+  bool ok = false;
+  std::string error;            // human-readable: port, max_tx_queues, n_workers
+  std::uint16_t port_id = 0;   // offending port (if !ok)
+  std::uint16_t max_tx_queues = 0;
+};
+
+// Check that port `port_id` has at least `n_workers` TX queues.
+// Returns ok=true if the port can support n_workers, or ok=false
+// with a descriptive error.
+TxSymmetryCheckResult check_tx_symmetry(std::uint16_t port_id,
+                                        unsigned n_workers);
+
 }  // namespace pktgate::eal
