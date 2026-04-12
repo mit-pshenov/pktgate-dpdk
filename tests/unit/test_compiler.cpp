@@ -4,9 +4,10 @@
 // C1: U3.1, U3.2, U3.3, U3.4 — object expansion + rule expansion.
 // C2: U3.5, U3.6 — struct sizing static_asserts.
 // C3: U3.7, U3.8, U3.25 — L2 compound construction.
+// C4: U3.9, U3.10, U3.11, U3.24 — L4 compound construction.
 //
 // These test the compiler's object expansion, rule expansion, and
-// L2 compound construction mechanics. The compiler takes a
+// L2/L4 compound construction mechanics. The compiler takes a
 // parsed+validated Config and produces compiled structures.
 //
 // No DPDK. No EAL. Pure C++ unit tests.
@@ -455,6 +456,168 @@ TEST(PortListDedup, DuplicatePortsDeduped_U3_25) {
   // Both share the same action
   EXPECT_EQ(result.l4_entries[0].action_index,
             result.l4_entries[1].action_index);
+}
+
+// =========================================================================
+// C4 — L4 compound construction
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U3.9 L4 compound — proto+dport primary
+//
+// Rule {proto: tcp, dst_port: 443} becomes an entry in l4_proto_dport
+// keyed (tcp<<16 | 443); filter_mask has no bits set. Covers D15.
+// -------------------------------------------------------------------------
+TEST(L4CompoundConstruction, ProtoDportPrimary_U3_9) {
+  Config cfg = make_config();
+
+  // TCP = 6, dst_port = 443
+  auto& rule = append_rule(cfg.pipeline.layer_4, 4001, ActionAllow{});
+  rule.proto = 6;       // TCP
+  rule.dst_port = 443;
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+  ASSERT_TRUE(l4out.collisions.empty());
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary must be kProtoDport
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+
+  // Key = (proto << 16) | dport = (6 << 16) | 443
+  const std::uint32_t expected_key = (6u << 16) | 443u;
+  EXPECT_EQ(cr.primary_key, expected_key);
+
+  // filter_mask: no secondary constraints → 0
+  EXPECT_EQ(cr.entry.filter_mask, 0u)
+      << "No secondary constraints — filter_mask must be zero";
+
+  // action_idx must point at the right action
+  EXPECT_EQ(cr.entry.action_idx, 0u);
+}
+
+// -------------------------------------------------------------------------
+// U3.10 L4 compound — proto+dport+sport has SRC_PORT bit
+//
+// With src_port also constrained, the SRC_PORT bit is set in
+// L4CompoundEntry.filter_mask and want_src_port is populated.
+// Covers D15.
+// -------------------------------------------------------------------------
+TEST(L4CompoundConstruction, ProtoDportSportSrcPortBit_U3_10) {
+  Config cfg = make_config();
+
+  // TCP = 6, dst_port = 443, src_port = 12345
+  auto& rule = append_rule(cfg.pipeline.layer_4, 4002, ActionDrop{});
+  rule.proto = 6;         // TCP
+  rule.dst_port = 443;
+  rule.src_port = 12345;
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary must be kProtoDport
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoDport);
+  const std::uint32_t expected_key = (6u << 16) | 443u;
+  EXPECT_EQ(cr.primary_key, expected_key);
+
+  // filter_mask: SRC_PORT bit set
+  EXPECT_TRUE(cr.entry.filter_mask & l4_mask::kSrcPort)
+      << "SRC_PORT bit must be set when src_port is constrained";
+
+  // want_src_port must hold the constrained value
+  EXPECT_EQ(cr.entry.want_src_port, 12345u);
+
+  // No TCP_FLAGS or VRF bits
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kTcpFlags);
+  EXPECT_FALSE(cr.entry.filter_mask & l4_mask::kVrf);
+}
+
+// -------------------------------------------------------------------------
+// U3.11 L4 compound — proto only goes to l4_proto_only
+//
+// Rule {proto: icmp} with no port constraint lands in l4_proto_only
+// hash, not the dport/sport tables. Covers D15.
+// -------------------------------------------------------------------------
+TEST(L4CompoundConstruction, ProtoOnlyTable_U3_11) {
+  Config cfg = make_config();
+
+  // ICMP = 1, no port constraint
+  auto& rule = append_rule(cfg.pipeline.layer_4, 4003, ActionAllow{});
+  rule.proto = 1;  // ICMP
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+  ASSERT_EQ(l4out.rules.size(), 1u);
+
+  const auto& cr = l4out.rules[0];
+
+  // Primary must be kProtoOnly
+  EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoOnly);
+
+  // Key = proto (just the protocol number)
+  EXPECT_EQ(cr.primary_key, 1u);
+
+  // filter_mask: no secondary constraints → 0
+  EXPECT_EQ(cr.entry.filter_mask, 0u)
+      << "Proto-only rule has no secondary constraints";
+}
+
+// -------------------------------------------------------------------------
+// U3.24 Collision detection — L4 compound identical keys
+//
+// Two L4 rules with identical primary key AND identical filter_mask
+// content are reported as a collision (dead rule). Covers D15,
+// compiler correctness.
+// -------------------------------------------------------------------------
+TEST(L4CompoundConstruction, CollisionDetection_U3_24) {
+  Config cfg = make_config();
+
+  // Rule 1: TCP/443, no secondary constraints
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 4010, ActionAllow{});
+  r1.proto = 6;
+  r1.dst_port = 443;
+
+  // Rule 2: TCP/443, identical — dead rule
+  auto& r2 = append_rule(cfg.pipeline.layer_4, 4011, ActionDrop{});
+  r2.proto = 6;
+  r2.dst_port = 443;
+
+  auto result = compile(cfg);
+  auto l4out = compile_l4_rules(cfg.pipeline.layer_4, result.l4_actions);
+
+  // Both rules still produce entries (the compiler doesn't remove them)
+  EXPECT_EQ(l4out.rules.size(), 2u);
+
+  // But there must be exactly one collision reported
+  ASSERT_EQ(l4out.collisions.size(), 1u);
+  EXPECT_EQ(l4out.collisions[0].rule_index_first, 0u);
+  EXPECT_EQ(l4out.collisions[0].rule_index_second, 1u);
+
+  // Now test that different filter_mask content is NOT a collision:
+  // Rule A: TCP/80 with src_port=1234
+  // Rule B: TCP/80 without src_port
+  // These have the same primary key but different filter_mask → not a collision.
+  Config cfg2 = make_config();
+  auto& ra = append_rule(cfg2.pipeline.layer_4, 4020, ActionAllow{});
+  ra.proto = 6;
+  ra.dst_port = 80;
+  ra.src_port = 1234;
+
+  auto& rb = append_rule(cfg2.pipeline.layer_4, 4021, ActionDrop{});
+  rb.proto = 6;
+  rb.dst_port = 80;
+
+  auto result2 = compile(cfg2);
+  auto l4out2 = compile_l4_rules(cfg2.pipeline.layer_4, result2.l4_actions);
+
+  EXPECT_EQ(l4out2.rules.size(), 2u);
+  EXPECT_TRUE(l4out2.collisions.empty())
+      << "Different filter_mask should NOT be reported as collision";
 }
 
 }  // namespace

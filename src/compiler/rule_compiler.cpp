@@ -1,21 +1,30 @@
 // src/compiler/rule_compiler.cpp
 //
-// M2 C3 — L2 compound construction.
+// M2 C3-C4 — L2/L4 compound construction.
 //
-// Implements compile_l2_rules(): for each L2 rule, determine the
-// most-selective constrained field as primary hash key (§5.2
-// selectivity order: src_mac > dst_mac > vlan > ethertype > pcp),
-// and build an L2CompoundEntry with filter_mask bits for secondary
-// constraints and populated want_* fields.
+// Implements compile_l2_rules() and compile_l4_rules().
+//
+// L2: for each L2 rule, determine the most-selective constrained field
+// as primary hash key (§5.2 selectivity order: src_mac > dst_mac >
+// vlan > ethertype > pcp), and build an L2CompoundEntry with
+// filter_mask bits for secondary constraints.
+//
+// L4: for each L4 rule, determine whether proto+dport or proto-only
+// is the primary key (§5.4), build L4CompoundEntry with filter_mask
+// bits for secondary constraints (SRC_PORT, TCP_FLAGS).
 //
 // Design anchors:
 //   * D15 — compound primary + filter_mask pattern
 //   * §5.2 — L2 selectivity order
-//   * §4.1 — L2CompoundEntry layout
+//   * §5.4 — L4 compound matching
+//   * §4.1 — L2CompoundEntry, L4CompoundEntry layouts
+//   * D29 — ICMP type→dport, code→sport unification
 
 #include "src/compiler/rule_compiler.h"
 
 #include <cstring>
+#include <tuple>
+#include <unordered_map>
 
 namespace pktgate::compiler {
 
@@ -116,6 +125,115 @@ std::vector<L2CompiledRule> compile_l2_rules(
   }
 
   return result;
+}
+
+// -------------------------------------------------------------------------
+// compile_l4_rules — L4 compound construction (C4).
+
+L4CompileOutput compile_l4_rules(
+    const std::vector<config::Rule>& rules,
+    const std::vector<CompiledAction>& /*actions*/) {
+  L4CompileOutput output;
+  output.rules.reserve(rules.size());
+
+  // Collision detection key: (primary_kind, primary_key, filter_mask,
+  // want_src_port, tcp_flags_want, tcp_flags_mask).
+  // Two entries with identical key are a collision (dead rule).
+  // We use a map from (primary_kind, primary_key) to a vector of
+  // (rule_index, filter_mask content) pairs for comparison.
+  struct FilterContent {
+    std::uint8_t filter_mask;
+    std::uint16_t want_src_port;
+    std::uint8_t tcp_flags_want;
+    std::uint8_t tcp_flags_mask;
+  };
+
+  // Key: (primary_kind, primary_key)
+  struct PairHash {
+    std::size_t operator()(const std::pair<std::uint8_t, std::uint32_t>& p) const {
+      return std::hash<std::uint64_t>{}(
+          (static_cast<std::uint64_t>(p.first) << 32) | p.second);
+    }
+  };
+
+  std::unordered_map<
+      std::pair<std::uint8_t, std::uint32_t>,
+      std::vector<std::pair<std::size_t, FilterContent>>,
+      PairHash>
+      seen;
+
+  for (std::size_t ri = 0; ri < rules.size(); ++ri) {
+    const auto& rule = rules[ri];
+
+    const bool has_proto = (rule.proto >= 0);
+    const bool has_dport = (rule.dst_port >= 0);
+    const bool has_sport = (rule.src_port >= 0);
+    const bool has_tcp_flags = rule.tcp_flags.has_value();
+
+    // Determine primary kind and key.
+    L4PrimaryKind primary;
+    std::uint32_t primary_key;
+
+    if (has_proto && has_dport) {
+      primary = L4PrimaryKind::kProtoDport;
+      primary_key =
+          (static_cast<std::uint32_t>(rule.proto) << 16) |
+          static_cast<std::uint32_t>(rule.dst_port & 0xFFFF);
+    } else if (has_proto) {
+      primary = L4PrimaryKind::kProtoOnly;
+      primary_key = static_cast<std::uint32_t>(rule.proto);
+    } else {
+      // No proto — degenerate. Still emit as proto-only with key 0.
+      primary = L4PrimaryKind::kProtoOnly;
+      primary_key = 0;
+    }
+
+    // Build filter_mask: set bits for secondary constraints.
+    std::uint8_t mask = 0;
+    if (has_sport) mask |= l4_mask::kSrcPort;
+    if (has_tcp_flags) mask |= l4_mask::kTcpFlags;
+
+    // Build the L4CompoundEntry.
+    pktgate::ruleset::L4CompoundEntry entry{};
+    entry.filter_mask = mask;
+    entry.want_src_port = has_sport
+        ? static_cast<std::uint16_t>(rule.src_port & 0xFFFF)
+        : 0;
+    entry.tcp_flags_want = has_tcp_flags ? rule.tcp_flags->want : 0;
+    entry.tcp_flags_mask = has_tcp_flags ? rule.tcp_flags->mask : 0;
+    entry._pad = 0;
+    entry.action_idx = static_cast<std::uint16_t>(ri);
+    entry._pad2 = 0;
+
+    // Collision detection.
+    auto map_key = std::make_pair(
+        static_cast<std::uint8_t>(primary), primary_key);
+    FilterContent fc{mask, entry.want_src_port,
+                     entry.tcp_flags_want, entry.tcp_flags_mask};
+
+    auto& bucket = seen[map_key];
+    for (const auto& [prev_ri, prev_fc] : bucket) {
+      if (prev_fc.filter_mask == fc.filter_mask &&
+          prev_fc.want_src_port == fc.want_src_port &&
+          prev_fc.tcp_flags_want == fc.tcp_flags_want &&
+          prev_fc.tcp_flags_mask == fc.tcp_flags_mask) {
+        CompileCollision col;
+        col.rule_index_first = prev_ri;
+        col.rule_index_second = ri;
+        col.description = "L4 compound collision: identical primary key + filter_mask";
+        output.collisions.push_back(std::move(col));
+      }
+    }
+    bucket.push_back({ri, fc});
+
+    L4CompiledRule compiled;
+    compiled.primary_kind = primary;
+    compiled.primary_key = primary_key;
+    compiled.entry = entry;
+    output.rules.push_back(compiled);
+  }
+
+  return output;
 }
 
 }  // namespace pktgate::compiler

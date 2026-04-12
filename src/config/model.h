@@ -192,6 +192,8 @@ struct Rule {
   std::int32_t id = -1;                  // U1.24 required, positive integer
   std::int32_t dst_port = -1;            // U1.17 range 0..65535, -1 = unset
   std::vector<std::int32_t> dst_ports;   // U1.20 port list
+  std::int32_t src_port = -1;            // M2 C4: range 0..65535, -1 = unset
+  std::int32_t proto = -1;               // M2 C4: L4 protocol number 0..255, -1 = unset
   std::int32_t vlan_id = -1;             // U1.18 range 0..4095, -1 = unset
   std::int32_t pcp = -1;                 // U1.19 range 0..7, -1 = unset
   bool hw_offload_hint = false;          // U1.23 D4
