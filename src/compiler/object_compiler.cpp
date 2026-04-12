@@ -13,6 +13,7 @@
 
 #include "src/compiler/object_compiler.h"
 
+#include <unordered_set>
 #include <variant>
 
 namespace pktgate::compiler {
@@ -106,9 +107,12 @@ CompileResult compile(const config::Config& cfg) {
               static_cast<std::uint32_t>(actions.size());
           actions.push_back(action);
 
-          // Port-list expansion (U3.2, U3.3)
+          // Port-list expansion (U3.2, U3.3) with dedup (U3.25).
+          // Dedup preserves declaration order of first occurrence.
           if (!rule.dst_ports.empty()) {
+            std::unordered_set<std::int32_t> seen;
             for (const auto port : rule.dst_ports) {
+              if (!seen.insert(port).second) continue;  // duplicate
               CompiledRuleEntry entry;
               entry.action_index = action_idx;
               entry.dst_port = port;

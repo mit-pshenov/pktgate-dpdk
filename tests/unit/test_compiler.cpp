@@ -1,11 +1,13 @@
 // tests/unit/test_compiler.cpp
 //
-// M2 C1 — compiler scaffold + object compiler.
-// RED tests: U3.1, U3.2, U3.3, U3.4.
+// M2 compiler tests.
+// C1: U3.1, U3.2, U3.3, U3.4 — object expansion + rule expansion.
+// C2: U3.5, U3.6 — struct sizing static_asserts.
+// C3: U3.7, U3.8, U3.25 — L2 compound construction.
 //
-// These test the compiler's object expansion and rule expansion
-// mechanics. The compiler takes a parsed+validated Config and
-// produces compiled structures.
+// These test the compiler's object expansion, rule expansion, and
+// L2 compound construction mechanics. The compiler takes a
+// parsed+validated Config and produces compiled structures.
 //
 // No DPDK. No EAL. Pure C++ unit tests.
 
@@ -19,6 +21,7 @@
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
 #include "src/compiler/object_compiler.h"
+#include "src/compiler/rule_compiler.h"
 #include "src/config/addr.h"
 #include "src/config/model.h"
 #include "src/config/sizing.h"
@@ -260,6 +263,198 @@ TEST(CompilerStructSizing, L2CompoundEntrySize_U3_6) {
   static_assert(sizeof(pktgate::ruleset::L2CompoundEntry) == 16,
                 "L2CompoundEntry layout drift — expected 16 B");
   SUCCEED() << "L2CompoundEntry is 16 B — §4.1 invariant holds";
+}
+
+// =========================================================================
+// C3 — L2 compound construction
+// =========================================================================
+
+// Helper: pack a Mac into a uint64_t the same way the runtime does
+// (first 6 bytes of a uint64_t in memory order, upper 2 bytes zero).
+static std::uint64_t mac_to_u64(const Mac& m) {
+  std::uint64_t v = 0;
+  auto* p = reinterpret_cast<std::uint8_t*>(&v);
+  for (std::size_t i = 0; i < 6; ++i) p[i] = m.bytes[i];
+  return v;
+}
+
+// -------------------------------------------------------------------------
+// U3.7 L2 compound construction — src_mac primary
+//
+// A rule with src_mac constraint becomes an entry with primary kind
+// kSrcMac, and the filter_mask reflects any secondary constraints
+// (vlan/ethertype/dst_mac/pcp). Covers D15, F1.
+// -------------------------------------------------------------------------
+TEST(L2CompoundConstruction, SrcMacPrimary_U3_7) {
+  Config cfg = make_config();
+
+  // Rule: src_mac + vlan_id + ethertype
+  auto& rule = append_rule(cfg.pipeline.layer_2, 2001, ActionAllow{});
+  Mac src{};
+  src.bytes = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01};
+  rule.src_mac = src;
+  rule.vlan_id = 100;
+  rule.ethertype = 0x0800;
+
+  auto result = compile(cfg);
+
+  // compile_l2_rules takes the L2 rules and their compiled actions
+  auto l2 = compile_l2_rules(cfg.pipeline.layer_2, result.l2_actions);
+  ASSERT_EQ(l2.size(), 1u);
+
+  // Primary must be src_mac (most selective constrained field)
+  EXPECT_EQ(l2[0].primary_kind, L2PrimaryKind::kSrcMac);
+  EXPECT_EQ(l2[0].primary_key, mac_to_u64(src));
+
+  // filter_mask must have VLAN + ETHERTYPE bits set (secondary constraints)
+  // but NOT SRC_MAC (that's the primary)
+  EXPECT_TRUE(l2[0].entry.filter_mask & l2_mask::kVlan)
+      << "VLAN bit must be set (secondary constraint)";
+  EXPECT_TRUE(l2[0].entry.filter_mask & l2_mask::kEthertype)
+      << "ETHERTYPE bit must be set (secondary constraint)";
+  EXPECT_FALSE(l2[0].entry.filter_mask & l2_mask::kSrcMac)
+      << "SRC_MAC bit must NOT be set (it's the primary)";
+  EXPECT_FALSE(l2[0].entry.filter_mask & l2_mask::kDstMac)
+      << "DST_MAC bit must NOT be set (not constrained)";
+  EXPECT_FALSE(l2[0].entry.filter_mask & l2_mask::kPcp)
+      << "PCP bit must NOT be set (not constrained)";
+
+  // Secondary want_* values must be populated
+  EXPECT_EQ(l2[0].entry.want_vlan, 100);
+  EXPECT_EQ(l2[0].entry.want_ethertype, 0x0800);
+
+  // action_idx must point at the right action
+  EXPECT_EQ(l2[0].entry.action_idx, 0);
+}
+
+// -------------------------------------------------------------------------
+// U3.8 L2 compound — src+dst+vlan selectivity ordering
+//
+// When a rule constrains src_mac, dst_mac, vlan, and ethertype, the
+// compiler picks src_mac as primary (per §5.2 selectivity order) and
+// puts the rest in the filter_mask bitmap. Covers D15, §5.2.
+// -------------------------------------------------------------------------
+TEST(L2CompoundConstruction, SelectivityOrdering_U3_8) {
+  Config cfg = make_config();
+
+  // Rule: src_mac + dst_mac + vlan_id + ethertype (all four constrained)
+  auto& rule = append_rule(cfg.pipeline.layer_2, 2002, ActionDrop{});
+  Mac src{};
+  src.bytes = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+  Mac dst{};
+  dst.bytes = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+  rule.src_mac = src;
+  rule.dst_mac = dst;
+  rule.vlan_id = 200;
+  rule.ethertype = 0x86DD;
+
+  auto result = compile(cfg);
+  auto l2 = compile_l2_rules(cfg.pipeline.layer_2, result.l2_actions);
+  ASSERT_EQ(l2.size(), 1u);
+
+  // Primary must be src_mac (highest selectivity)
+  EXPECT_EQ(l2[0].primary_kind, L2PrimaryKind::kSrcMac);
+  EXPECT_EQ(l2[0].primary_key, mac_to_u64(src));
+
+  // filter_mask must have DST_MAC + VLAN + ETHERTYPE
+  EXPECT_TRUE(l2[0].entry.filter_mask & l2_mask::kDstMac);
+  EXPECT_TRUE(l2[0].entry.filter_mask & l2_mask::kVlan);
+  EXPECT_TRUE(l2[0].entry.filter_mask & l2_mask::kEthertype);
+  EXPECT_FALSE(l2[0].entry.filter_mask & l2_mask::kSrcMac)
+      << "SRC_MAC must NOT be in filter_mask (it's the primary)";
+  EXPECT_FALSE(l2[0].entry.filter_mask & l2_mask::kPcp)
+      << "PCP not constrained";
+
+  // want_mac must hold the dst_mac (the "other" MAC, per §4.1)
+  for (std::size_t i = 0; i < 6; ++i) {
+    EXPECT_EQ(l2[0].entry.want_mac[i], dst.bytes[i])
+        << "want_mac[" << i << "] mismatch";
+  }
+  EXPECT_EQ(l2[0].entry.want_vlan, 200);
+  EXPECT_EQ(l2[0].entry.want_ethertype, 0x86DD);
+
+  // Also verify: a rule with ONLY dst_mac (no src_mac) picks dst_mac
+  // as primary, and a rule with ONLY vlan picks vlan, etc.
+  Config cfg2 = make_config();
+  auto& r2 = append_rule(cfg2.pipeline.layer_2, 2003, ActionAllow{});
+  r2.dst_mac = dst;
+  r2.vlan_id = 300;
+
+  auto result2 = compile(cfg2);
+  auto l2b = compile_l2_rules(cfg2.pipeline.layer_2, result2.l2_actions);
+  ASSERT_EQ(l2b.size(), 1u);
+  EXPECT_EQ(l2b[0].primary_kind, L2PrimaryKind::kDstMac)
+      << "Without src_mac, dst_mac should be primary";
+  EXPECT_EQ(l2b[0].primary_key, mac_to_u64(dst));
+  EXPECT_TRUE(l2b[0].entry.filter_mask & l2_mask::kVlan);
+  EXPECT_FALSE(l2b[0].entry.filter_mask & l2_mask::kDstMac)
+      << "DST_MAC is primary, must not be in filter_mask";
+
+  // A rule with only vlan_id picks vlan as primary
+  Config cfg3 = make_config();
+  auto& r3 = append_rule(cfg3.pipeline.layer_2, 2004, ActionAllow{});
+  r3.vlan_id = 400;
+
+  auto result3 = compile(cfg3);
+  auto l2c = compile_l2_rules(cfg3.pipeline.layer_2, result3.l2_actions);
+  ASSERT_EQ(l2c.size(), 1u);
+  EXPECT_EQ(l2c[0].primary_kind, L2PrimaryKind::kVlan);
+  EXPECT_EQ(l2c[0].primary_key, 400u);
+  EXPECT_EQ(l2c[0].entry.filter_mask, 0u)
+      << "Only vlan constrained and it's the primary — no secondary bits";
+
+  // A rule with only ethertype picks ethertype
+  Config cfg4 = make_config();
+  auto& r4 = append_rule(cfg4.pipeline.layer_2, 2005, ActionAllow{});
+  r4.ethertype = 0x0800;
+
+  auto result4 = compile(cfg4);
+  auto l2d = compile_l2_rules(cfg4.pipeline.layer_2, result4.l2_actions);
+  ASSERT_EQ(l2d.size(), 1u);
+  EXPECT_EQ(l2d[0].primary_kind, L2PrimaryKind::kEthertype);
+  EXPECT_EQ(l2d[0].primary_key, 0x0800u);
+
+  // A rule with only pcp picks pcp
+  Config cfg5 = make_config();
+  auto& r5 = append_rule(cfg5.pipeline.layer_2, 2006, ActionAllow{});
+  r5.pcp = 5;
+
+  auto result5 = compile(cfg5);
+  auto l2e = compile_l2_rules(cfg5.pipeline.layer_2, result5.l2_actions);
+  ASSERT_EQ(l2e.size(), 1u);
+  EXPECT_EQ(l2e[0].primary_kind, L2PrimaryKind::kPcp);
+  EXPECT_EQ(l2e[0].primary_key, 5u);
+}
+
+// -------------------------------------------------------------------------
+// U3.25 Port-list with duplicates flagged or deduped
+//
+// dst_port: [80, 80, 443] produces two unique entries (dedup policy).
+// Covers D8.
+//
+// Note: U3.25 talks about port-list dedup. At L2 level there are no
+// port lists, but the dedup principle applies to dst_ports at the
+// compile() level. We test that compile() deduplicates port entries.
+// -------------------------------------------------------------------------
+TEST(PortListDedup, DuplicatePortsDeduped_U3_25) {
+  Config cfg = make_config();
+
+  auto& rule = append_rule(cfg.pipeline.layer_4, 3010, ActionAllow{});
+  rule.dst_ports = {80, 80, 443};
+
+  auto result = compile(cfg);
+
+  // Should produce 2 unique entries, not 3
+  ASSERT_EQ(result.l4_entries.size(), 2u)
+      << "Duplicate port 80 should be deduped";
+
+  // The two unique ports are 80 and 443
+  EXPECT_EQ(result.l4_entries[0].dst_port, 80);
+  EXPECT_EQ(result.l4_entries[1].dst_port, 443);
+
+  // Both share the same action
+  EXPECT_EQ(result.l4_entries[0].action_index,
+            result.l4_entries[1].action_index);
 }
 
 }  // namespace
