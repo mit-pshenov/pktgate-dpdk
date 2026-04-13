@@ -28,6 +28,7 @@
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
+#include "src/ruleset/builder.h"
 #include "src/ruleset/builder_eal.h"
 #include "src/ruleset/ruleset.h"
 #include "src/ruleset/types.h"
@@ -582,6 +583,236 @@ TEST_F(ScatterValidatorTest, U4_18_CheckNoScatterAcceptsAndRejects) {
 
   rte_mempool_free(small_mp);
   rte_mempool_free(big_mp);
+}
+
+// =========================================================================
+// U6.2 — L2 src_mac match → dispatch_l2 [needs EAL]
+//
+// Build a Ruleset with one L2 DROP rule keyed on src_mac aa:bb:cc:dd:ee:ff.
+// Present a packet with that src_mac. Expect classify_l2 to return kDrop
+// AND to have written verdict_action_idx=0 into the dynfield.
+//
+// Covers: D15 (compound primary lookup + dispatch), §5.2, D41.
+// =========================================================================
+
+class ClassifyL2CompoundTest : public EalFixture {};
+
+TEST_F(ClassifyL2CompoundTest, U6_2_SrcMacMatchDispatch) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // One L2 DROP rule: src_mac = aa:bb:cc:dd:ee:ff
+  auto& r1 = append_rule(cfg.pipeline.layer_2, 2001, ActionDrop{});
+  r1.src_mac = config::Mac{{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 1u);
+
+  // Build ruleset (actions) + EAL tables.
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_2";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l2_compound_hash, nullptr);
+
+  // Build a minimal untagged Ethernet frame:
+  //   dst_mac: 01:02:03:04:05:06
+  //   src_mac: aa:bb:cc:dd:ee:ff
+  //   ethertype: 0x0800 (IPv4)
+  //   payload: zeros
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_2_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // Build Ethernet header in the mbuf.
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(
+      rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  // dst_mac
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  // src_mac = aa:bb:cc:dd:ee:ff
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  // ethertype = 0x0800
+  pkt[12]=0x08; pkt[13]=0x00;
+
+  // D41: call through top-level entry point.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "src_mac DROP rule must return kDrop";
+
+  // Dynfield: verdict_action_idx must point at rule index 0.
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->verdict_action_idx, 0u)
+      << "verdict_action_idx must be 0 (first rule)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.3 — L2 compound filter_mask rejects partial match [needs EAL]
+//
+// Rule on (src_mac + vlan_id=100). Packet has matching src_mac but no
+// VLAN tag (parsed_vlan = 0xFFFF, which != 100). Primary hit on src_mac,
+// filter_mask check for kVlan fails → fall through → kNextL3 (miss).
+//
+// Covers: D15 (filter_mask secondary check), §5.2.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_3_FilterMaskRejectsPartialMatch) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // Rule on src_mac + vlan=100, action=ALLOW.
+  auto& r1 = append_rule(cfg.pipeline.layer_2, 2003, ActionAllow{});
+  r1.src_mac = config::Mac{{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}};
+  r1.vlan_id = 100;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 1u);
+  // Compiler should pick src_mac as primary (more selective than vlan).
+  EXPECT_EQ(cr.l2_compound[0].entry.filter_mask,
+            compiler::l2_mask::kVlan)
+      << "vlan must be in filter_mask (secondary), src_mac is primary";
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_3";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+
+  // Untagged packet with matching src_mac but NO VLAN tag.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_3_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  pkt[12]=0x08; pkt[13]=0x00;  // untagged IPv4
+
+  // D41: through top-level entry point. Primary hit, filter_mask fails → miss.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3)
+      << "filter_mask vlan check must reject packet with no VLAN tag";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.4 — L2 selectivity order probed correctly [needs EAL]
+//
+// Two rules: rule1 on src_mac=aa:bb:cc:dd:ee:01 (DROP), rule2 on
+// vlan=200 (ALLOW). Packet has vlan=200 and src_mac NOT matching rule1.
+// Classifier probes src_mac first → miss, then probes vlan → hit.
+// Result: kNextL3 (ALLOW action from rule2).
+//
+// Covers: §5.2 selectivity order (src_mac > vlan probed first), D15.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_4_SelectivityOrderProbed) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // Rule 0: src_mac primary → DROP (packet src_mac does NOT match this).
+  auto& r1 = append_rule(cfg.pipeline.layer_2, 2010, ActionDrop{});
+  r1.src_mac = config::Mac{{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01}};
+  // Rule 1: vlan primary (=200) → ALLOW (packet vlan DOES match this).
+  auto& r2 = append_rule(cfg.pipeline.layer_2, 2011, ActionAllow{});
+  r2.vlan_id = 200;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 2u);
+  // Verify compiler assigned primary kinds.
+  EXPECT_EQ(cr.l2_compound[0].primary_kind,
+            compiler::L2PrimaryKind::kSrcMac)
+      << "rule0 must have kSrcMac primary";
+  EXPECT_EQ(cr.l2_compound[1].primary_kind,
+            compiler::L2PrimaryKind::kVlan)
+      << "rule1 must have kVlan primary";
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_4";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+
+  // Packet: src_mac=aa:bb:cc:dd:ee:02 (does NOT match rule0),
+  //         vlan=200 (matches rule1). VLAN-tagged frame (0x8100).
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_4_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // VLAN-tagged Ethernet: 6+6+2 (0x8100)+2 (vlan=200)+2 (inner etype) = 18 B header.
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  // dst_mac
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  // src_mac = aa:bb:cc:dd:ee:02 (different from rule0's aa:...:01)
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0x02;
+  // outer ethertype: 0x8100 (VLAN)
+  pkt[12]=0x81; pkt[13]=0x00;
+  // TCI: vlan=200, pcp=0 → 0x00c8
+  pkt[14]=0x00; pkt[15]=0xc8;
+  // inner ethertype: 0x0800
+  pkt[16]=0x08; pkt[17]=0x00;
+
+  // D41: through top-level entry point.
+  // Expected: src_mac probe → miss (packet src_mac != rule0's MAC),
+  //           vlan probe → hit rule1 (vlan=200), ALLOW → kNextL3.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3)
+      << "vlan=200 ALLOW rule must produce kNextL3 after src_mac probe misses";
+
+  // Dynfield: verdict_action_idx must be 1 (rule1 = second rule = index 1).
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->verdict_action_idx, 1u)
+      << "verdict_action_idx must be 1 (second rule, vlan-primary)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
 }
 
 }  // namespace pktgate::test
