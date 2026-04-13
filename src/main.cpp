@@ -281,6 +281,7 @@ int main(int argc, char* argv[]) {
   worker_ctx.port_id = port_ids[0];
   worker_ctx.queue_id = 0;
   worker_ctx.running = &pktgate::ctl::g_running;
+  worker_ctx.ruleset = ruleset.get();  // M4 C1: wire active Ruleset
 
   unsigned worker_lcore = RTE_MAX_LCORE;
   unsigned count = 0;

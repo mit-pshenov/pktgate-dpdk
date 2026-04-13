@@ -25,6 +25,11 @@ struct WorkerCtx {
   std::uint16_t queue_id;      // RX queue assigned to this worker
   std::atomic<bool>* running;  // global stop flag (ctl::g_running)
 
+  // M4 C1: active Ruleset pointer. Set by the control plane before
+  // launching the worker. Hot-reload (M8) will update this under RCU.
+  // Non-owning — lifetime managed by g_active (D9).
+  const ruleset::Ruleset* ruleset = nullptr;
+
   // Per-worker counters (D3: per-lcore, zero atomics).
   std::uint64_t pkt_multiseg_drop_total = 0;  // D39: nb_segs != 1
 };

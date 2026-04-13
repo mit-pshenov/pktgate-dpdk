@@ -24,6 +24,7 @@
 #include "src/compiler/rule_compiler.h"
 #include "src/config/model.h"
 #include "src/config/sizing.h"
+#include "src/dataplane/classify_l2.h"
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
@@ -93,6 +94,60 @@ TEST_F(DynfieldTest, U6_0a_DynfieldRegistrationAndWritable) {
   EXPECT_EQ(cdyn->parsed_l4_sport, 12345);
   EXPECT_EQ(cdyn->parsed_vlan, 0xFFFF);
   EXPECT_EQ(cdyn->parsed_ethertype, 0x0800);
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.1 — classify_l2: empty ruleset → NEXT_L3 [needs EAL]
+//
+// Build a Ruleset with no L2 compound entries (l2_compound_count == 0,
+// l2_compound_hash == nullptr — the pure-C++ builder path leaves them
+// as nullptr/0). Allocate a stub mbuf from a tiny mempool, call
+// classify_l2() through the top-level public entry point (D41 invariant:
+// tests go through the same entry point the worker uses), and assert
+// that the verdict is kNextL3.
+//
+// The stub mbuf payload does not matter for this test — the empty-ruleset
+// short-circuit fires before any packet parsing.
+//
+// Covers: §5.2 control flow, F1 default (miss → proceed to L3).
+// D41: first cycle where classify_l2 is called; this IS the top-level
+//      entry point test that all C2+ cycles must also satisfy.
+// =========================================================================
+
+class ClassifyL2Test : public EalFixture {};
+
+TEST_F(ClassifyL2Test, U6_1_EmptyRulesetReturnsNextL3) {
+  // Register the dynfield so classify_l2 can use mbuf_dynfield in future
+  // cycles. C1 body doesn't write the dynfield yet, but the dynfield must
+  // be registered before any production code path uses it.
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  // Build an empty Ruleset (pure-C++ path: no DPDK handles).
+  ruleset::Ruleset rs;
+  // l2_compound_count is 0 by default (value-initialized in Ruleset ctor).
+  ASSERT_EQ(rs.l2_compound_count, 0u);
+  ASSERT_EQ(rs.l2_compound_hash, nullptr);
+
+  // Create a tiny mempool for the stub mbuf.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_1_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr) << "mempool creation failed";
+
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr) << "mbuf alloc failed";
+
+  // Precondition: single segment (D39 invariant the worker guarantees).
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // D41 invariant: call through top-level classify_l2 entry point.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3)
+      << "empty ruleset must return kNextL3 (L2 miss → proceed to L3)";
 
   rte_pktmbuf_free(m);
   rte_mempool_free(mp);
