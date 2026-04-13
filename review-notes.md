@@ -2111,6 +2111,66 @@ cardinality) and closes both gaps.
 - §10.3 metrics — `pktgate_lcore_pkt_frag_skipped_total{lcore,af}`,
   `pktgate_lcore_pkt_frag_dropped_total{lcore,policy,af}`
 
+### D41 — Multi-stage milestones ship with end-to-end pipeline smoke
+
+**Decision.** Any milestone whose deliverable is a multi-stage
+pipeline (parser → validator → compiler → builder; or classify_l2
+→ l3 → l4; or anything with ≥ 2 transformation stages handing off
+to each other) **MUST** include at least one test that exercises
+the full pipeline end-to-end through the public top-level entry
+point — not only per-stage unit tests.
+
+The smoke test must:
+1. Feed a non-trivial input through the public top-level function
+   (`compile()`, `classify()`, etc. — the thing the next milestone
+   calls).
+2. Assert on **observable side effects of each internal stage**.
+   For a compiler: that every layer's compound output is non-empty
+   when rules of that layer exist; that counter slots were assigned;
+   that objects were resolved. For classify: that the verdict
+   reflects L2+L3+L4 state, not just the first stage visited.
+3. Be labelled `unit` (or `smoke`) so it runs in the exit gate
+   alongside per-stage tests.
+
+Per-stage unit tests remain mandatory — this decision does NOT
+replace them. It adds a cross-cutting assertion that the stages
+are **wired into the pipeline**, not just individually correct.
+
+**Why.** M2 closed green with orphaned `compile_l2_rules` /
+`compile_l4_rules`: the functions were implemented, unit-tested in
+isolation, and passed every sanitizer preset. But top-level
+`compile()` never called them. `CompileResult` had no fields for
+compound entries at all, and `L3CompiledRule` didn't exist despite
+M2 being marked "compiler done". The gap surfaced only in M3 C6,
+when the Ruleset builder tried to populate `rte_hash` / `rte_fib`
+and found nothing to populate from. A single five-line test
+(`auto r = compile(sample_config); EXPECT_FALSE(r.l2_compound.empty());`)
+would have failed in M2 C3 and saved a week of downstream rework.
+
+Unit-test coverage on stages is necessary but not sufficient:
+coverage metrics can look healthy while the entry point silently
+bypasses half the code. Integration smoke tests are the invariant
+that catches pipeline-wiring bugs.
+
+**Scope.** This applies to all M4+ milestones and is enforced as
+part of the per-milestone exit gate definition in the
+implementation plan. M2's retrofit lands as **M4 C0 — compile()
+wiring retrofit**, which explicitly includes the smoke test as
+step 6 of its scope. After M4 C0, every subsequent milestone's
+handoff must list its pipeline smoke test alongside per-stage
+unit tests in the RED column.
+
+**Non-applicability.** Single-stage milestones (M0 infrastructure,
+M7 REDIRECT if it lands as one atomic cycle, etc.) don't need a
+separate smoke test — their existing tests already are the
+end-to-end check. The invariant triggers when there are ≥ 2
+stages that hand off data to each other through a shared result
+type.
+
+**Prior art caught late:** M2 silent gap (2026-04-10 closed →
+2026-04-11 gap surfaced in M3 C6 → 2026-04-12 deferred to M4 C0).
+Memory grabli: `grabli_m2_silent_pipeline_gap.md`.
+
 ### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
 
 Not standalone decisions; one-paragraph prose fixes surfaced by
@@ -2150,7 +2210,11 @@ the test-architect brigade.
   the flag is undefined; the validator rejects
   `cmd_socket.test_allow_uids` as `unknown field` in release.
 
-*Last updated: 2026-04-11 (D31–D38 + full five-lawyer triage,
+*Last updated: 2026-04-12 (D41 added after M2 silent gap caught in
+M3 C6 — compile_l2/l4_rules unit-tested in isolation but never
+wired into top-level compile(); retrofit scheduled as M4 C0).*
+
+*Previously: 2026-04-11 (D31–D38 + full five-lawyer triage,
 single batch commit after the embarrassing D30 fix; D39/D40 +
 Q3/Q5/Q6/Q7/Q9 clarifications landed later same day after the
 test-architect brigade.)*
