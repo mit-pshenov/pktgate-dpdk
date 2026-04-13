@@ -1404,4 +1404,383 @@ TEST_F(ClassifyL2TruncTest, U6_11_VlanShortFrameDropsL2VlanBucket) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// M4 C6 — L2 truncation corner tests (C1.1-C1.8)
+//
+// Eight frame shapes hammering the D31 truncation guards in classify_l2.
+// All tests use an empty ruleset so the only code paths that can produce
+// kDrop are the D31 guards. The ordering in classify_l2 (C5 landing):
+//
+//   Guard #1 (l2)      fires at pkt_len < 14
+//   Guard #2 (l2_vlan) fires at is_vlan_tpid(outer_etype) && pkt_len < 18
+//   Empty-ruleset bail fires after both guards → kNextL3
+//
+// Test IDs: C1.1-C1.8.  Covers D31, D32, D41.
+// All tests use fresh L2TruncCtrs{} (zero-init) for clean delta assertions.
+// =========================================================================
+
+class ClassifyL2TruncCornerTest : public EalFixture {};
+
+// =========================================================================
+// C1.1 — Zero-byte frame
+//
+// Packet: empty (pkt_len=0). Guard #1 fires (0 < 14).
+// Assert: pkt_truncated_total[l2] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_1_ZeroByte) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_1_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+  // Do NOT append any bytes: pkt_len stays 0.
+  ASSERT_EQ(m->pkt_len, 0u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.1: zero-byte frame must be dropped by D31 l2 guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 1u)
+      << "C1.1: pkt_truncated_total[l2] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 0u)
+      << "C1.1: pkt_truncated_total[l2_vlan] must be 0";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.2 — One-byte frame
+//
+// Packet: 1 byte (0x01). Guard #1 fires (1 < 14).
+// Assert: pkt_truncated_total[l2] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_2_OneByte) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_2_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 1));
+  ASSERT_NE(pkt, nullptr);
+  pkt[0] = 0x01;
+  ASSERT_EQ(m->pkt_len, 1u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.2: 1-byte frame must be dropped by D31 l2 guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 1u)
+      << "C1.2: pkt_truncated_total[l2] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 0u)
+      << "C1.2: pkt_truncated_total[l2_vlan] must be 0";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.3 — 13-byte frame (one byte short of minimal Ethernet header)
+//
+// Packet: 13 bytes of 0xFF. Guard #1 fires (13 < 14).
+// Assert: pkt_truncated_total[l2] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_3_ThirteenBytes) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_3_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 13));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0xFF, 13);
+  ASSERT_EQ(m->pkt_len, 13u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.3: 13-byte frame must be dropped by D31 l2 guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 1u)
+      << "C1.3: pkt_truncated_total[l2] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 0u)
+      << "C1.3: pkt_truncated_total[l2_vlan] must be 0";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.4 — 14-byte frame claiming VLAN TPID 0x8100
+//
+// Layout: dst(6) + src(6) + 0x8100 — 14 B total, no room for TCI.
+// Guard #1 does NOT fire (14 >= 14). Guard #2 fires (is_vlan_tpid(0x8100)
+// && 14 < 18).
+// Assert: pkt_truncated_total[l2_vlan] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_4_FourteenBytesVlanTpid8100) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_4_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // 14 bytes: dst(6) + src(6) + ethertype=0x8100 (VLAN TPID). No TCI bytes.
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 14));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 14);
+  pkt[0]=0x00; pkt[1]=0x11; pkt[2]=0x22;
+  pkt[3]=0x33; pkt[4]=0x44; pkt[5]=0x55;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  pkt[12]=0x81; pkt[13]=0x00;  // 0x8100 TPID
+  ASSERT_EQ(m->pkt_len, 14u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.4: 14-byte VLAN TPID frame must be dropped by D31 l2_vlan guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 1u)
+      << "C1.4: pkt_truncated_total[l2_vlan] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 0u)
+      << "C1.4: pkt_truncated_total[l2] must be 0 (14 >= 14, guard #1 doesn't fire)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.5 — 15-byte frame: dst(6) + src(6) + 0x8100 + one TCI byte
+//
+// One byte of TCI present but inner ethertype ([16..17]) absent.
+// Guard #2 fires (is_vlan_tpid(0x8100) && 15 < 18).
+// Assert: pkt_truncated_total[l2_vlan] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_5_FifteenBytesVlanOneTciByte) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_5_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // 15 bytes: dst(6) + src(6) + 0x8100 + 1 TCI byte.
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 15));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 15);
+  pkt[0]=0x00; pkt[1]=0x11; pkt[2]=0x22;
+  pkt[3]=0x33; pkt[4]=0x44; pkt[5]=0x55;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  pkt[12]=0x81; pkt[13]=0x00;  // 0x8100 TPID
+  pkt[14]=0x00;                 // one TCI byte (0x00), second byte absent
+  ASSERT_EQ(m->pkt_len, 15u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.5: 15-byte VLAN frame must be dropped by D31 l2_vlan guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 1u)
+      << "C1.5: pkt_truncated_total[l2_vlan] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 0u)
+      << "C1.5: pkt_truncated_total[l2] must be 0";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.6 — 17-byte frame: dst(6) + src(6) + 0x8100 + three extra bytes
+//
+// Bytes at [14..16]: 0x00 0x64 0x08 — TCI=0x0064 (vlan=100) + first byte
+// of inner ethertype (0x08), but second byte absent → pkt_len=17 < 18.
+// Guard #2 fires (is_vlan_tpid(0x8100) && 17 < 18).
+// Assert: pkt_truncated_total[l2_vlan] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_6_SeventeenBytesVlanThreeExtraBytes) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_6_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // 17 bytes: dst(6) + src(6) + 0x8100 + 0x00 0x64 0x08
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 17));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 17);
+  pkt[0]=0x00; pkt[1]=0x11; pkt[2]=0x22;
+  pkt[3]=0x33; pkt[4]=0x44; pkt[5]=0x55;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  pkt[12]=0x81; pkt[13]=0x00;  // 0x8100 TPID
+  pkt[14]=0x00; pkt[15]=0x64;  // TCI: vlan=100
+  pkt[16]=0x08;                 // first byte of inner etype (0x0800), second absent
+  ASSERT_EQ(m->pkt_len, 17u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.6: 17-byte VLAN frame must be dropped by D31 l2_vlan guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 1u)
+      << "C1.6: pkt_truncated_total[l2_vlan] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 0u)
+      << "C1.6: pkt_truncated_total[l2] must be 0";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.7 — 14-byte frame claiming 0x88A8 (S-tag TPID)
+//
+// Layout: dst(6) + src(6) + 0x88A8 — 14 B total.
+// D32: 0x88A8 is treated as a VLAN TPID (same path as 0x8100). Guard #2
+// fires (is_vlan_tpid(0x88A8) && 14 < 18). Bucket is l2_vlan, NOT l2.
+// Assert: pkt_truncated_total[l2_vlan] == 1, verdict == kDrop.
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_7_FourteenBytesStagTpid88A8) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_7_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // 14 bytes: dst(6) + src(6) + ethertype=0x88A8 (S-tag TPID). No TCI bytes.
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 14));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 14);
+  pkt[0]=0x00; pkt[1]=0x11; pkt[2]=0x22;
+  pkt[3]=0x33; pkt[4]=0x44; pkt[5]=0x55;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  pkt[12]=0x88; pkt[13]=0xA8;  // 0x88A8 S-tag TPID (D32)
+  ASSERT_EQ(m->pkt_len, 14u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "C1.7: 14-byte 0x88A8 S-tag frame must be dropped by D31 l2_vlan guard";
+  // D32: 0x88A8 is a VLAN TPID → guard #2 fires → l2_vlan bucket, not l2.
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 1u)
+      << "C1.7: pkt_truncated_total[l2_vlan] must be 1 (D32: 0x88A8 walks VLAN path)";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 0u)
+      << "C1.7: pkt_truncated_total[l2] must be 0 (14 >= 14, guard #1 does not fire)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// C1.8 — 14-byte frame, non-VLAN ethertype (0x0800)
+//
+// Layout: dst(6) + src(6) + 0x0800 — 14 B — well-formed minimal Ethernet.
+// Neither guard fires: pkt_len=14 >= 14 (guard #1 ok), outer_etype=0x0800
+// is not a VLAN TPID (guard #2 ok). Empty-ruleset bail → kNextL3.
+//
+// M4 interpretation (classify_l3 not yet implemented — lands in M5):
+//   - Assert l2 == 0 (l2 guard did NOT fire)
+//   - Assert l2_vlan == 0 (l2_vlan guard did NOT fire)
+//   - Assert verdict == kNextL3 (classify_l2 falls through to classify_l3)
+//   - The l3_v4 truncation counter originally specified by corner.md
+//     (pkt_truncated_total[l3_v4] += 1) cannot be asserted in M4 because
+//     classify_l3 does not exist yet.
+//
+// TODO: M5 C? — assert l3_v4 truncation bucket += 1 once classify_l3 lands.
+//
+// Covers: D31 (confirms l2 bucket does not fire on well-formed 14 B frame),
+//         D41 (top-level classify_l2 call).
+// =========================================================================
+TEST_F(ClassifyL2TruncCornerTest, C1_8_FourteenBytesIPv4EtherNoVlan) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c1_8_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // 14 bytes: dst(6) + src(6) + ethertype=0x0800 (IPv4, non-VLAN).
+  // Well-formed minimal Ethernet header — neither D31 guard fires.
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 14));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 14);
+  pkt[0]=0x00; pkt[1]=0x11; pkt[2]=0x22;
+  pkt[3]=0x33; pkt[4]=0x44; pkt[5]=0x55;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0xff;
+  pkt[12]=0x08; pkt[13]=0x00;  // 0x0800 IPv4, not a VLAN TPID
+  ASSERT_EQ(m->pkt_len, 14u);
+
+  dataplane::L2TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, nullptr, &trunc_ctrs);
+
+  // M4 interpretation: neither D31 L2-stage guard fires on well-formed 14 B.
+  // Empty-ruleset bail returns kNextL3 (classify_l3 will handle l3_v4
+  // truncation once it lands in M5).
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3)
+      << "C1.8: well-formed 14-byte IPv4 frame must pass classify_l2 → kNextL3";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 0u)
+      << "C1.8: pkt_truncated_total[l2] must be 0 (14 B >= 14, guard #1 does not fire)";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2Vlan)], 0u)
+      << "C1.8: pkt_truncated_total[l2_vlan] must be 0 (0x0800 is not a VLAN TPID)";
+
+  // TODO: M5 C? — assert l3_v4 truncation bucket += 1 once classify_l3 lands.
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test
