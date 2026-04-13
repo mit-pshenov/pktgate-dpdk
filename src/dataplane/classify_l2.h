@@ -283,12 +283,6 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
     return ClassifyL2Verdict::kDrop;
   }
 
-  // Empty-ruleset short-circuit (C1).
-  // Placed AFTER truncation guards so malformed frames are always dropped.
-  if (rs.l2_compound_count == 0 || !rs.l2_compound_hash) {
-    return ClassifyL2Verdict::kNextL3;
-  }
-
   // ---- Parse src/dst MACs (pkt_len >= 14 guaranteed, safe) ----------------
   const std::uint64_t src_key = detail::mac_to_u64(raw + 6);
   const std::uint64_t dst_key = detail::mac_to_u64(raw + 0);
@@ -311,14 +305,19 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
     // D32: if the inner ethertype is itself a VLAN TPID, this is a true
     // QinQ stack. Bump the counter. We do NOT drill further — l3_offset
     // stays 18, full QinQ is v2 per D32 prose.
+    //
+    // NOTE: counter bump happens BEFORE the empty-ruleset short-circuit
+    // so observability is independent of rule presence (C7 fix).
     if (detail::is_vlan_tpid(pkt_etype) && qinq_ctr != nullptr) {
       ++(*qinq_ctr);
     }
   }
 
   // ---- D13: write l3_offset, parsed_vlan, parsed_ethertype to dynfield ----
-  // Write before the selectivity probes so classify_l3 (M5) always reads
-  // the correct byte offset regardless of which probe (if any) hits.
+  // Write BEFORE the empty-ruleset short-circuit so classify_l3 (M5) always
+  // reads the correct byte offset even when no L2 rules exist (C7 fix —
+  // original C1 placement ran the short-circuit before parse, leaving
+  // dynfield zero-initialised for empty rulesets).
   //
   // Untagged:       l3_offset = 14, parsed_vlan = 0xFFFF
   // Single VLAN:    l3_offset = 18, parsed_vlan = vid (12 lower bits of TCI)
@@ -328,6 +327,17 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
     dyn->l3_offset        = (pkt_vlan != 0xFFFFu) ? 18u : 14u;
     dyn->parsed_vlan      = pkt_vlan;
     dyn->parsed_ethertype = pkt_etype;
+  }
+
+  // Empty-ruleset short-circuit (C1, re-placed by C7 fix).
+  // Moved AFTER parse + dynfield write + qinq counter bump so that:
+  //   (a) truncation guards still fire first (memory safety)
+  //   (b) downstream classify_l3 reads a correct l3_offset
+  //   (c) qinq_outer_only_total observability is independent of rule state
+  // The short-circuit still skips the selectivity probes, which is the
+  // only part that actually needs l2_compound_hash to be populated.
+  if (rs.l2_compound_count == 0 || !rs.l2_compound_hash) {
+    return ClassifyL2Verdict::kNextL3;
   }
 
   // ---- Selectivity-ordered probing (§5.2, D15) ----------------------------
