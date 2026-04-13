@@ -815,4 +815,261 @@ TEST_F(ClassifyL2CompoundTest, U6_4_SelectivityOrderProbed) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// U6.5 — L2 first-match-wins [needs EAL]
+//
+// Two rules both match a packet with src_mac=aa:bb:cc:dd:ee:01 and
+// vlan=100:
+//   Rule 0: src_mac=aa:bb:cc:dd:ee:01, vlan=100 (filter_mask kVlan) → DROP
+//   Rule 1: vlan=100 (primary=kVlan) → ALLOW
+//
+// Selectivity order probes src_mac first.  Rule 0 has src_mac as its
+// primary key → probe hits, filter_mask vlan=100 passes → dispatched.
+// Rule 1 is never probed.  First-match-wins per config order enforced
+// by selectivity ordering.
+//
+// Assert: verdict == kDrop AND verdict_action_idx == 0.
+//
+// Covers: F1 (first-match-wins discipline), §5.2 selectivity order.
+// D41: through top-level classify_l2 entry point.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_5_FirstMatchWins) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+
+  // Rule 0 (config position 0): src_mac primary + vlan=100 in filter_mask → DROP.
+  // primary_kind = kSrcMac, filter_mask = kVlan.
+  auto& r0 = append_rule(cfg.pipeline.layer_2, 5000, ActionDrop{});
+  r0.src_mac = config::Mac{{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01}};
+  r0.vlan_id = 100;
+
+  // Rule 1 (config position 1): vlan=100 primary only → ALLOW.
+  // primary_kind = kVlan, no filter_mask.
+  auto& r1 = append_rule(cfg.pipeline.layer_2, 5001, ActionAllow{});
+  r1.vlan_id = 100;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 2u);
+
+  // Verify compiler chose src_mac as primary for rule 0 and vlan for rule 1.
+  EXPECT_EQ(cr.l2_compound[0].primary_kind, compiler::L2PrimaryKind::kSrcMac)
+      << "rule 0 must have kSrcMac primary";
+  EXPECT_EQ(cr.l2_compound[1].primary_kind, compiler::L2PrimaryKind::kVlan)
+      << "rule 1 must have kVlan primary";
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_5";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l2_compound_hash, nullptr);
+
+  // Build a VLAN-tagged frame:
+  //   dst_mac: 01:02:03:04:05:06
+  //   src_mac: aa:bb:cc:dd:ee:01  ← matches rule 0
+  //   outer ethertype: 0x8100
+  //   TCI: vlan=100, pcp=0  ← matches both rules
+  //   inner ethertype: 0x0800
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_5_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  // dst_mac
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  // src_mac = aa:bb:cc:dd:ee:01
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0x01;
+  // outer ethertype: 0x8100
+  pkt[12]=0x81; pkt[13]=0x00;
+  // TCI: vlan=100 (0x0064), pcp=0
+  pkt[14]=0x00; pkt[15]=0x64;
+  // inner ethertype: 0x0800
+  pkt[16]=0x08; pkt[17]=0x00;
+
+  // D41: through top-level entry point.
+  // Expect rule 0 (src_mac primary, DROP) fires before rule 1 (vlan primary,
+  // ALLOW) is probed — first-match-wins by selectivity order.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kDrop)
+      << "first-match-wins: rule 0 (DROP) must fire before rule 1 (ALLOW)";
+
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->verdict_action_idx, 0u)
+      << "verdict_action_idx must be 0 (rule 0, src_mac primary)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.6 — VLAN-tagged IPv4 sets l3_offset=18, parsed_vlan=100,
+//         parsed_ethertype=0x0800 (D13) [needs EAL]
+//
+// Build a VLAN-tagged IPv4 frame (vlan=100, inner ethertype=0x0800).
+// After classify_l2, assert dynfield fields per D13:
+//   dyn->l3_offset == 18
+//   dyn->parsed_vlan == 100
+//   dyn->parsed_ethertype == 0x0800
+//
+// Uses a vlan=100 ALLOW rule so classify_l2 reaches the dispatch path.
+// Dynfield is written before dispatch (design §5.2 lines 1039-1041),
+// so the fields are valid regardless of verdict.
+//
+// Covers: D13 (VLAN-tagged l3_offset fix), §5.2, §5.1.
+// D41: through top-level classify_l2 entry point.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_6_VlanTaggedIPv4L3Offset) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // One rule: vlan=100 → ALLOW. Ensures a hit so we exercise the dispatch.
+  auto& r0 = append_rule(cfg.pipeline.layer_2, 6000, ActionAllow{});
+  r0.vlan_id = 100;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 1u);
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_6";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+
+  // VLAN-tagged frame:
+  //   dst: 01:02:03:04:05:06  src: aa:bb:cc:dd:ee:01
+  //   outer ethertype: 0x8100, TCI: vlan=100 (0x0064), pcp=0
+  //   inner ethertype: 0x0800 (IPv4)
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_6_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0x01;
+  pkt[12]=0x81; pkt[13]=0x00;    // outer ethertype: 0x8100
+  pkt[14]=0x00; pkt[15]=0x64;    // TCI: vlan=100, pcp=0
+  pkt[16]=0x08; pkt[17]=0x00;    // inner ethertype: 0x0800 (IPv4)
+
+  // D41: through top-level entry point.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+  // Rule matches → ALLOW → kNextL3.
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3);
+
+  // D13: assert dynfield l3_offset, parsed_vlan, parsed_ethertype.
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->l3_offset, 18u)
+      << "VLAN-tagged IPv4: l3_offset must be 18 (14 Eth + 4 VLAN tag)";
+  EXPECT_EQ(dyn->parsed_vlan, 100u)
+      << "parsed_vlan must be 100 (TCI & 0x0FFF)";
+  EXPECT_EQ(dyn->parsed_ethertype, 0x0800u)
+      << "parsed_ethertype must be inner ethertype 0x0800 (IPv4)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.7 — untagged IPv4 sets l3_offset=14 (D13) [needs EAL]
+//
+// Build an untagged IPv4 frame (outer ethertype=0x0800). After
+// classify_l2, assert dynfield:
+//   dyn->l3_offset == 14
+//
+// unit.md specifies only l3_offset for U6.7 (no parsed_vlan assertion
+// for untagged — see dispatch prompt guidance).
+//
+// Uses an ethertype=0x0800 ALLOW rule so the frame hits. Dynfield is
+// written before dispatch so fields are valid on miss too, but a hit
+// is cleaner for demonstrating the full path.
+//
+// Covers: D13 (untagged l3_offset=14), §5.2, §5.1.
+// D41: through top-level classify_l2 entry point.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_7_UntaggedIPv4L3Offset) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // One rule: ethertype=0x0800 → ALLOW.
+  auto& r0 = append_rule(cfg.pipeline.layer_2, 7000, ActionAllow{});
+  r0.ethertype = 0x0800;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 1u);
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_7";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+
+  // Untagged frame:
+  //   dst: 01:02:03:04:05:06  src: aa:bb:cc:dd:ee:02
+  //   ethertype: 0x0800 (IPv4)
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_7_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0x02;
+  pkt[12]=0x08; pkt[13]=0x00;    // ethertype: 0x0800 (IPv4), no VLAN
+
+  // D41: through top-level entry point.
+  const dataplane::ClassifyL2Verdict verdict = dataplane::classify_l2(m, rs);
+  // Rule matches → ALLOW → kNextL3.
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3);
+
+  // D13: assert l3_offset = 14 for untagged frame.
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->l3_offset, 14u)
+      << "untagged IPv4: l3_offset must be 14 (standard Ethernet header)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test
