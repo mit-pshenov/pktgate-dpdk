@@ -8,6 +8,10 @@
 //          or l3_offset=18 (single 0x8100 VLAN tag); parsed_vlan and
 //          parsed_ethertype written to dynfield before dispatch.
 // M4 C4 — QinQ outer 0x88A8 accept + qinq_outer_only_total bump (D32).
+// M4 C5 — D31 truncation length guards: l2 (< 14 B) and l2_vlan
+//          (VLAN TPID at offset 12 but pkt_len < 18). Both bump
+//          pkt_truncated_total[where] and return kDrop.
+//
 // Implements the L2 classification entry point per §5.2.  Full body
 // is built incrementally across M4 cycles:
 //
@@ -25,7 +29,7 @@
 //                 (M5) can read the correct byte offset.
 //                 Single-VLAN (0x8100) only; QinQ (0x88A8) deferred C4.
 //   C4           — QinQ outer 0x88A8 accept + counter (D32).
-//   C5           — truncation length guards (D31).
+//   C5           — D31 truncation length guards (l2 / l2_vlan buckets).
 //
 // Design anchors:
 //   * §5.2  — classify_l2 full spec
@@ -39,6 +43,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 
@@ -57,12 +62,32 @@ namespace pktgate::dataplane {
 // ClassifyL2Verdict — result of classify_l2.
 //
 // kNextL3: L2 pass — proceed to L3 (empty ruleset miss OR ALLOW action).
-// kDrop:   terminal drop — L2 rule with DROP action matched.
+// kDrop:   terminal drop — L2 rule with DROP action matched, or D31 guard.
 
 enum class ClassifyL2Verdict : std::uint8_t {
   kNextL3 = 0,  // L2 pass — proceed to L3 pipeline
-  kDrop   = 1,  // terminal drop
+  kDrop   = 1,  // terminal drop (rule match or D31 truncation guard)
 };
+
+// -------------------------------------------------------------------------
+// L2TruncBucket — D31 per-stage truncation counter buckets for classify_l2.
+//
+// kL2      — frame shorter than minimal Ethernet header (< 14 B).
+// kL2Vlan  — frame has a VLAN TPID (0x8100 / 0x88A8) at offset 12 but
+//             pkt_len < 18 (no room for the 4-byte VLAN tag to reach the
+//             inner ethertype).
+//
+// Indexed into a std::array<uint64_t, kL2TruncBucketCount> counter storage.
+// L3/L4 buckets (l3_v4, l3_v6, l3_v6_frag_ext, l4) land in M5/M6.
+
+enum class L2TruncBucket : std::size_t {
+  kL2     = 0,
+  kL2Vlan = 1,
+};
+inline constexpr std::size_t kL2TruncBucketCount = 2;
+
+// Convenience alias used by WorkerCtx and test code.
+using L2TruncCtrs = std::array<std::uint64_t, kL2TruncBucketCount>;
 
 // -------------------------------------------------------------------------
 // Internal helpers (anonymous namespace in a header — inline-only hot path).
@@ -188,59 +213,85 @@ inline ClassifyL2Verdict l2_try_probe(struct rte_mbuf* m,
 // Preconditions (enforced by caller / worker.cpp D39 guard):
 //   m->nb_segs == 1   (headers-in-first-seg invariant)
 //
-// C4 body (full, includes C1/C2/C3 steps):
+// C5 body (full, includes C1/C2/C3/C4 steps):
+//   0. D31 guard #1: if pkt_len < 14, bump trunc_ctrs[kL2], return kDrop.
 //   1. Empty-ruleset short-circuit (from C1).
 //   2. Parse Ethernet header: src_mac, dst_mac, outer ethertype.
-//   3. If outer ethertype ∈ {0x8100, 0x88A8} (VLAN TPID, D32): extract
+//   3. D31 guard #2: if outer ethertype ∈ VLAN TPID AND pkt_len < 18,
+//      bump trunc_ctrs[kL2Vlan], return kDrop.
+//   4. If outer ethertype ∈ {0x8100, 0x88A8} (VLAN TPID, D32): extract
 //      vlan_id and pcp from the 802.1Q TCI; inner ethertype is at offset 16.
 //      D32: walk ONE tag only. If the inner ethertype is itself a VLAN TPID
 //      (true QinQ stack), bump *qinq_ctr (if non-null) but do NOT drill
 //      further. l3_offset stays 18, not 22.
-//   4. D13 dynfield write: l3_offset=14 (untagged) or 18 (VLAN/QinQ-outer),
+//   5. D13 dynfield write: l3_offset=14 (untagged) or 18 (VLAN/QinQ-outer),
 //      parsed_vlan, parsed_ethertype — written before any probe so
 //      classify_l3 (M5) always reads the correct byte offset.
-//   5. Probe in selectivity order (§5.2, D15, first-match-wins): src_mac
+//   6. Probe in selectivity order (§5.2, D15, first-match-wins): src_mac
 //      → dst_mac → vlan → ethertype → pcp. Each probe:
 //      rte_hash_lookup_data, filter_mask check, dispatch on first match.
-//   6. Miss: return kNextL3.
+//   7. Miss: return kNextL3.
 //
 // qinq_ctr (optional, D32):
 //   Pointer to a per-lcore uint64_t counter for QinQ outer-only events.
 //   Pass nullptr to skip the bump (backward-compatible default).
 //   Worker passes &ctx->qinq_outer_only_total.
 //
-// TODO C5: D31 truncation length guards at l2 / l2_vlan buckets.
+// trunc_ctrs (optional, D31):
+//   Pointer to a L2TruncCtrs array (std::array<uint64_t, 2> indexed by
+//   L2TruncBucket). Pass nullptr to skip the bump (backward-compatible).
+//   Worker passes &ctx->pkt_truncated_l2.
 
 inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
                                      const ruleset::Ruleset& rs,
-                                     std::uint64_t* qinq_ctr = nullptr) {
+                                     std::uint64_t* qinq_ctr = nullptr,
+                                     L2TruncCtrs*  trunc_ctrs = nullptr) {
   // D39: caller is responsible for ensuring nb_segs == 1 before calling.
 
+  // ---- D31 Guard #1: l2 bucket — frame shorter than minimal Ethernet -------
+  // Minimal Ethernet header: dst_mac(6) + src_mac(6) + ethertype(2) = 14 B.
+  // Any frame shorter than this cannot be parsed at all.  Fires before any
+  // other logic — including empty-ruleset bail and header parse.
+  if (rte_pktmbuf_pkt_len(m) < 14u) {
+    if (trunc_ctrs) {
+      ++(*trunc_ctrs)[static_cast<std::size_t>(L2TruncBucket::kL2)];
+    }
+    return ClassifyL2Verdict::kDrop;
+  }
+
+  // ---- Parse outer ethertype (pkt_len >= 14 guaranteed by guard #1) --------
+  // Frame layout:
+  //   [0..5]   dst_mac
+  //   [6..11]  src_mac
+  //   [12..13] ethertype (outer; may be a VLAN TPID)
+  //   (further fields only valid if pkt_len >= 18 — guard #2 below)
+
+  const auto* raw = rte_pktmbuf_mtod(m, const std::uint8_t*);
+
+  const std::uint16_t outer_etype =
+      static_cast<std::uint16_t>((raw[12] << 8) | raw[13]);
+
+  // ---- D31 Guard #2: l2_vlan bucket — VLAN header truncated ---------------
+  // Must fire before the empty-ruleset bail so truncated VLAN frames are
+  // always dropped regardless of ruleset state.  After guard #1 we know
+  // pkt_len >= 14, so reading raw[12..13] above was safe; but raw[14..17]
+  // (VLAN TCI + inner ethertype) is only present when pkt_len >= 18.
+  if (detail::is_vlan_tpid(outer_etype) && rte_pktmbuf_pkt_len(m) < 18u) {
+    if (trunc_ctrs) {
+      ++(*trunc_ctrs)[static_cast<std::size_t>(L2TruncBucket::kL2Vlan)];
+    }
+    return ClassifyL2Verdict::kDrop;
+  }
+
   // Empty-ruleset short-circuit (C1).
+  // Placed AFTER truncation guards so malformed frames are always dropped.
   if (rs.l2_compound_count == 0 || !rs.l2_compound_hash) {
     return ClassifyL2Verdict::kNextL3;
   }
 
-  // ---- Parse Ethernet header ------------------------------------------------
-  // Frame layout (untagged):
-  //   [0..5]   dst_mac
-  //   [6..11]  src_mac
-  //   [12..13] ethertype
-  //
-  // Frame layout (802.1Q tagged, outer ethertype == 0x8100):
-  //   [0..5]   dst_mac
-  //   [6..11]  src_mac
-  //   [12..13] outer ethertype = 0x8100
-  //   [14..15] TCI (pcp[15:13] + cfi[12] + vid[11:0])
-  //   [16..17] inner ethertype
-
-  const auto* raw = rte_pktmbuf_mtod(m, const std::uint8_t*);
-
+  // ---- Parse src/dst MACs (pkt_len >= 14 guaranteed, safe) ----------------
   const std::uint64_t src_key = detail::mac_to_u64(raw + 6);
   const std::uint64_t dst_key = detail::mac_to_u64(raw + 0);
-
-  const std::uint16_t outer_etype =
-      static_cast<std::uint16_t>((raw[12] << 8) | raw[13]);
 
   // VLAN extraction: fills local variables used for both the D13 dynfield
   // write and the D15 selectivity probe key.

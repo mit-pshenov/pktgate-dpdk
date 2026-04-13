@@ -7,6 +7,7 @@
 //   * D9   — g_active global (scaffold; real QSBR is M8)
 //   * D19  — worker stays RCU-online at idle (Q7)
 //   * D39  — nb_segs != 1 drop (C5 adds the check)
+//   * D31  — truncation sentinels (M4 C5): pkt_truncated_l2 counter array
 
 #pragma once
 
@@ -15,6 +16,7 @@
 
 #include <rte_mbuf.h>
 
+#include "src/dataplane/classify_l2.h"  // L2TruncCtrs, L2TruncBucket
 #include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {
@@ -33,6 +35,7 @@ struct WorkerCtx {
   // Per-worker counters (D3: per-lcore, zero atomics).
   std::uint64_t pkt_multiseg_drop_total = 0;  // D39: nb_segs != 1
   std::uint64_t qinq_outer_only_total   = 0;  // D32: outer S-tag, inner is VLAN TPID
+  L2TruncCtrs   pkt_truncated_l2{};           // D31: l2 / l2_vlan truncation buckets
 };
 
 // D39: check if an mbuf is single-segment. If not, it must be dropped.
