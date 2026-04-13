@@ -1072,4 +1072,199 @@ TEST_F(ClassifyL2CompoundTest, U6_7_UntaggedIPv4L3Offset) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// U6.8 — QinQ outer 0x88A8 accepted; inner 0x8100 bumps counter (D32)
+//
+// Frame layout (double-tagged QinQ):
+//   [0..5]   dst_mac
+//   [6..11]  src_mac
+//   [12..13] outer ethertype: 0x88A8 (S-tag, 802.1ad)
+//   [14..15] outer TCI: vlan=200, pcp=0
+//   [16..17] inner ethertype: 0x8100 (C-tag) ← true QinQ stack
+//   [18..19] inner TCI: vlan=300, pcp=0
+//   [20..21] inner-inner ethertype: 0x0800 (IPv4)
+//
+// classify_l2 MUST:
+//   - walk ONE tag (S-tag at offset 12), see inner ethertype 0x8100
+//   - bump qinq_outer_only_total (inner is a VLAN TPID → true QinQ)
+//   - set l3_offset = 18 (NOT 22 — no inner drilling)
+//   - set parsed_vlan = 200 (outer TCI & 0x0FFF)
+//   - set parsed_ethertype = 0x8100 (inner, not drilled)
+//   - return kNextL3 (no terminal drop for QinQ, D32)
+//
+// Uses a vlan=200 ALLOW rule to exercise the full dispatch path.
+//
+// Covers: D32 (QinQ outer accept + counter), D13, D41.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_8_QinQOuterAcceptedInnerBumpsCounter) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // Rule: vlan=200 → ALLOW. Outer S-tag TCI has vid=200, so this probe hits.
+  auto& r0 = append_rule(cfg.pipeline.layer_2, 8000, ActionAllow{});
+  r0.vlan_id = 200;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 1u);
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_8";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+
+  // Double-tagged QinQ frame:
+  //   dst: 01:02:03:04:05:06  src: aa:bb:cc:dd:ee:08
+  //   outer: S-tag 0x88A8, TCI: vlan=200 (0x00C8), pcp=0
+  //   inner: C-tag 0x8100, TCI: vlan=300 (0x012C), pcp=0
+  //   inner-inner: IPv4 0x0800
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_8_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0x08;
+  pkt[12]=0x88; pkt[13]=0xA8;    // outer ethertype: 0x88A8 (S-tag)
+  pkt[14]=0x00; pkt[15]=0xC8;    // outer TCI: vlan=200, pcp=0
+  pkt[16]=0x81; pkt[17]=0x00;    // inner ethertype: 0x8100 (C-tag) — true QinQ
+  pkt[18]=0x01; pkt[19]=0x2C;    // inner TCI: vlan=300, pcp=0
+  pkt[20]=0x08; pkt[21]=0x00;    // inner-inner ethertype: 0x0800 (IPv4)
+
+  // D32: pass a local counter to observe the bump.
+  std::uint64_t qinq_ctr = 0;
+
+  // D41: through top-level classify_l2 entry point.
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, &qinq_ctr);
+  // D32: QinQ frames must NOT be terminally dropped.
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3)
+      << "QinQ outer frame must produce kNextL3 (no terminal drop for QinQ)";
+
+  // D32: inner ethertype 0x8100 is a VLAN TPID → counter must fire.
+  EXPECT_EQ(qinq_ctr, 1u)
+      << "qinq_outer_only_total must be 1 (inner ethertype is VLAN TPID 0x8100)";
+
+  // D13 / D32: l3_offset must be 18 (ONE tag walked, not two).
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->l3_offset, 18u)
+      << "QinQ outer: l3_offset must be 18 (one tag walked, inner not drilled)";
+  EXPECT_EQ(dyn->parsed_vlan, 200u)
+      << "parsed_vlan must be 200 (outer S-tag TCI & 0x0FFF)";
+  EXPECT_EQ(dyn->parsed_ethertype, 0x8100u)
+      << "parsed_ethertype must be inner 0x8100 (inner C-tag, not drilled)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.9 — single 0x88A8 tag over IPv4: outer accepted, no counter bump (D32)
+//
+// Frame layout (single S-tag, no inner VLAN):
+//   [0..5]   dst_mac
+//   [6..11]  src_mac
+//   [12..13] outer ethertype: 0x88A8 (S-tag)
+//   [14..15] TCI: vlan=400, pcp=0
+//   [16..17] inner ethertype: 0x0800 (IPv4) ← NOT a VLAN TPID
+//
+// classify_l2 MUST:
+//   - walk ONE tag (S-tag at offset 12), see inner ethertype 0x0800
+//   - NOT bump qinq_outer_only_total (inner is IPv4, not a VLAN TPID)
+//   - set l3_offset = 18
+//   - set parsed_vlan = 400 (TCI & 0x0FFF)
+//   - set parsed_ethertype = 0x0800
+//   - return kNextL3
+//
+// Uses a vlan=400 ALLOW rule.
+//
+// Covers: D32 (single S-tag, no-bump path), D13, D41.
+// =========================================================================
+
+TEST_F(ClassifyL2CompoundTest, U6_9_SingleSTagOverIPv4NoBump) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+  // Rule: vlan=400 → ALLOW.
+  auto& r0 = append_rule(cfg.pipeline.layer_2, 9000, ActionAllow{});
+  r0.vlan_id = 400;
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed";
+  ASSERT_EQ(cr.l2_compound.size(), 1u);
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_9";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+
+  // Single S-tag frame over IPv4:
+  //   dst: 01:02:03:04:05:06  src: aa:bb:cc:dd:ee:09
+  //   outer: S-tag 0x88A8, TCI: vlan=400 (0x0190), pcp=0
+  //   inner ethertype: 0x0800 (IPv4)
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_9_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, 64));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, 64);
+  pkt[0]=0x01; pkt[1]=0x02; pkt[2]=0x03;
+  pkt[3]=0x04; pkt[4]=0x05; pkt[5]=0x06;
+  pkt[6]=0xaa; pkt[7]=0xbb; pkt[8]=0xcc;
+  pkt[9]=0xdd; pkt[10]=0xee; pkt[11]=0x09;
+  pkt[12]=0x88; pkt[13]=0xA8;    // outer ethertype: 0x88A8 (S-tag)
+  pkt[14]=0x01; pkt[15]=0x90;    // TCI: vlan=400, pcp=0
+  pkt[16]=0x08; pkt[17]=0x00;    // inner ethertype: 0x0800 (IPv4) — NOT VLAN
+
+  // D32: pass a local counter; must remain 0 after the call.
+  std::uint64_t qinq_ctr = 0;
+
+  // D41: through top-level classify_l2 entry point.
+  const dataplane::ClassifyL2Verdict verdict =
+      dataplane::classify_l2(m, rs, &qinq_ctr);
+  // D32: single S-tag over IPv4 must pass (no terminal drop).
+  EXPECT_EQ(verdict, dataplane::ClassifyL2Verdict::kNextL3)
+      << "single S-tag over IPv4 must produce kNextL3";
+
+  // D32: inner ethertype is IPv4 (0x0800), NOT a VLAN TPID → no bump.
+  EXPECT_EQ(qinq_ctr, 0u)
+      << "qinq_outer_only_total must NOT be bumped when inner etype is IPv4";
+
+  // D13 / D32: l3_offset = 18, parsed_vlan = 400, parsed_ethertype = 0x0800.
+  const auto* dyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->l3_offset, 18u)
+      << "single S-tag: l3_offset must be 18";
+  EXPECT_EQ(dyn->parsed_vlan, 400u)
+      << "parsed_vlan must be 400 (TCI & 0x0FFF)";
+  EXPECT_EQ(dyn->parsed_ethertype, 0x0800u)
+      << "parsed_ethertype must be 0x0800 (IPv4)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test

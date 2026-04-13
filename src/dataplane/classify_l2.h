@@ -7,6 +7,7 @@
 //          VLAN l3_offset dynfield write per D13: l3_offset=14 (untagged)
 //          or l3_offset=18 (single 0x8100 VLAN tag); parsed_vlan and
 //          parsed_ethertype written to dynfield before dispatch.
+// M4 C4 — QinQ outer 0x88A8 accept + qinq_outer_only_total bump (D32).
 // Implements the L2 classification entry point per §5.2.  Full body
 // is built incrementally across M4 cycles:
 //
@@ -67,6 +68,13 @@ enum class ClassifyL2Verdict : std::uint8_t {
 // Internal helpers (anonymous namespace in a header — inline-only hot path).
 
 namespace detail {
+
+// D32: returns true if `etype` is a VLAN TPID (0x8100 C-tag or 0x88A8 S-tag).
+// Used at the outer ethertype check (offset 12) and at the inner ethertype
+// check (offset 16 after one walked tag) to detect true QinQ stacks.
+inline bool is_vlan_tpid(std::uint16_t etype) noexcept {
+  return etype == 0x8100u || etype == 0x88A8u;
+}
 
 // Pack a 6-byte MAC (bytes[0..5]) into a uint64_t with bytes in memory
 // order (low byte = bytes[0]), high 2 bytes zero. Matches mac_to_u64 in
@@ -180,13 +188,15 @@ inline ClassifyL2Verdict l2_try_probe(struct rte_mbuf* m,
 // Preconditions (enforced by caller / worker.cpp D39 guard):
 //   m->nb_segs == 1   (headers-in-first-seg invariant)
 //
-// C3 body (full, includes C1/C2 steps):
+// C4 body (full, includes C1/C2/C3 steps):
 //   1. Empty-ruleset short-circuit (from C1).
 //   2. Parse Ethernet header: src_mac, dst_mac, outer ethertype.
-//   3. If outer ethertype == 0x8100 (single VLAN): extract vlan_id and
-//      pcp from the 802.1Q TCI; inner ethertype is at offset 16.
-//      QinQ (0x88A8) outer detection is deferred to C4.
-//   4. D13 dynfield write: l3_offset=14 (untagged) or 18 (single VLAN),
+//   3. If outer ethertype ∈ {0x8100, 0x88A8} (VLAN TPID, D32): extract
+//      vlan_id and pcp from the 802.1Q TCI; inner ethertype is at offset 16.
+//      D32: walk ONE tag only. If the inner ethertype is itself a VLAN TPID
+//      (true QinQ stack), bump *qinq_ctr (if non-null) but do NOT drill
+//      further. l3_offset stays 18, not 22.
+//   4. D13 dynfield write: l3_offset=14 (untagged) or 18 (VLAN/QinQ-outer),
 //      parsed_vlan, parsed_ethertype — written before any probe so
 //      classify_l3 (M5) always reads the correct byte offset.
 //   5. Probe in selectivity order (§5.2, D15, first-match-wins): src_mac
@@ -194,11 +204,16 @@ inline ClassifyL2Verdict l2_try_probe(struct rte_mbuf* m,
 //      rte_hash_lookup_data, filter_mask check, dispatch on first match.
 //   6. Miss: return kNextL3.
 //
-// TODO C4: QinQ outer 0x88A8 accept + qinq_outer_only_total bump (D32).
+// qinq_ctr (optional, D32):
+//   Pointer to a per-lcore uint64_t counter for QinQ outer-only events.
+//   Pass nullptr to skip the bump (backward-compatible default).
+//   Worker passes &ctx->qinq_outer_only_total.
+//
 // TODO C5: D31 truncation length guards at l2 / l2_vlan buckets.
 
 inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
-                                     const ruleset::Ruleset& rs) {
+                                     const ruleset::Ruleset& rs,
+                                     std::uint64_t* qinq_ctr = nullptr) {
   // D39: caller is responsible for ensuring nb_segs == 1 before calling.
 
   // Empty-ruleset short-circuit (C1).
@@ -233,14 +248,22 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
   std::uint16_t pkt_etype = outer_etype;
   std::uint8_t  pkt_pcp   = 0;
 
-  if (outer_etype == 0x8100u) {
+  // D32: both 0x8100 (C-tag) and 0x88A8 (S-tag) are VLAN TPIDs.
+  // Walk ONE tag regardless of which TPID is outer.
+  if (detail::is_vlan_tpid(outer_etype)) {
     const std::uint16_t tci =
         static_cast<std::uint16_t>((raw[14] << 8) | raw[15]);
     pkt_vlan  = tci & 0x0FFFu;          // vid: bits [11:0]
     pkt_pcp   = static_cast<std::uint8_t>((tci >> 13) & 0x07u);
     pkt_etype = static_cast<std::uint16_t>((raw[16] << 8) | raw[17]);
+
+    // D32: if the inner ethertype is itself a VLAN TPID, this is a true
+    // QinQ stack. Bump the counter. We do NOT drill further — l3_offset
+    // stays 18, full QinQ is v2 per D32 prose.
+    if (detail::is_vlan_tpid(pkt_etype) && qinq_ctr != nullptr) {
+      ++(*qinq_ctr);
+    }
   }
-  // QinQ 0x88A8 outer — C4 territory. No additional parsing here.
 
   // ---- D13: write l3_offset, parsed_vlan, parsed_ethertype to dynfield ----
   // Write before the selectivity probes so classify_l3 (M5) always reads
@@ -248,7 +271,7 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
   //
   // Untagged:       l3_offset = 14, parsed_vlan = 0xFFFF
   // Single VLAN:    l3_offset = 18, parsed_vlan = vid (12 lower bits of TCI)
-  // QinQ (C4):      l3_offset = 22 (deferred — C4 writes this)
+  // QinQ outer:     l3_offset = 18 (ONE tag walked, inner not drilled, D32)
   {
     auto* dyn = eal::mbuf_dynfield(m);
     dyn->l3_offset        = (pkt_vlan != 0xFFFFu) ? 18u : 14u;

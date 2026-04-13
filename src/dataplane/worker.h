@@ -32,6 +32,7 @@ struct WorkerCtx {
 
   // Per-worker counters (D3: per-lcore, zero atomics).
   std::uint64_t pkt_multiseg_drop_total = 0;  // D39: nb_segs != 1
+  std::uint64_t qinq_outer_only_total   = 0;  // D32: outer S-tag, inner is VLAN TPID
 };
 
 // D39: check if an mbuf is single-segment. If not, it must be dropped.

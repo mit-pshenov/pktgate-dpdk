@@ -54,9 +54,10 @@ int worker_main(void* arg) {
       // M4 C1: L2 classification. classify_l2 returns kNextL3 on
       // empty ruleset or hash miss, kDrop on L2 rule drop action.
       // M5 will extend the kNextL3 branch to call classify_l3.
+      // D32: pass per-lcore qinq counter so the hot path can bump it.
       // TODO M5: call classify_l3 on kNextL3 verdict.
       const ClassifyL2Verdict l2v =
-          classify_l2(bufs[i], *ctx->ruleset);
+          classify_l2(bufs[i], *ctx->ruleset, &ctx->qinq_outer_only_total);
 
       switch (l2v) {
         case ClassifyL2Verdict::kNextL3:
