@@ -2171,6 +2171,61 @@ type.
 2026-04-11 gap surfaced in M3 C6 → 2026-04-12 deferred to M4 C0).
 Memory grabli: `grabli_m2_silent_pipeline_gap.md`.
 
+**Amendment 2026-04-13 — boot-path wiring clause.** M2's silent
+gap was caught by the compile-side smoke (`U3.Smoke1` landed in
+M4 C0a). But a **second** silent gap surfaced in M4 C8:
+`populate_ruleset_eal()` was orphaned from `main.cpp`. The
+function existed, was unit-tested under an EAL fixture
+(U4.2–U4.5), and every `rte_hash` / `rte_fib` assertion passed —
+because the U4.* tests called `populate_ruleset_eal()` **inline
+in the helper**, not via the boot path. `main.cpp` built the
+Ruleset via `build_ruleset()` and went straight to worker launch,
+leaving the DPDK tables empty at runtime. The gap surfaced when
+the C8 F2 functional tests injected traffic and observed zero
+rule hits despite non-empty `l2_compound_count` in the
+`ruleset_published` log line.
+
+Compile-side smoke asserts that the compiler wires its own stages
+into the top-level `compile()` entry point. It does **not**
+assert that `main()` wires every pipeline stage into the boot
+sequence. The two are independent axes of silent-gap risk, and
+both need an explicit guard.
+
+**Extension.** D41 now requires **two smoke levels** for
+multi-stage milestones:
+
+1. **Compile-side smoke** (existing, unchanged): top-level
+   `compile()` on a non-trivial config, assert every
+   `CompileResult` compound vector is non-empty when rules of
+   that layer exist. Label: `unit` or `smoke`. Runs in the
+   inner build/test loop.
+2. **Boot-path smoke** (new): at least one test — functional
+   preferred, EAL-full-boot unit test acceptable — that
+   launches the binary through `main()` and asserts observable
+   behaviour that can only be true if **every** boot-path
+   stage was wired up. Concrete acceptance shapes:
+   - A rule match visible via `stats_on_exit` / telemetry dump
+     after injected traffic.
+   - `rte_hash_lookup` / `rte_fib_lookup` returning populated
+     data against a live Ruleset captured post-`main()`-boot.
+   - Any negative assertion that would fail if a builder call
+     were deleted from `main.cpp`.
+   F1.1 (`test_f1_boot`) **does not** satisfy this clause: it
+   asserts the binary reaches `"ready":true` and exits cleanly,
+   which stays green even when `populate_ruleset_eal()` is
+   missing. Boot-path smoke must assert something downstream
+   of every wired stage, not just boot completion.
+
+**Enforcement.** F2.* (M4 C8) retroactively serves as the
+boot-path smoke for M4 — the per-rule counter assertions in
+F2.1–F2.9 fail if any stage from `compile()` through
+`populate_ruleset_eal()` through `worker_main` counter bump is
+missing. Subsequent milestones must include at least one
+boot-path smoke test in their RED column and exit gate, listed
+explicitly in the handoff alongside compile-side smoke.
+
+**Origin:** M4 C8 `populate_ruleset_eal()` orphan, 2026-04-13.
+
 ### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
 
 Not standalone decisions; one-paragraph prose fixes surfaced by
@@ -2210,7 +2265,9 @@ the test-architect brigade.
   the flag is undefined; the validator rejects
   `cmd_socket.test_allow_uids` as `unknown field` in release.
 
-*Last updated: 2026-04-12 (D41 added after M2 silent gap caught in
+*Last updated: 2026-04-13 (D41 amendment — boot-path wiring clause
+added after M4 C8 populate_ruleset_eal orphan; previously 2026-04-12
+D41 added after M2 silent gap caught in
 M3 C6 — compile_l2/l4_rules unit-tested in isolation but never
 wired into top-level compile(); retrofit scheduled as M4 C0).*
 

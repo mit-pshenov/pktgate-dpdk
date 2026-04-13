@@ -120,6 +120,36 @@ deferred to C6)". M3 C6 was deferred to M4 C0. Resolution: M4 C0b
 (`c6d0c97`) landed U4.18 as EAL unit test.
 *Origin: M3 C3 deferral 2026-04-12 → M4 C0b fix 2026-04-13.*
 
+### C0b silent gap: `populate_ruleset_eal()` orphaned from `main.cpp`
+M4 C0b (`c6d0c97`) added `populate_ruleset_eal()` in
+`src/ruleset/builder_eal.{cpp,h}` with real `rte_hash_create` /
+`rte_fib_create` / `rte_hash_add_key_with_hash` / `rte_fib_add`
+calls, and U4.2–U4.5 unit tests passed under `eal_fixture.h`. But
+`main.cpp` was **never updated** to call the function on the boot
+path — `build_ruleset()` created the pure-C++ arenas and the boot
+went straight to worker launch, leaving `rte_hash`/`rte_fib` tables
+empty at runtime. Unit tests missed it because they invoked
+`populate_ruleset_eal()` inline in the fixture helper, not through
+`main()`. F1.1 (`test_f1_boot`) missed it because it only asserts
+`"ready":true` and clean exit.
+
+Surfaced in **M4 C8** (2026-04-13) when F2.* functional tests
+injected traffic and observed zero `matched_packets` in
+`stats_on_exit` despite a non-empty `l2_compound_count` in the
+`ruleset_published` log line. C8 WIP added the missing
+`populate_ruleset_eal()` call to `main.cpp` phase 6 (between
+`build_ruleset()` and the `ruleset_published` log line).
+
+Second silent gap of the M2/C0 family after `compile_l2/l4_rules`
+orphaning. D41 amended same day to require a **boot-path smoke**
+tier alongside the compile-side smoke; see `review-notes.md` §D41
+"Amendment 2026-04-13 — boot-path wiring clause". F2.* retroactively
+serves as M4's boot-path smoke.
+
+*Origin: M4 C0b gap 2026-04-13 → surfaced in M4 C8 predecessor
+work same day → fix landed in C8 WIP (main.cpp `populate_ruleset_eal`
+call) + D41 amendment.*
+
 ## Design.md bugs (NOT plan errata — migrate to design.md batch revision)
 
 This section tracks architectural doc bugs discovered during
@@ -146,5 +176,6 @@ template fixed same day.*
 
 ---
 
-*Last updated: 2026-04-13 (M4 C7 close). Add new items with date +
-origin cycle at append time.*
+*Last updated: 2026-04-13 (M4 C8 predecessor work — populate_ruleset_eal
+orphan discovery + D41 amendment). Add new items with date + origin
+cycle at append time.*
