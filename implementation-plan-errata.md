@@ -163,6 +163,48 @@ sums to **10 B**. Discovered in M2 C2 `dc8cecc` during static_assert.
 Resolution: fix doc to match fields (10 B) or add padding (12 B).
 *Origin: M2 C2, 2026-04-10. Should land in design.md batch revision.*
 
+## §M5 — Classifier L3 (lines 356-399)
+
+### C1 RED list — plan↔unit.md ID drift on D14/D31 IPv4 row
+Plan §M5 lists `unit.md U6.12–U6.17` as the D31 L3 bucket tests
+and `U6.19` as the D14 IHL row. Reading the actual `unit.md` entries:
+
+- **U6.12** = IPv4 short packet → `l3_v4` trunc — **C1 scope ✓**
+- **U6.13** = IPv4 `IHL<5` drops `l3_v4` — **this is the D14 reject
+  test; C1 scope ✓** (plan misattributes D14 to U6.19)
+- **U6.14** = **IPv6** short packet → `l3_v6` trunc — **C4 scope**,
+  NOT C1
+- **U6.15** = IPv6 frag-ext truncated → `l3_v6_frag_ext` — C6
+- **U6.16** = L4 truncated TCP → `l4` — M6
+- **U6.17** = meta dispatch-table — structural, any milestone with
+  full D31 surface
+- **U6.18** = IPv4 dst FIB hit → (unit.md wording: `TERMINAL_L3`,
+  stale pre-D21 text) — **C1 scope ✓** (the real dst FIB primary
+  hit test; C0 shipped enum `{kNextL4, kTerminalPass, kTerminalDrop}`
+  without `TERMINAL_L3`, so the verdict is `kNextL4` on allow /
+  `kTerminalDrop` on drop rule action)
+- **U6.19** = IPv4 IHL=6 L4 offset uses `ihl<<2` — **M6 scope**;
+  D14's L4-offset contribution belongs to classify_l4, not M5
+
+**Resolution.** M5 C1 transcribes **U6.12 + U6.13 + U6.18 + new
+U6.18a** ("IPv4 dst FIB miss → kNextL4 fall-through"). U6.18a is
+added to `unit.md` in the same commit (same precedent as M4 C0
+U6.0a + M5 C0 U6.11a). U6.18's stale `TERMINAL_L3` wording is
+updated inline to current enum dispatch (allow → `kNextL4`, drop →
+`kTerminalDrop`). Drop the handoff's `U6.14`/`U6.19` C1 references
+as ID drift.
+
+M5 C4 transcribes U6.14 + U6.15 (IPv6 trunc family). M6 owns U6.19.
+
+Also: the earlier errata note in `scratch/m5-supervisor-handoff.md`
+§Plan errata #1 ("No plan edit in M5; worker reads U6.19 per the
+narrow interpretation") is **wrong** — under the narrow
+interpretation there is no M5 U6.19 test at all; the D14 IHL reject
+test already exists as U6.13. Handoff file patched at the same
+time as this errata entry.
+*Origin: M5 C1 worker stopped at RED-prep 2026-04-15 → supervisor
+resolution same day (Option A).*
+
 ### D32 QinQ `l3_offset = 22` never happens in MVP
 Earlier handoff template prose said "QinQ → l3_offset=22" but
 `classify_l2` walks exactly one tag in MVP (0x8100 or 0x88A8), so
@@ -176,6 +218,6 @@ template fixed same day.*
 
 ---
 
-*Last updated: 2026-04-13 (M4 C8 predecessor work — populate_ruleset_eal
-orphan discovery + D41 amendment). Add new items with date + origin
-cycle at append time.*
+*Last updated: 2026-04-15 (M5 C1 RED-prep drift — §M5 C1 RED list
+entry + handoff patch). Add new items with date + origin cycle at
+append time.*
