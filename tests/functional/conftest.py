@@ -18,6 +18,66 @@ import time
 import pytest
 
 
+# ---------------------------------------------------------------------------
+# M4 C8 — NetworkManager unmanaged-devices fixture for F2 L2 tests
+# ---------------------------------------------------------------------------
+#
+# DPDK net_tap creates kernel tap interfaces (e.g. dtap_f2_rx / dtap_f2_tx).
+# The moment NetworkManager sees them it starts managing them like any other
+# NIC and fires DHCPv4 / IPv6 RS.  Those background frames land in the DPDK
+# RX ring and contaminate per-rule counter assertions non-deterministically
+# across tests in a full session run.
+#
+# Fix: write an NM keyfile marking the test interface names as unmanaged for
+# the whole pytest session.  The fixture is session-scoped and NOT autouse —
+# modules that need it (tests/functional/test_f2_l2.py) opt in via
+# `pytestmark = pytest.mark.usefixtures("nm_unmanaged_tap")`.
+#
+# Rationale for keyfile vs. `nmcli device set`: the tap device only exists
+# between binary start and shutdown; a keyfile is applied declaratively as
+# soon as NM sees the device appear, closing the race window DHCP would
+# otherwise race through.
+#
+# Root cause note salvaged from M4 C8 aborted attempt 2026-04-13:
+# `scratch/c8-salvage/nm_unmanaged_tap.md`.
+
+_NM_CONF_PATH = "/etc/NetworkManager/conf.d/pktgate_test_unmanaged.conf"
+_TAP_IFACES_TO_UNMANAGE = ["dtap_f2_rx", "dtap_f2_tx"]
+
+
+@pytest.fixture(scope="session", autouse=False)
+def nm_unmanaged_tap():
+    """Mark DPDK functional-test tap interfaces as NM-unmanaged for the session."""
+    nm_conf_written = False
+    try:
+        iface_spec = ",".join(
+            f"interface-name:{n}" for n in _TAP_IFACES_TO_UNMANAGE
+        )
+        with open(_NM_CONF_PATH, "w") as f:
+            f.write("[keyfile]\n")
+            f.write(f"unmanaged-devices={iface_spec}\n")
+        subprocess.run(
+            ["nmcli", "general", "reload", "conf"],
+            capture_output=True,
+        )
+        nm_conf_written = True
+    except OSError:
+        # Not writable (e.g. non-root CI): best-effort, test may contaminate.
+        pass
+
+    yield
+
+    if nm_conf_written:
+        try:
+            os.unlink(_NM_CONF_PATH)
+            subprocess.run(
+                ["nmcli", "general", "reload", "conf"],
+                capture_output=True,
+            )
+        except OSError:
+            pass
+
+
 def find_binary():
     """Find the pktgate_dpdk binary. Prefers PKTGATE_BINARY env var (set by
     CMake) so ctest runs the binary matching the active preset."""

@@ -22,6 +22,7 @@
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 
+#include "src/action/action.h"
 #include "src/compiler/compiler.h"
 #include "src/compiler/object_compiler.h"
 #include "src/config/parser.h"
@@ -32,6 +33,7 @@
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
 #include "src/ruleset/builder.h"
+#include "src/ruleset/builder_eal.h"
 #include "src/ruleset/ruleset.h"
 
 // -------------------------------------------------------------------------
@@ -266,10 +268,47 @@ int main(int argc, char* argv[]) {
             std::to_string(port_ids.size()) + "}").c_str());
 
   // ---- Phase 6: build and publish Ruleset ----
+  //
+  // M4 C8: num_lcores for counter indexing must be rte_lcore_count(), NOT
+  // n_workers.  The counter row array is indexed by raw lcore_id (0..n-1);
+  // with `-l 0,1` the main thread is lcore 0 and the worker is lcore 1,
+  // so if we sized only to n_workers the worker's counter_row(1) would
+  // overflow a 1-row allocation.  rte_lcore_count() returns main+workers,
+  // which is the tightest safe bound.
+  const unsigned num_lcores_for_counters = rte_lcore_count();
   auto ruleset = std::make_unique<pktgate::ruleset::Ruleset>(
-      pktgate::ruleset::build_ruleset(compile_result, cfg.sizing, n_workers));
+      pktgate::ruleset::build_ruleset(compile_result, cfg.sizing,
+                                      num_lcores_for_counters));
+
+  // M4 C8: populate the DPDK compound tables (rte_hash / rte_fib / rte_fib6)
+  // from the CompileResult compound vectors.  build_ruleset() only creates
+  // the pure-C++ action arenas; the DPDK side of the compiled-ruleset
+  // pipeline lives in populate_ruleset_eal() (C0b silent gap fix — see
+  // implementation-plan-errata.md §M4 "C0b silent gap").
+  {
+    pktgate::ruleset::EalPopulateParams eal_params;
+    eal_params.name_prefix =
+        "pktgate_g" + std::to_string(ruleset->generation);
+    eal_params.socket_id = static_cast<int>(socket_id);
+    eal_params.max_entries = cfg.sizing.rules_per_layer_max;
+    auto eal_res = pktgate::ruleset::populate_ruleset_eal(
+        *ruleset, compile_result, eal_params);
+    if (!eal_res.ok) {
+      log_json("{\"error\":\"ruleset_eal_populate_failed\",\"reason\":\"" +
+               eal_res.error + "\"}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+  }
+
   log_json(("{\"event\":\"ruleset_published\",\"generation\":" +
-            std::to_string(ruleset->generation) + "}").c_str());
+            std::to_string(ruleset->generation) +
+            ",\"l2_rules\":" + std::to_string(ruleset->n_l2_rules) +
+            ",\"l2_compound_count\":" +
+            std::to_string(ruleset->l2_compound_count) +
+            ",\"num_lcores\":" + std::to_string(ruleset->num_lcores) +
+            "}").c_str());
 
   // D9 scaffold: publish ruleset via atomic store.
   g_active.store(ruleset.get(), std::memory_order_release);
@@ -326,6 +365,47 @@ int main(int argc, char* argv[]) {
     // ---- Phase 9: shutdown (§6.4) ----
     log_json("{\"event\":\"workers_exit\"}");
     rte_eal_mp_wait_lcore();
+  }
+
+  // ---- M4 C8: emit per-rule counter summary for functional tests ---------
+  //
+  // Aggregates per-lcore RuleCounter rows across all workers and emits
+  // one JSON log line {event, rules: [{rule_id, layer, matched_packets,
+  // drops}, ...]}.  Only rules with non-zero traffic are listed.  Real
+  // telemetry (M10) replaces this with a proper scrape endpoint; for M4
+  // the log line is the functional observable F2 tests assert on.
+  {
+    const auto& rs = *ruleset;
+    std::string stats_json =
+        "{\"event\":\"stats_on_exit\",\"rules\":[";
+    bool first_entry = true;
+
+    for (std::uint32_t idx = 0; idx < rs.n_l2_rules; ++idx) {
+      if (!rs.l2_actions) break;
+      const auto& act = rs.l2_actions[idx];
+      const auto slot = static_cast<std::uint32_t>(act.counter_slot);
+
+      std::uint64_t total_matched = 0;
+      std::uint64_t total_drops   = 0;
+      for (std::uint32_t lc = 0; lc < rs.num_lcores; ++lc) {
+        const auto* row = rs.counter_row(lc);
+        if (!row || slot >= rs.counter_slots_per_lcore) continue;
+        total_matched += row[slot].matched_packets;
+        total_drops   += row[slot].drops;
+      }
+
+      if (total_matched == 0 && total_drops == 0) continue;
+
+      if (!first_entry) stats_json += ',';
+      first_entry = false;
+      stats_json += "{\"rule_id\":" + std::to_string(act.rule_id) +
+                    ",\"layer\":\"l2\""
+                    ",\"matched_packets\":" + std::to_string(total_matched) +
+                    ",\"drops\":" + std::to_string(total_drops) + "}";
+    }
+
+    stats_json += "]}";
+    log_json(stats_json);
   }
 
   // Stop and close ports.

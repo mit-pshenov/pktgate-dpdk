@@ -49,3 +49,17 @@ set_tests_properties(functional.test_d39_scatter PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 30
 )
+
+# M4 C8 — F2.1-F2.9 L2 happy-path functional tests.
+# Uses net_tap vdevs and scapy packet injection; requires root (NM keyfile
+# write + scapy AF_PACKET injection).  Longer timeout because each test
+# boots a fresh EAL instance.
+add_test(
+  NAME functional.test_f2_l2
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f2_l2.py"
+)
+set_tests_properties(functional.test_f2_l2 PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 240
+)

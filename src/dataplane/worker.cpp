@@ -2,6 +2,7 @@
 //
 // M3 C1/C5 — worker skeleton: RX loop with D39 multi-seg drop.
 // M4 C1      — classify_l2 call site wired in.
+// M4 C8      — per-rule counter bump after classify_l2 match.
 //
 // The worker polls a single RX queue, drops multi-segment mbufs
 // (D39: headers-in-first-seg invariant), calls classify_l2 on each
@@ -12,19 +13,69 @@
 
 #include <rte_debug.h>
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 
+#include "src/action/action.h"
 #include "src/dataplane/classify_l2.h"
+#include "src/eal/dynfield.h"
+#include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {
 
 namespace {
+
 constexpr std::uint16_t kBurstSize = 32;
+
+// M4 C8 — verdict_action_idx sentinel.
+//
+// classify_l2 writes `dyn->verdict_action_idx = idx` on a match and leaves
+// the field untouched on a miss.  The worker needs to distinguish
+// "matched action slot 0" from "no match", so we pre-initialise the
+// dynfield to a reserved sentinel before every classify_l2 call. 0xFFFF is
+// outside every valid action_idx range (rules_per_layer_max is bounded
+// well below 65535 by sizing), so it cannot collide with a real match.
+constexpr std::uint16_t kNoMatchSentinel = 0xFFFFu;
+
+// bump_l2_counter — M4 C8: post-classify_l2 per-rule counter increment.
+//
+// Reads the matched action slot from the ruleset action arena and
+// increments the corresponding RuleCounter row for this lcore.  Runs on
+// the worker lcore — zero atomics per D1 (RuleCounter writes are
+// single-writer per lcore; telemetry aggregates in M10).
+//
+// Guards against misconfigured ruleset (nullptr action/counters, slot
+// out-of-range) so a compile/build failure on the side path cannot
+// corrupt RX processing.
+inline void bump_l2_counter(const ruleset::Ruleset& rs,
+                            std::uint16_t action_idx,
+                            ClassifyL2Verdict verdict,
+                            unsigned lcore_id) {
+  if (action_idx >= rs.n_l2_rules || !rs.l2_actions || !rs.counters) return;
+
+  const auto& act = rs.l2_actions[action_idx];
+  const auto slot = static_cast<std::uint32_t>(act.counter_slot);
+
+  ruleset::RuleCounter* row = rs.counter_row(lcore_id);
+  if (!row || slot >= rs.counter_slots_per_lcore) return;
+
+  ruleset::RuleCounter& ctr = row[slot];
+  ++ctr.matched_packets;
+  if (verdict == ClassifyL2Verdict::kDrop) {
+    ++ctr.drops;
+  }
+}
+
 }  // namespace
 
 int worker_main(void* arg) {
   auto* ctx = static_cast<WorkerCtx*>(arg);
   struct rte_mbuf* bufs[kBurstSize];
+
+  // M4 C8: lcore id for per-rule counter indexing (§4.3 D3).  Captured
+  // once at entry — lcore affinity does not change for the lifetime of
+  // a worker thread.
+  const unsigned lcore_id = rte_lcore_id();
 
   // D19/Q7: worker stays "online" at all times — no offline transition
   // on idle. Real RCU register/online/offline/unregister lands in M8.
@@ -51,6 +102,13 @@ int worker_main(void* arg) {
       // D39 debug assert: after passing the check, nb_segs MUST be 1.
       RTE_ASSERT(bufs[i]->nb_segs == 1);
 
+      // M4 C8: pre-init verdict_action_idx to the no-match sentinel so
+      // bump_l2_counter can reliably distinguish "matched slot 0" from
+      // "no match".  classify_l2::l2_dispatch writes the real action_idx
+      // on hit; a miss leaves this sentinel in place.
+      auto* dyn = eal::mbuf_dynfield(bufs[i]);
+      dyn->verdict_action_idx = kNoMatchSentinel;
+
       // M4 C1: L2 classification. classify_l2 returns kNextL3 on
       // empty ruleset or hash miss, kDrop on L2 rule drop action.
       // M5 will extend the kNextL3 branch to call classify_l3.
@@ -61,6 +119,13 @@ int worker_main(void* arg) {
           classify_l2(bufs[i], *ctx->ruleset,
                       &ctx->qinq_outer_only_total,
                       &ctx->pkt_truncated_l2);
+
+      // M4 C8: bump the per-rule counter if classify_l2 matched a rule.
+      // A miss leaves verdict_action_idx == kNoMatchSentinel (pre-init).
+      const std::uint16_t act_idx = dyn->verdict_action_idx;
+      if (act_idx != kNoMatchSentinel) {
+        bump_l2_counter(*ctx->ruleset, act_idx, l2v, lcore_id);
+      }
 
       switch (l2v) {
         case ClassifyL2Verdict::kNextL3:
