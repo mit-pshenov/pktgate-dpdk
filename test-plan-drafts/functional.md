@@ -246,10 +246,17 @@ The binary is built with the `ASAN` flavor for functional CI runs.
   10.1.2.3 hits R1.
 - Covers: F1 L3, §4.1 DIR-24-8
 
-### F2.12 L3 IPv4 src-prefix secondary FIB
-- Setup: rule `src_subnet=192.168.0.0/16` action=drop.
+### F2.12 L3 IPv4 src-prefix secondary FIB [DEFERRED_V2]
+- Setup: a rule constraining the IPv4 source prefix
+  (`192.168.0.0/16`) action=drop.
 - Assertion: only packets originating in 192.168/16 are dropped.
 - Covers: F1 L3 src-prefix, `l3_v4_src`
+- Status: deferred to v2 — src-prefix secondary probe is a v2
+  feature per `review-notes.md` §P10 / §5.3 (M5 C1c, 2026-04-15).
+  Not shipping in MVP. The `dst_subnet` rename absorbed the
+  primary-key concern; src-prefix secondary needs an independent
+  config field, dedicated FIB storage, and a separate filter
+  stage in classify_l3.
 
 ### F2.13 L3 IPv4 VRF match
 - Setup: compound rule with `vrf=7` and a corresponding
@@ -1045,7 +1052,7 @@ The binary is built with the `ASAN` flavor for functional CI runs.
 - Assertion: validate_err sub-reason `undefined_role_ref`.
 - Covers: D5, §3a.2
 
-### F10.7 Rule with both src_subnet object-ref and literal
+### F10.7 Rule with both dst_subnet object-ref and literal
 - Config where the same field is specified twice in conflicting ways.
 - Assertion: validator rejects; old generation intact.
 - Covers: §3a.2

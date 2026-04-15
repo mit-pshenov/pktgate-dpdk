@@ -99,7 +99,7 @@ TEST(RulesetBuilder, ArenaSizingFromConfig_U4_1) {
   r2.src_mac = Mac{{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}};
 
   append_rule(cfg.pipeline.layer_3, 200, ActionDrop{});
-  // L3 rules need at least src_subnet or dst_subnet — but the compiler
+  // L3 rules need at least dst_subnet — but the compiler
   // doesn't enforce this at M2 level (no FIB). A bare rule is fine for
   // action array sizing.
 

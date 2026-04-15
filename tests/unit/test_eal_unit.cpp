@@ -302,7 +302,7 @@ class BuilderEalTest : public EalFixture {};
 // U4.2 — FIB4 population [needs EAL]
 //
 // Three L3v4 rules with distinct destination prefixes (resolved via
-// src_subnet since M1 has no dst_subnet). After populate_ruleset_eal
+// `dst_subnet` SubnetRef → object pool). After populate_ruleset_eal
 // the v4 FIB must return the correct action_idx for in-prefix addresses
 // and the default (no match) for an outside address.
 // =========================================================================
@@ -328,11 +328,11 @@ TEST_F(BuilderEalTest, U4_2_Fib4Population) {
   cfg.objects.subnets.push_back(std::move(c));
 
   auto& r1 = append_rule(cfg.pipeline.layer_3, 3001, ActionDrop{});
-  r1.src_subnet = SubnetRef{"net_a"};
+  r1.dst_subnet = SubnetRef{"net_a"};
   auto& r2 = append_rule(cfg.pipeline.layer_3, 3002, ActionAllow{});
-  r2.src_subnet = SubnetRef{"net_b"};
+  r2.dst_subnet = SubnetRef{"net_b"};
   auto& r3 = append_rule(cfg.pipeline.layer_3, 3003, ActionDrop{});
-  r3.src_subnet = SubnetRef{"net_c"};
+  r3.dst_subnet = SubnetRef{"net_c"};
 
   CompileResult cr = compile(cfg);
   ASSERT_FALSE(cr.error.has_value());
@@ -400,9 +400,9 @@ TEST_F(BuilderEalTest, U4_3_Fib6Population) {
   cfg.objects.subnets.push_back(std::move(b));
 
   auto& r1 = append_rule(cfg.pipeline.layer_3, 4001, ActionDrop{});
-  r1.src_subnet = SubnetRef{"v6_a"};
+  r1.dst_subnet = SubnetRef{"v6_a"};
   auto& r2 = append_rule(cfg.pipeline.layer_3, 4002, ActionAllow{});
-  r2.src_subnet = SubnetRef{"v6_b"};
+  r2.dst_subnet = SubnetRef{"v6_b"};
 
   CompileResult cr = compile(cfg);
   ASSERT_FALSE(cr.error.has_value());
@@ -1650,9 +1650,9 @@ TEST_F(ClassifyL3Ipv4Test, U6_18_Ipv4DstFibHitDispatch) {
   cfg.objects.subnets.push_back(std::move(target));
 
   auto& r_filler = append_rule(cfg.pipeline.layer_3, 6018, ActionDrop{});
-  r_filler.src_subnet = SubnetRef{"net_filler"};
+  r_filler.dst_subnet = SubnetRef{"net_filler"};
   auto& r_target = append_rule(cfg.pipeline.layer_3, 6019, ActionAllow{});
-  r_target.src_subnet = SubnetRef{"net_target"};
+  r_target.dst_subnet = SubnetRef{"net_target"};
 
   CompileResult cr = compile(cfg);
   ASSERT_FALSE(cr.error.has_value());
@@ -1747,9 +1747,9 @@ TEST_F(ClassifyL3Ipv4Test, U6_18a_Ipv4DstFibMissFallsThrough) {
   cfg.objects.subnets.push_back(std::move(target));
 
   auto& r_filler = append_rule(cfg.pipeline.layer_3, 6020, ActionDrop{});
-  r_filler.src_subnet = SubnetRef{"net_filler"};
+  r_filler.dst_subnet = SubnetRef{"net_filler"};
   auto& r_target = append_rule(cfg.pipeline.layer_3, 6021, ActionAllow{});
-  r_target.src_subnet = SubnetRef{"net_target"};
+  r_target.dst_subnet = SubnetRef{"net_target"};
 
   CompileResult cr = compile(cfg);
   ASSERT_FALSE(cr.error.has_value());
@@ -1817,7 +1817,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_18a_Ipv4DstFibMissFallsThrough) {
 // `L3CompoundEntry` via `ruleset::make_l3_entry(...)`; classify_l3
 // unpacks the next-hop slot and checks the tag instead of nh-against-zero.
 //
-// Setup: a SINGLE L3 drop rule whose src_subnet resolves to an IPv4
+// Setup: a SINGLE L3 drop rule whose dst_subnet resolves to an IPv4
 // prefix, so after compile the target rule lands at `action_idx = 0`
 // and its packed L3CompoundEntry (filter_mask=0, action_idx=0) is
 // literally all-zero except for the new `valid_tag` byte. Before C1b
@@ -1850,7 +1850,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_18b_Ipv4DstFibHitAtActionIdxZero) {
   cfg.objects.subnets.push_back(std::move(target));
 
   auto& r_target = append_rule(cfg.pipeline.layer_3, 6022, ActionDrop{});
-  r_target.src_subnet = SubnetRef{"net_target"};
+  r_target.dst_subnet = SubnetRef{"net_target"};
 
   CompileResult cr = compile(cfg);
   ASSERT_FALSE(cr.error.has_value());

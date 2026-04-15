@@ -185,9 +185,10 @@ No EAL, no mempool, no sockets.
 - Covers: D6.
 
 ### U1.28 `objects.subnets` object-reference resolved
-- Goal: `src_subnet: "corp_v4"` parses as object reference and
+- Goal: `dst_subnet: "corp_v4"` parses as object reference and
   the unresolved form survives the parse stage (resolution is
-  the validator's job).
+  the validator's job). The field was named `src_subnet` until
+  M5 C1c P10(c) rename (2026-04-15); the contract is unchanged.
 - Covers: D8 (object model), compiler pipeline step.
 
 ### U1.29 Action exactly-one invariant
@@ -262,6 +263,24 @@ No EAL, no mempool, no sockets.
   `kTypeMismatch`; field omitted → optional stays empty.
 - Covers: F1 (pipeline order, parser half), D8.
 
+### U1.36 Deprecated `src_subnet` key rejected (P10(c))
+- Goal: M5 C1c P10(c) resolution. `src_subnet` was renamed to
+  `dst_subnet` on 2026-04-15 — the historical "src" slot was
+  always packed by the compiler as `kIpv{4,6}DstPrefix`, so the
+  rename retroactively corrects the semantics with no schema
+  shim. The parser must reject any rule that still carries
+  `"src_subnet"` with an explicit deprecation error that names
+  BOTH literals (`src_subnet`, `dst_subnet`) and references
+  `P10(c)` so the operator can grep the resolution record.
+- Inputs: layer_3 rule object with `"src_subnet": "10.0.0.0/24"`
+  and no `"dst_subnet"` key.
+- Assertions: parse fails; the error message contains the
+  literal substrings `src_subnet`, `dst_subnet`, and `P10`.
+- Covers: M5 C1c rename, P10(c) resolution, D8 (strict object
+  model — no silent backcompat). The `dst_subnet` happy-path
+  contract is covered by the renamed-in-place U1.28 / U2.* L3
+  fixtures.
+
 ---
 
 ## U2 — Validator (`src/config/validator.*`)
@@ -272,7 +291,7 @@ No EAL, no mempool, no sockets.
 - Covers: D8 (object model).
 
 ### U2.2 Object reference — dangling rejected
-- Inputs: rule references `src_subnet: "ghost"` not declared.
+- Inputs: rule references `dst_subnet: "ghost"` not declared.
 - Assertions: `UnresolvedObject` error naming `ghost`.
 - Covers: D8.
 
@@ -399,7 +418,7 @@ these tests — those live in U4 (`needs EAL`).
 ### U3.Smoke1 Pipeline smoke — end-to-end top-level `compile()` (D41)
 - Goal: exercise the full compiler pipeline through the public
   `compile()` entry point. Feed a config with one L2 rule (src_mac
-  + vlan), one L3 rule (src_subnet → resolved CIDR), and one L4
+  + vlan), one L3 rule (dst_subnet → resolved CIDR), and one L4
   rule (proto + dst_port). Assert that `result.l2_compound`,
   `result.l3_compound`, and `result.l4_compound` are all non-empty
   and that the entries carry the expected primary_kind / action_idx.

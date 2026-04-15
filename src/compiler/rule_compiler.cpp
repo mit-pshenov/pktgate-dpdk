@@ -246,22 +246,17 @@ L4CompileOutput compile_l4_rules(
 // -------------------------------------------------------------------------
 // compile_l3_rules — L3 compound construction (M4 C0 retrofit, D41).
 //
-// Current M1 config model (src/config/model.h) only exposes
-// `src_subnet` as an unresolved SubnetRef on Rule — there is no
-// dst_subnet field yet. For parity with L2/L4 (D15 primary + mask),
-// we read the resolved src_subnet CIDRs from CompiledObjects and
-// emit one L3CompiledRule per CIDR. Rules with no subnet reference
-// at all produce no compound output (they will fall through to
-// default behaviour at classify_l3 time).
+// Reads the unresolved `dst_subnet` SubnetRef on each Rule, resolves
+// it through `CompiledObjects.subnets`, and emits one L3CompiledRule
+// per CIDR with `primary_kind = kIpv{4,6}DstPrefix`. Rules without
+// any subnet reference produce no compound output (classify_l3 falls
+// through to the default behaviour for packets they would have
+// matched). Mixed-family subnets produce one compound rule per CIDR.
 //
-// This matches the "L3 rules need at least src_subnet or dst_subnet"
-// comment in tests/unit/test_builder.cpp U4.1 — the builder doesn't
-// enforce it, but the compound path skips address-less L3 rules.
-//
-// Planning note: when M1 grows `dst_subnet` on Rule, compile_l3_rules
-// must switch the primary key source and emit one entry per dst CIDR.
-// The L3CompoundEntry layout stays the same (filter_mask already has
-// a reserved slot for the secondary constraint).
+// M5 C1c (P10(c) rename, 2026-04-15): the field was named `src_subnet`
+// in the AST until this cycle. The compiler had always packed the
+// resolved CIDRs as the destination-prefix primary, so the rename was
+// a pure semantic correction with no logic change here.
 
 std::vector<L3CompiledRule> compile_l3_rules(
     const std::vector<config::Rule>& rules,
@@ -272,13 +267,13 @@ std::vector<L3CompiledRule> compile_l3_rules(
 
   for (std::size_t ri = 0; ri < rules.size(); ++ri) {
     const auto& rule = rules[ri];
-    if (!rule.src_subnet.has_value()) {
+    if (!rule.dst_subnet.has_value()) {
       // No address constraint — skip. Classify_l3 will fall through
       // to the default_behavior for packets this rule would have
       // matched if it carried a prefix constraint.
       continue;
     }
-    const auto& subnet_name = rule.src_subnet->name;
+    const auto& subnet_name = rule.dst_subnet->name;
     auto it = objects.subnets.by_name.find(subnet_name);
     if (it == objects.subnets.by_name.end()) {
       // Unresolved reference. The validator (M1 C8) is supposed to

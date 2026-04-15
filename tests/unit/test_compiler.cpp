@@ -1373,7 +1373,7 @@ TEST(EmptyPipeline, EmptyPipelineValid_U3_26) {
 // wiring bug.
 //
 // Input config intentionally has rules of all three layers (L2 with
-// src_mac, L3 with src_subnet, L4 with proto+dst_port) so the smoke
+// src_mac, L3 with dst_subnet, L4 with proto+dst_port) so the smoke
 // assertions on l{2,3,4}_compound non-emptiness bite.
 //
 // Covers: D41.
@@ -1386,7 +1386,7 @@ TEST(PipelineSmoke, CompileEndToEnd_U3_Smoke1) {
   r2.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}};
   r2.vlan_id = 42;
 
-  // L3 rule: src_subnet "corp_v4" → 10.0.0.0/8.
+  // L3 rule: dst_subnet "corp_v4" → 10.0.0.0/8.
   // Populate the subnet object so compile_l3_rules can resolve the
   // SubnetRef and produce a compound entry.
   SubnetObject corp;
@@ -1398,7 +1398,7 @@ TEST(PipelineSmoke, CompileEndToEnd_U3_Smoke1) {
   cfg.objects.subnets.push_back(std::move(corp));
 
   auto& r3 = append_rule(cfg.pipeline.layer_3, 2001, ActionDrop{});
-  r3.src_subnet = SubnetRef{"corp_v4"};
+  r3.dst_subnet = SubnetRef{"corp_v4"};
 
   // L4 rule: tcp/443 (compound with proto+dport primary).
   auto& r4 = append_rule(cfg.pipeline.layer_4, 3001, ActionDrop{});

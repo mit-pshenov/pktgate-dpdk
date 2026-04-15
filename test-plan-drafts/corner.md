@@ -811,7 +811,7 @@ All `[scapy-pytest]`.
 - Covers: D8 strict version match.
 
 ### C7.22 Forward-reference to undefined object group
-- Config: L3 rule uses `"src_subnet": "nonexistent_group"`.
+- Config: L3 rule uses `"dst_subnet": "nonexistent_group"`.
 - Assert: `validate_err`, sub-reason `unresolved_object_ref`.
 - Covers: D8 validator.
 

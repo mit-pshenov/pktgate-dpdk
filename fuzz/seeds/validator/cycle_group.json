@@ -16,12 +16,12 @@
     "layer_3": [
       {
         "id": 1,
-        "src_subnet": "group_a",
+        "dst_subnet": "group_a",
         "action": { "type": "allow" }
       },
       {
         "id": 2,
-        "src_subnet": "group_b",
+        "dst_subnet": "group_b",
         "action": { "type": "drop" }
       }
     ],

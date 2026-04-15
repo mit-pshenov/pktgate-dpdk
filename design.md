@@ -184,8 +184,7 @@ are reused.
         "match": {
           "interface":   "upstream_port",
           "vrf":         0,
-          "src_subnet":  "corp_v4",          // object ref
-          "dst_subnet":  "10.10.0.0/16"
+          "dst_subnet":  "corp_v4"           // object ref
         },
         "action": { "type": "rate-limit",
                     "rate": "200Mbps", "burst_ms": 10 },

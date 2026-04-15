@@ -414,8 +414,27 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
                     "pipeline rule entry must be a JSON object");
   }
 
+  // M5 C1c (P10(c) rename, 2026-04-15) — deprecated-key reject.
+  // The historical L3 rule field `src_subnet` was renamed to
+  // `dst_subnet`; it had always been packed as the destination prefix
+  // by the L3 compiler, so the rename retroactively corrects the
+  // semantics. There is NO backcompat shim — the schema is pre-freeze
+  // and there are zero external consumers — so any rule that still
+  // carries `"src_subnet"` is rejected here with an explicit
+  // deprecation error that names BOTH literals and the P10 marker so
+  // the operator can grep `review-notes.md §P10` for the resolution
+  // record. Pinned by `ParserU1_36`.
+  if (j.contains("src_subnet")) {
+    return make_err(
+        ParseError::kUnknownField,
+        "rule field 'src_subnet' was renamed to 'dst_subnet' in "
+        "P10(c) (2026-04-15). Update your config; no backcompat "
+        "shim is provided.");
+  }
+
   // Strict per-rule whitelist. C5 adds id/action/hw_offload_hint/tcp_flags.
-  // C6.5 adds src_subnet (U1.28 — unresolved object reference).
+  // C6.5 adds dst_subnet (U1.28 — unresolved object reference; named
+  // `src_subnet` until M5 C1c P10(c) rename, 2026-04-15).
   // C7 adds `interface` (U2.3/U2.4 — unresolved interface_roles ref,
   // resolution happens in the C7 validator).
   // C7.6 adds the L2 compound key trio + `next_layer` (U1.33/U1.34/
@@ -428,7 +447,7 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   constexpr std::array<std::string_view, 14> kAllowedRuleKeys = {
       "id",         "dst_port",        "dst_ports",  "vlan_id",
       "pcp",        "hw_offload_hint", "tcp_flags",  "action",
-      "src_subnet", "interface",       "src_mac",    "dst_mac",
+      "dst_subnet", "interface",       "src_mac",    "dst_mac",
       "ethertype",  "next_layer"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     const std::string& key = it.key();
@@ -520,19 +539,22 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
     out.action = act;
   }
 
-  // C6.5 U1.28 — `src_subnet` unresolved object reference. Parser
-  // stores the raw name verbatim in a SubnetRef; validator (C8) maps
-  // it to an entry in `objects.subnets`. The parser stays dumb:
+  // C6.5 U1.28 / M5 C1c (P10(c) rename, 2026-04-15) — `dst_subnet`
+  // unresolved object reference. Parser stores the raw name verbatim
+  // in a SubnetRef; validator (C8) maps it to an entry in
+  // `objects.subnets`. The L3 compiler packs the resolved CIDR(s) as
+  // the destination-prefix primary key. The parser stays dumb:
   // empty-string and dangling-name detection are not our business.
-  // Only the structural type-check is enforced here.
-  if (j.contains("src_subnet")) {
-    const json& v = j["src_subnet"];
+  // Only the structural type-check is enforced here. The deprecated
+  // `"src_subnet"` JSON key is rejected at the top of `parse_rule`.
+  if (j.contains("dst_subnet")) {
+    const json& v = j["dst_subnet"];
     if (!v.is_string()) {
       return make_err(ParseError::kTypeMismatch,
-                      "rule field 'src_subnet' must be a string "
+                      "rule field 'dst_subnet' must be a string "
                       "(object reference into objects.subnets)");
     }
-    out.src_subnet = SubnetRef{v.get<std::string>()};
+    out.dst_subnet = SubnetRef{v.get<std::string>()};
   }
 
   // C7 U2.3/U2.4 — `interface` unresolved role reference. Parser

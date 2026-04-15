@@ -642,6 +642,15 @@ outcome. Implementation path is chosen by the user; the
 supervisor does not dispatch rename/growth cycles until P10 is
 resolved.
 
+**Resolution 2026-04-15: option (c) adopted.** Rename
+`src_subnet` → `dst_subnet` landed in M5 C1c commit `<c1c-sha>`
+(placeholder — supervisor patches with the real short sha
+in a follow-up housekeeping commit; sha self-reference is
+the classic content-address fixed-point problem). No
+backcompat shim; parser emits an explicit deprecation
+error on the old key. Src-prefix secondary probe deferred
+to v2 as a separate feature.
+
 ---
 
 ## Batch revision plan
@@ -1076,10 +1085,27 @@ Also missing from budget:
    structure and amortizes nicely. Flag as plan-phase
    optimization.
 
-2. **§5.3 "try src?" dead branch** — the comment is half-finished;
-   either implement src-prefix FIB lookup or remove the stub.
-   Tied to the compound-L3 compiler strategy (§5.3 last
-   paragraph). Complete the description.
+2. **§5.3 "try src?" dead branch** — split into two halves by
+   M5 C1c (P10(c) resolution, 2026-04-15):
+
+   - **Primary-key half [CLOSED 2026-04-15 via M5 C1c].** The
+     primary-key source for the dst-prefix FIB is now
+     unambiguously `Rule.dst_subnet` (the field was named
+     `src_subnet` until the rename — see §P10 resolution). The
+     compiler, parser, validator, and dataplane all agree on
+     the dst-prefix label. No more half-finished comment in
+     §5.3 about "try src?" — the only L3 primary key is the
+     destination prefix.
+
+   - **Src-prefix secondary half [DEFERRED_V2].** Src-prefix
+     secondary probe from §5.3 is deferred to v2 as an
+     independent filter stage; not shipping in MVP. v2 will
+     introduce a dedicated config field (separate from
+     `dst_subnet`), dedicated `l3_v{4,6}_src` FIB storage, and
+     a separate filter stage in `classify_l3` after the
+     dst-prefix primary lookup. M4 C0b's pre-allocated
+     `l3_v4_src` / `l3_v6_src` slot in `Ruleset` stays as
+     architectural carry — it is not populated in MVP.
 
 3. **§5.1 `handle_idle(ctx)`** — undefined. Must specify: does
    it sleep, spin, or call `rte_rcu_qsbr_thread_offline`? If it

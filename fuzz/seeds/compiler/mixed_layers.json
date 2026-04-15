@@ -32,7 +32,7 @@
     "layer_3": [
       {
         "id": 100,
-        "src_subnet": "internal",
+        "dst_subnet": "internal",
         "interface": "upstream_port",
         "action": { "type": "allow" }
       }

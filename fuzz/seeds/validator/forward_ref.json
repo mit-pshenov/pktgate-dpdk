@@ -10,7 +10,7 @@
     "layer_3": [
       {
         "id": 1,
-        "src_subnet": "nonexistent_group",
+        "dst_subnet": "nonexistent_group",
         "action": { "type": "drop" }
       }
     ],

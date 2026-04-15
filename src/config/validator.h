@@ -69,7 +69,7 @@ struct ValidateOk {};
 
 struct ValidateError {
   enum Kind : std::uint8_t {
-    kUnresolvedObject,        // U2.2 — rule.src_subnet name not in objects.subnets
+    kUnresolvedObject,        // U2.2 — rule.dst_subnet name not in objects.subnets
     kUnresolvedInterfaceRef,  // U2.4 — rule.interface name not in interface_roles
     kDuplicateRuleId,         // U2.5 — two rules in same layer share id
     kKeyCollision,            // U2.7 — identical L2 compound key (D15)

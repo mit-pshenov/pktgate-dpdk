@@ -5,7 +5,7 @@
 // U2.7 / U2.18 / U2.19 / U2.20 exercise:
 //
 //   * Walk every Rule in Pipeline.layer_{2,3,4}. For each rule:
-//       - If `src_subnet` is set, look up the name in
+//       - If `dst_subnet` is set, look up the name in
 //         `Config.objects.subnets`. Miss → kUnresolvedObject.
 //       - If `interface_ref` is set, look up the name in
 //         `Config.interface_roles`. Miss → kUnresolvedInterfaceRef.
@@ -351,13 +351,13 @@ std::optional<ValidateError> validate_rules(const Config& cfg,
   for (std::size_t i = 0; i < rules.size(); ++i) {
     const Rule& r = rules[i];
 
-    if (r.src_subnet.has_value()) {
-      const std::string& name = r.src_subnet->name;
+    if (r.dst_subnet.has_value()) {
+      const std::string& name = r.dst_subnet->name;
       if (!has_subnet_named(cfg, name)) {
         return make_err(
             ValidateError::kUnresolvedObject,
             std::string{"rule id "} + std::to_string(r.id) + " in " +
-                layer_name + " references src_subnet '" + name +
+                layer_name + " references dst_subnet '" + name +
                 "' which is not declared in objects.subnets");
       }
     }

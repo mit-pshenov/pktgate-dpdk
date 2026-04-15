@@ -237,10 +237,26 @@ No action in M5 C1 errata — flagged here purely so the next
 reader does not misread U6.18's "src\_subnet routes through the
 dst FIB" as a C1 worker bug.
 
+Under P10(c) (resolved 2026-04-15 in M5 C1c), fixtures
+rename in one sed pass; test logic unchanged. U6.18 /
+U6.18a / U6.18b stay green transparently — they live on
+`action_idx >= 1` and the rename only touches field name /
+JSON key.
+
 *Origin: M5 C2 worker stop-and-report 2026-04-15 → consultant
 verification of code paths → P10 promotion.*
 
-### C2 BLOCKED on review-notes P10
+### C2 BLOCKED on review-notes P10 → RESOLVED via M5 C1c rename
+
+**RESOLVED 2026-04-15 → subsumed into M5 C1c rename.**
+User chose P10 option (c). No secondary FIB cycle; no
+`l3_v4_src`/`l3_v6_src` storage. C2 row in the state
+table became SUBSUMED_BY_C1c. See C1c commit `<c1c-sha>`
+(placeholder — supervisor patches the real short sha
+post-report).
+
+Historical record below preserved verbatim for the
+decision trail.
 
 **M5 C2 as written in `implementation-plan.md` §M5 is
 undispatchable until `review-notes.md` §P10 resolves.**

@@ -104,19 +104,10 @@ struct L2CompiledRule {
 // L3PrimaryKind — which FIB the rule's primary key lands in.
 //
 // M4 C0 retrofit (D41). Primary key is the destination prefix of
-// the rule. The current config AST (src/config/model.h) only carries
-// `src_subnet` as an unresolved SubnetRef — there is no dst_subnet
-// field yet. For parity with L2/L4, compile_l3_rules picks the
-// first CIDR of the resolved src_subnet object as the primary key
-// until M1 grows a dst_subnet field. Rules with no L3 address
+// the rule, sourced from `Rule.dst_subnet` (renamed from `src_subnet`
+// in M5 C1c, P10(c) resolution 2026-04-15). Rules with no L3 address
 // constraint at all produce no L3 compound entry (no primary to
 // key on).
-//
-// See grabli_m4c0_l3_dst_missing.md — flagged as a plan-vs-model
-// inconsistency for the supervisor; worker did NOT silent-reinterpret
-// D15 (compound primary + filter_mask), only noted that M1 ships
-// without dst_subnet and L3 primary routing is deferred to the
-// first cycle that needs it on the dataplane path (M5 classify_l3).
 
 enum class L3PrimaryKind : std::uint8_t {
   kIpv4DstPrefix,
@@ -128,10 +119,7 @@ enum class L3PrimaryKind : std::uint8_t {
 //
 // Holds the primary key (IPv4 32-bit or IPv6 128-bit prefix + depth),
 // the compound entry (action_idx + filter_mask for future secondary
-// constraints), and the kind discriminator. For the current M1 config
-// model without dst_subnet, compile_l3_rules reads src_subnet as a
-// provisional primary so L3 has *some* compound state to feed the
-// D41 smoke test and the C0b rte_fib populate path.
+// constraints), and the kind discriminator.
 
 struct L3CompiledRule {
   L3PrimaryKind primary_kind;
@@ -214,11 +202,9 @@ L4CompileOutput compile_l4_rules(
 // compile_l3_rules — build L3 compound entries from config rules (M4 C0).
 //
 // For each L3 rule, resolves the rule's destination prefix by looking
-// up the rule's primary address constraint in the compiled subnet pool.
-// Because the current M1 Rule AST only carries `src_subnet` (no
-// dst_subnet field), the primary key falls back to the first CIDR of
-// the resolved src_subnet entry; rules without any subnet ref produce
-// no compound output.
+// up `Rule.dst_subnet` in the compiled subnet pool and emits one
+// L3CompiledRule per CIDR. Rules without any subnet ref produce no
+// compound output.
 //
 // Invariants:
 //   * Output order matches input rule order (first-match-wins preserved).

@@ -219,12 +219,12 @@ void expect_parse_ok(const ParseResult& r, const std::string& doc) {
 // -------------------------------------------------------------------------
 // U2.1 — object reference resolution, valid case.
 //
-// A rule carrying `src_subnet: "corp_v4"` against a config that declares
+// A rule carrying `dst_subnet: "corp_v4"` against a config that declares
 // `objects.subnets.corp_v4 = [10.0.0.0/8]` must validate clean.
 
 TEST(ValidatorU2_1, ObjectRefValid) {
   const std::string doc = make_doc_with_layer3_rule_and_subnets(
-      R"({ "id": 1, "src_subnet": "corp_v4" })",
+      R"({ "id": 1, "dst_subnet": "corp_v4" })",
       R"({ "corp_v4": ["10.0.0.0/8"] })");
   const ParseResult pr = parse(doc);
   expect_parse_ok(pr, doc);
@@ -241,14 +241,14 @@ TEST(ValidatorU2_1, ObjectRefValid) {
 // -------------------------------------------------------------------------
 // U2.2 — dangling object reference rejected.
 //
-// Same shape as U2.1 but the rule references `src_subnet: "ghost"` which
+// Same shape as U2.1 but the rule references `dst_subnet: "ghost"` which
 // is not declared anywhere in `objects.subnets`. The validator must
 // return `kUnresolvedObject` and the message must literally contain the
 // offending name (`ghost`) so an operator can jump straight to the typo.
 
 TEST(ValidatorU2_2, ObjectRefDangling) {
   const std::string doc = make_doc_with_layer3_rule_and_subnets(
-      R"({ "id": 2, "src_subnet": "ghost" })",
+      R"({ "id": 2, "dst_subnet": "ghost" })",
       R"({ "corp_v4": ["10.0.0.0/8"] })");
   const ParseResult pr = parse(doc);
   expect_parse_ok(pr, doc);

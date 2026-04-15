@@ -199,10 +199,18 @@ struct Rule {
   bool hw_offload_hint = false;          // U1.23 D4
   std::optional<TcpFlags> tcp_flags{};   // U1.30 D15
   std::optional<RuleAction> action{};    // U1.29 D15 exactly-one
-  // U1.28 / C6.5: unresolved `src_subnet` reference. Populated by the
-  // parser when a rule carries `"src_subnet": "<name>"`; the C8
-  // validator maps the name to an entry in `objects.subnets`.
-  std::optional<SubnetRef> src_subnet{};
+  // U1.28 / C6.5 / M5 C1c (P10(c) rename, 2026-04-15): unresolved
+  // `dst_subnet` reference. Populated by the parser when a rule carries
+  // `"dst_subnet": "<name>"`; the C8 validator maps the name to an
+  // entry in `objects.subnets`. The L3 compiler packs the resolved
+  // CIDR(s) as the destination-prefix primary key for `kIpv{4,6}DstPrefix`.
+  // Historical note: this slot was named `src_subnet` until M5 C1c —
+  // the parser had always stored the value here and the compiler had
+  // always packed it as a dst-prefix, so the rename retroactively
+  // corrects the semantics with no FIB or storage changes. The
+  // deprecated `"src_subnet"` JSON key is rejected at parse time
+  // (see ParserU1_36).
+  std::optional<SubnetRef> dst_subnet{};
   // C7 / U2.3 / U2.4 (D5): unresolved role name reference. Populated
   // by the parser when a rule carries `"interface": "<name>"`; the
   // validator maps the name to an entry in `interface_roles`.
