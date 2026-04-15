@@ -205,6 +205,100 @@ time as this errata entry.
 *Origin: M5 C1 worker stopped at RED-prep 2026-04-15 → supervisor
 resolution same day (Option A).*
 
+### C1 U6.18 / U6.18a validate an interim wrong-primary-key schema
+
+C1 tests (U6.18 dst FIB hit, U6.18a dst FIB miss) exercise the
+current pipeline as it is: `compile_l3_rules` reads
+`rule.src_subnet`, packs each CIDR as `L3PrimaryKind::kIpv4DstPrefix`,
+`populate_ruleset_eal` inserts it into the dst-prefix FIB, and
+`classify_l3` reads it back as a dst-prefix match. All three
+layers agree on the wrong label, so the tests pass and the
+dataplane routes packets correctly.
+
+This is **not** an M5 bug — it is the same `src_subnet`-as-dst-primary
+interim that `rule_compiler.{h:108-132,218-220; cpp:261-264}` has
+documented since M2 and that `review-notes.md` §5.3 "try src?"
+dead-branch item has been tracking as an open design question.
+Formalised at handoff time as `review-notes.md` §P10. See that
+entry for the three resolution options (defer / grow / rename)
+and the consultant lean.
+
+**Impact on U6.18 / U6.18a under each P10 option:**
+
+- **(a) defer:** tests stay as-is, interim schema is MVP forever.
+- **(b) grow dst_subnet:** U6.18 / U6.18a fixtures rewrite to
+  feed `dst_subnet` as the address constraint. Logic of the tests
+  (hit → dispatch, miss → fall through) stays identical.
+- **(c) rename src_subnet → dst_subnet:** U6.18 / U6.18a fixtures
+  update their JSON field name in one sed pass; test logic
+  unchanged.
+
+No action in M5 C1 errata — flagged here purely so the next
+reader does not misread U6.18's "src\_subnet routes through the
+dst FIB" as a C1 worker bug.
+
+*Origin: M5 C2 worker stop-and-report 2026-04-15 → consultant
+verification of code paths → P10 promotion.*
+
+### C2 BLOCKED on review-notes P10
+
+**M5 C2 as written in `implementation-plan.md` §M5 is
+undispatchable until `review-notes.md` §P10 resolves.**
+
+C2 cell description: *"IPv4 src-prefix secondary + compound L3
+(src+dst / VRF)"*. M5 handoff `§C2` repeated the same. None of
+this is implementable against current code, because:
+
+- No `dst_subnet` field exists on `config::Rule` (model.h:205) —
+  so "src-prefix secondary" has nothing to complement.
+- `src_subnet` is already consumed as the primary key
+  (rule_compiler.cpp:275-298) — a second "src-prefix probe" has
+  no distinct source field.
+- `Ruleset` has no `l3_v4_src` / `l3_v6_src` storage — the
+  secondary FIB does not exist.
+- `test-plan-drafts/unit.md` has zero src-prefix secondary
+  tests — the plan cell's RED list is an empty set.
+
+**Cause.** Plan cell was written in batch assuming M1/M2 would
+grow `dst_subnet` before M5 arrived. They did not. The same
+parallel-track debt is simultaneously tracked in
+`review-notes.md` §5.3 dead-branch item. Nobody cross-checked
+plan cells against open items at plan-authoring time. See memory
+grabli `plan_cell_assumes_unscheduled_debt` for the generalised
+pattern.
+
+**Supervisor action.**
+
+- M5 handoff state-table row for C2 → `BLOCKED_ON_P10` (per
+  `scratch/m5-supervisor-handoff.md` patch landing with this
+  errata entry).
+- **Do not dispatch C2** until user resolves P10.
+- **C3 – C10 are independent** of src-prefix secondary per the
+  handoff dependencies matrix and may proceed:
+  - C3 = IPv4 fragments + D40 — works on C1 body; no src probe.
+  - C4 = IPv6 dst FIB + D31 — parallel IPv6 branch of C1.
+  - C5 = IPv6 ext-header D20 — protocol walk only.
+  - C6 = IPv6 Fragment ext D27 + D40 — fragment logic only.
+  - C7 = IPv4 corner — uses C1-C3 body.
+  - C8 = IPv6 corner — uses C4-C6 body.
+  - C9 = fragment policy matrix — uses C3 + C6.
+  - C10 = F4 functional + REFACTOR — uses C1-C6 body.
+- M5 C1b retrofit (`valid_tag` disambiguation of FIB miss vs
+  zero-packed entry) is **mechanical, independent of P10**, and
+  dispatches first in the new order: `C1 → C1b → C3 → C4 → …`.
+  C2 sits in a parking lot; if P10 option (a)/(c) resolves, C2
+  closes as "deferred" or "subsumed into rename"; if option (b)
+  resolves, C2 reopens after the multi-milestone growth work
+  lands and gets a fresh row in the state table.
+
+**Follow-up on P10 resolution.** Whoever closes P10 is responsible
+for updating this errata entry (status: RESOLVED → option X
+chosen) and either deleting C2's BLOCKED row in the handoff or
+rewriting its scope per the chosen option.
+
+*Origin: M5 C2 worker stop-and-report 2026-04-15 → consultant
+claim verification → P10 promotion + C2 blocking.*
+
 ### D32 QinQ `l3_offset = 22` never happens in MVP
 Earlier handoff template prose said "QinQ → l3_offset=22" but
 `classify_l2` walks exactly one tag in MVP (0x8100 or 0x88A8), so

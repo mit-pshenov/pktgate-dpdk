@@ -560,6 +560,88 @@ automatic topological analysis come in v2 or v3? Architectural hook
 (rule tiering + dual-path dataplane) is the same either way; the
 difference is compiler complexity. Defer to plan discussion.
 
+### P10 — compound-L3 primary key source (src_subnet / dst_subnet)
+
+Surfaced 2026-04-15 when M5 C2 worker stopped on RED-prep. The
+long-standing open batch-revision item **§5.3 "try src?" dead
+branch** (see this file's Review pass — §5.3 parser / fragments
+section, item "dead branch — the comment is half-finished; either
+implement src-prefix FIB lookup or remove the stub") tied directly
+to a concrete dispatchability problem in M5.
+
+**Observed state of the code (verified 2026-04-15):**
+
+- `src/config/model.h:205` — `config::Rule` has only
+  `std::optional<SubnetRef> src_subnet`. There is no `dst_subnet`
+  field anywhere in the config model, parser, or validator.
+- `src/compiler/rule_compiler.cpp:275-298` — `compile_l3_rules`
+  reads `rule.src_subnet`, resolves the SubnetRef through
+  `CompiledObjects`, and emits every CIDR with
+  `primary_kind = L3PrimaryKind::kIpv4DstPrefix` (or `kIpv6DstPrefix`).
+  **The `src_subnet` CIDR is packed as the dst-prefix primary key
+  of the L3 FIB.** This is semantically wrong but mechanically
+  consistent with the rest of the pipeline.
+- `src/compiler/rule_compiler.{h:108-132,218-220; cpp:261-264}` —
+  the compiler itself documents the interim explicitly: *"when M1
+  grows `dst_subnet` on Rule, compile_l3_rules must switch the
+  primary key source and emit one entry per dst CIDR. The
+  L3CompoundEntry layout stays the same (filter_mask already has
+  a reserved slot for the secondary constraint)."*
+- `src/ruleset/ruleset.h` — has `l3_v4_fib` / `l3_v6_fib` but no
+  `l3_v4_src` / `l3_v6_src`. The secondary src-prefix probe has no
+  storage.
+- `test-plan-drafts/unit.md` — zero src-prefix secondary tests.
+  All L3 U6.* entries are dst-prefix + truncation + fragments +
+  ext-headers.
+- M5 C1 tests `U6.18` / `U6.18a` (tests/unit/test_eal_unit.cpp:
+  1500+) route traffic through this interim schema and are
+  functionally correct under it (`populate_ruleset_eal` and
+  `classify_l3` both treat the FIB as dst-prefix, and the compiler
+  feeds it src\_subnet, so the three layers agree on the wrong
+  label).
+
+**Why this is a user-level decision.** Three coherent options
+exist, each with different scope and cost:
+
+- **(a) Defer to v2.** Accept interim; src-prefix secondary does
+  not ship in MVP; `src_subnet` stays as-is and is effectively
+  routed as dst-prefix under its current name. Closes M5 C2 as
+  "deferred to post-MVP". Cheapest. Risk: v2 inherits a
+  named-as-src-but-actually-dst footgun; any new dev onboarding
+  will misread the rule semantics.
+- **(b) Grow `dst_subnet` now.** Net-new cycle set:
+  (i) M1 parser/validator extension for `dst_subnet` + unit
+  coverage; (ii) M2 compiler rewrite (primary = dst, optional
+  secondary = src) + compound filter\_mask logic mirroring L2/L4
+  (D15); (iii) M3/M4 ruleset extension for `l3_v4_src`, `l3_v6_src`
+  storage + builder_eal population; (iv) M5 C2 reimplementation as
+  real src-prefix secondary probe on top of a dst primary. Scale:
+  roughly M1 C0 retrofit. Correct, but burns significant work on a
+  feature that `input.md` does not explicitly require and the
+  customer has not asked for.
+- **(c) Rename `src_subnet` → `dst_subnet` in the config model.**
+  Acknowledges that today's "src" slot was always effectively a
+  dst prefix; no new secondary path in MVP; defer src-prefix
+  secondary entirely as a separate v2 feature. Scope: M1 field
+  rename (parser + validator + model docs + fixtures) + M2
+  compiler field rename; M3/M4/M5 code is untouched because the
+  FIB already treats the bytes as dst-prefix. Mid-cost. Breaks any
+  existing config fixtures that use `src_subnet` — MVP blast
+  radius is small because the config schema is still pre-freeze.
+
+**Consultant lean (2026-04-15): (c).** It retroactively corrects
+the semantics without building infrastructure that is not in MVP
+scope, surfaces the interim gap as an explicit rename commit
+(rather than burying it under a "deferred" sticker), and keeps v2
+free to introduce a real src-prefix secondary on top of a
+correctly-named dst field. Needs user ok before any file edits.
+
+**Decision status: USER CALL.** Blocks M5 C2 dispatch only;
+M5 C3 – C10 are independent of P10 and can proceed under any
+outcome. Implementation path is chosen by the user; the
+supervisor does not dispatch rename/growth cycles until P10 is
+resolved.
+
 ---
 
 ## Batch revision plan
