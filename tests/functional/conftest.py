@@ -42,7 +42,11 @@ import pytest
 # `scratch/c8-salvage/nm_unmanaged_tap.md`.
 
 _NM_CONF_PATH = "/etc/NetworkManager/conf.d/pktgate_test_unmanaged.conf"
-_TAP_IFACES_TO_UNMANAGE = ["dtap_f2_rx", "dtap_f2_tx"]
+_TAP_IFACES_TO_UNMANAGE = [
+    "dtap_f2_rx", "dtap_f2_tx",
+    # M4 C9 — F8.14 QinQ counter visibility test uses its own dtap pair.
+    "dtap_f8_rx", "dtap_f8_tx",
+]
 
 
 @pytest.fixture(scope="session", autouse=False)

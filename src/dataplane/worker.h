@@ -38,8 +38,11 @@ struct WorkerCtx {
   L2TruncCtrs   pkt_truncated_l2{};           // D31: l2 / l2_vlan truncation buckets
 };
 
-// D39: check if an mbuf is single-segment. If not, it must be dropped.
-// This is the pre-classify check; the actual classify_l2/l3/l4 is M4+.
+// D39: check if an mbuf is single-segment.  M3 C5 primitive retained
+// for U6.2a unit test back-compat; the production RX loop now goes
+// through classify_entry_ok (src/dataplane/classify_entry.h, M4 C9)
+// which bundles this check with the per-lcore drop counter bump and a
+// debug RTE_ASSERT.
 inline bool is_single_segment(const struct rte_mbuf* m) {
   return m->nb_segs == 1;
 }

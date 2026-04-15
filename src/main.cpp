@@ -404,7 +404,19 @@ int main(int argc, char* argv[]) {
                     ",\"drops\":" + std::to_string(total_drops) + "}";
     }
 
-    stats_json += "]}";
+    // M4 C9 — F8.14: expose per-lcore dataplane counters that are NOT
+    // per-rule through a sibling `counters` object.  Today the only
+    // counter surfaced here is `qinq_outer_only_total` (D32); M5/M6 add
+    // the D31 truncation buckets and D40 fragment counters, M10 replaces
+    // this ad-hoc JSON with a proper Prometheus scrape endpoint.
+    //
+    // Aggregation is a sum across workers.  The dev VM runs a single
+    // worker, so the aggregate equals the single WorkerCtx field.  When
+    // M-later adds multi-worker launches, this loop will extend over the
+    // worker_ctx array — kept as an explicit sum so that extension does
+    // not require a test-surface change.
+    stats_json += "],\"counters\":{\"qinq_outer_only_total\":" +
+                  std::to_string(worker_ctx.qinq_outer_only_total) + "}}";
     log_json(stats_json);
   }
 

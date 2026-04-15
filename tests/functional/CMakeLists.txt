@@ -63,3 +63,16 @@ set_tests_properties(functional.test_f2_l2 PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 240
 )
+
+# M4 C9 — F8.14: QinQ outer-only counter visibility through stats_on_exit.
+# Uses a dedicated dtap_f8_* interface pair, shares the nm_unmanaged_tap
+# fixture with F2 (conftest.py lists both f2 and f8 names).
+add_test(
+  NAME functional.test_f8_qinq_counter
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f8_qinq_counter.py"
+)
+set_tests_properties(functional.test_f8_qinq_counter PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 60
+)

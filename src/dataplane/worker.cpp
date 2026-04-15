@@ -3,11 +3,14 @@
 // M3 C1/C5 — worker skeleton: RX loop with D39 multi-seg drop.
 // M4 C1      — classify_l2 call site wired in.
 // M4 C8      — per-rule counter bump after classify_l2 match.
+// M4 C9      — D39 guard moved into shared classify_entry helper.
 //
 // The worker polls a single RX queue, drops multi-segment mbufs
-// (D39: headers-in-first-seg invariant), calls classify_l2 on each
-// surviving mbuf, and dispatches on the verdict. Classification for
-// L3/L4 (classify_l3/classify_l4) arrives in M5-M6.
+// (D39: headers-in-first-seg invariant — now handled by
+// classify_entry_ok), calls classify_l2 on each surviving mbuf, and
+// dispatches on the verdict. Classification for L3/L4
+// (classify_l3/classify_l4) arrives in M5-M6 and will share the same
+// classify_entry_ok gate.
 
 #include "src/dataplane/worker.h"
 
@@ -17,6 +20,7 @@
 #include <rte_mbuf.h>
 
 #include "src/action/action.h"
+#include "src/dataplane/classify_entry.h"
 #include "src/dataplane/classify_l2.h"
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
@@ -90,17 +94,16 @@ int worker_main(void* arg) {
     }
 
     for (std::uint16_t i = 0; i < nb_rx; ++i) {
-      // D39: drop multi-segment mbufs. Port validator (C3) ensures
-      // scatter is OFF and mempool fits max_rx_pkt_len, so multi-seg
-      // should never arrive in practice. This is the safety net.
-      if (!is_single_segment(bufs[i])) {
-        ++ctx->pkt_multiseg_drop_total;
+      // D39 pre-classify entry gate (M4 C9): headers-in-first-seg
+      // invariant check + debug assert + release-build counter bump.
+      // Promoted out of classify_l2 into classify_entry_ok so L3/L4
+      // (M5/M6) reuse the same gate.  Port validator (C3) ensures
+      // scatter is OFF and mempool fits max_rx_pkt_len, so a multi-seg
+      // mbuf reaching here means a PMD lied — the helper drops it.
+      if (!classify_entry_ok(bufs[i], &ctx->pkt_multiseg_drop_total)) {
         rte_pktmbuf_free(bufs[i]);
         continue;
       }
-
-      // D39 debug assert: after passing the check, nb_segs MUST be 1.
-      RTE_ASSERT(bufs[i]->nb_segs == 1);
 
       // M4 C8: pre-init verdict_action_idx to the no-match sentinel so
       // bump_l2_counter can reliably distinguish "matched slot 0" from

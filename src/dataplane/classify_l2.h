@@ -210,8 +210,9 @@ inline ClassifyL2Verdict l2_try_probe(struct rte_mbuf* m,
 // -------------------------------------------------------------------------
 // classify_l2 — top-level L2 classification entry point (§5.2).
 //
-// Preconditions (enforced by caller / worker.cpp D39 guard):
-//   m->nb_segs == 1   (headers-in-first-seg invariant)
+// Preconditions (enforced by caller via classify_entry_ok, M4 C9):
+//   m->nb_segs == 1   (headers-in-first-seg invariant, D39)
+//   See src/dataplane/classify_entry.h — shared across L2/L3/L4 stages.
 //
 // C5 body (full, includes C1/C2/C3/C4 steps):
 //   0. D31 guard #1: if pkt_len < 14, bump trunc_ctrs[kL2], return kDrop.
@@ -246,7 +247,8 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
                                      const ruleset::Ruleset& rs,
                                      std::uint64_t* qinq_ctr = nullptr,
                                      L2TruncCtrs*  trunc_ctrs = nullptr) {
-  // D39: caller is responsible for ensuring nb_segs == 1 before calling.
+  // D39: caller (worker.cpp) has already run classify_entry_ok which
+  // enforces nb_segs == 1.  See src/dataplane/classify_entry.h.
 
   // ---- D31 Guard #1: l2 bucket — frame shorter than minimal Ethernet -------
   // Minimal Ethernet header: dst_mac(6) + src_mac(6) + ethertype(2) = 14 B.
