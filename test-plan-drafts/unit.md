@@ -920,6 +920,26 @@ built in-process via U3/U4 helpers.
   `implementation-plan-errata.md` §M5 C1.
 - Covers: §5.3 dst-prefix primary miss semantics.
 
+### U6.18b L3 IPv4 — dst FIB hit on `action_idx = 0` drop rule [needs EAL]
+- Goal: single L3 drop rule whose compound entry packs to
+  `{filter_mask=0, action_idx=0}`. Before M5 C1b the
+  classify_l3 hot path read `nh == 0` on FIB hit, interpreted
+  it as miss (`rte_fib_conf.default_nh = 0` aliases
+  byte-for-byte with a zero-packed valid entry), and returned
+  `kNextL4`. After C1b, `ruleset::make_l3_entry(...)` stamps
+  `valid_tag = 0xA5` on the arena slot and `classify_l3`
+  unpacks the next-hop, checks the tag, and dispatches to
+  `kTerminalDrop`.
+- Note: new RED in M5 C1b. Single target rule at
+  `action_idx = 0` (no filler); contrast with U6.18 which
+  prepends a filler so its allow target lands at
+  `action_idx = 1`. U6.18b is the complementary coverage
+  that exercises the zero-packed slot directly. Closes
+  memory grabli `rte_fib_default_nh_aliases_action_idx_0`.
+- Covers: M5 C1b `L3CompoundEntry.valid_tag` retrofit;
+  `make_l3_entry` construction invariant; FIB-miss-vs-hit
+  disambiguation.
+
 ### U6.19 L3 IPv4 — IHL=6 L4 offset uses `ihl << 2`
   (D14)
 - Goal: IPv4 header with options (IHL=6, 24-byte header).

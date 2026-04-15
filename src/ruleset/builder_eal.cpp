@@ -211,8 +211,14 @@ EalPopulateResult populate_ruleset_eal(Ruleset& rs,
     if (n > 0) {
       rs.l3_compound_entries = new L3CompoundEntry[n]();
       rs.l3_compound_count = static_cast<std::uint32_t>(n);
+      // M5 C1b: fill every arena slot via `make_l3_entry` so the
+      // `valid_tag = 0xA5` byte gets stamped. `classify_l3` relies on
+      // the tag to tell a real hit at `action_idx = 0, filter_mask = 0`
+      // from the `rte_fib_conf.default_nh = 0` miss sentinel (the two
+      // would otherwise be byte-identical). See `types.h` docstring.
       for (std::size_t i = 0; i < n; ++i) {
-        rs.l3_compound_entries[i] = src[i].entry;
+        rs.l3_compound_entries[i] = make_l3_entry(
+            src[i].entry.action_idx, src[i].entry.filter_mask);
       }
 
       // Open v4 FIB (DIR24_8). Always created even if only v6 rules

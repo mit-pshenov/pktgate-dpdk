@@ -308,8 +308,14 @@ std::vector<L3CompiledRule> compile_l3_rules(
           },
           cidr_variant);
 
+      // M5 C1b: valid_tag is stamped at arena-fill time by
+      // `ruleset::make_l3_entry` in `builder_eal.cpp`, not here — the
+      // compiler's intermediate `L3CompiledRule.entry` is a staging
+      // buffer that gets copied through the helper. Leaving valid_tag
+      // at 0 here is intentional; it only needs to be 0xA5 once the
+      // entry lands in the arena slot classify_l3 reads.
       compiled.entry.filter_mask = 0;
-      compiled.entry._pad0 = 0;
+      compiled.entry.valid_tag = 0;
       compiled.entry.action_idx = static_cast<std::uint16_t>(ri);
       compiled.entry._pad1 = 0;
 

@@ -1805,6 +1805,121 @@ TEST_F(ClassifyL3Ipv4Test, U6_18a_Ipv4DstFibMissFallsThrough) {
   rte_mempool_free(mp);
 }
 
+// -------------------------------------------------------------------------
+// U6.18b — L3CompoundEntry valid_tag retrofit: zero-packed hit vs FIB miss
+//
+// Regression sentinel for the `rte_fib_default_nh_aliases_action_idx_0`
+// grabli. Before M5 C1b the hot path used `nh == 0` as the FIB miss
+// signal, which aliased with a real hit on an `action_idx = 0,
+// filter_mask = 0` entry (packed to 0x0000000000000000 — byte-identical
+// to `rte_fib_conf.default_nh = 0`). M5 C1b introduces an explicit
+// `valid_tag = 0xA5` byte stamped into every arena-resident
+// `L3CompoundEntry` via `ruleset::make_l3_entry(...)`; classify_l3
+// unpacks the next-hop slot and checks the tag instead of nh-against-zero.
+//
+// Setup: a SINGLE L3 drop rule whose src_subnet resolves to an IPv4
+// prefix, so after compile the target rule lands at `action_idx = 0`
+// and its packed L3CompoundEntry (filter_mask=0, action_idx=0) is
+// literally all-zero except for the new `valid_tag` byte. Before C1b
+// the test would observe `nh == 0` and return `kNextL4` (the C1 miss
+// arm) → wrong verdict. After C1b the dispatcher sees a valid entry,
+// resolves ActionVerb::kDrop, and returns `kTerminalDrop`.
+//
+// Contrast with U6.18: U6.18 deliberately inserts a filler rule so the
+// allow target lands at `action_idx = 1` (non-zero). U6.18b is the
+// complementary coverage that exercises the `action_idx = 0` slot via
+// a drop rule, and it MUST NOT rely on any "+1 filler" workaround.
+//
+// Covers: M5 C1b valid_tag retrofit; closes grabli
+// `rte_fib_default_nh_aliases_action_idx_0`.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4Test, U6_18b_Ipv4DstFibHitAtActionIdxZero) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+
+  // Single target rule at slot 0 with a drop action. With no filler,
+  // the resulting L3CompoundEntry has action_idx=0 and filter_mask=0;
+  // pre-C1b this aliases the FIB miss sentinel byte-for-byte.
+  SubnetObject target;
+  target.name = "net_target";
+  target.cidrs.push_back(Cidr4{0x0A000000, 8});   // 10.0.0.0/8
+  cfg.objects.subnets.push_back(std::move(target));
+
+  auto& r_target = append_rule(cfg.pipeline.layer_3, 6022, ActionDrop{});
+  r_target.src_subnet = SubnetRef{"net_target"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+  ASSERT_EQ(cr.l3_compound.size(), 1u);
+  // Sanity: the target sits at slot 0 (the exact alias case we guard).
+  ASSERT_EQ(cr.l3_compound[0].entry.action_idx, 0u);
+  ASSERT_EQ(cr.l3_compound[0].entry.filter_mask, 0u);
+
+  // Build actions arena first (populate_ruleset_eal only opens FIB /
+  // hash handles and fills compound entries — the l3_actions arena is
+  // filled by build_ruleset from cr.l3_actions). See memory grabli
+  // `populate_ruleset_eal_no_l3_actions`.
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_18b";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v4_fib, nullptr);
+  ASSERT_GE(rs.n_l3_rules, 1u);
+  EXPECT_EQ(rs.l3_actions[0].verb,
+            static_cast<std::uint8_t>(compiler::ActionVerb::kDrop));
+
+  // Build a 14 B Ethernet + 20 B IPv4 frame addressed to 10.1.2.3
+  // (matches the target 10/8 prefix).
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_18b_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  constexpr std::size_t kFrameLen = 14 + 20;
+  uint8_t* pkt =
+      reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x08;
+  pkt[13] = 0x00;  // 0x0800 IPv4
+  pkt[14] = 0x45;  // version=4, IHL=5
+  // dst_addr at offset 14+16 = 30. 10.1.2.3 network-byte-order.
+  pkt[30] = 0x0A;
+  pkt[31] = 0x01;
+  pkt[32] = 0x02;
+  pkt[33] = 0x03;
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+
+  dataplane::L3TruncCtrs trunc_ctrs{};
+  const dataplane::ClassifyL3Verdict verdict =
+      dataplane::classify_l3(m, rs, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "U6.18b: dst FIB hit on a drop rule at action_idx=0 must "
+         "dispatch to kTerminalDrop (valid_tag disambiguates the "
+         "zero-packed-hit from rte_fib default_nh=0 miss sentinel)";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "U6.18b: clean hit must not bump the truncation bucket";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 // =========================================================================
 // M4 C6 — L2 truncation corner tests (C1.1-C1.8)
 //

@@ -1,8 +1,13 @@
 // src/dataplane/classify_l3.h
 //
-// M5 C0 — classify_l3 skeleton: plumbing + pass-through pipeline hook.
-// M5 C1 — IPv4 branch: dst-prefix FIB lookup + D31 l3_v4 truncation
+// M5 C0  — classify_l3 skeleton: plumbing + pass-through pipeline hook.
+// M5 C1  — IPv4 branch: dst-prefix FIB lookup + D31 l3_v4 truncation
 //          guard + D14 IHL reject.
+// M5 C1b — L3CompoundEntry `valid_tag` retrofit: unpack the FIB next-hop
+//          slot and check the `0xA5` tag byte to disambiguate a real
+//          hit at `action_idx = 0, filter_mask = 0` from the
+//          `rte_fib_conf.default_nh = 0` miss sentinel. Closes memory
+//          grabli `rte_fib_default_nh_aliases_action_idx_0`.
 //
 // The classify_l3 stage consumes `dyn->l3_offset` and
 // `dyn->parsed_ethertype` (both written by classify_l2 per D13) and
@@ -171,17 +176,19 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 //      l3_v4 bucket (per errata §M5 C1) and return kTerminalDrop.
 //      NOTE: L4-offset-via-IHL (the other half of D14) is M6.
 //   3. dst-prefix primary FIB lookup — rte_fib_lookup_bulk(n=1) with
-//      host-order dst IP. Miss (nh == 0, the default_nh we set in
-//      builder_eal) → fall through to kNextL4 (C2 adds src secondary;
-//      for C1 a miss means fall through, not drop). Do NOT bump any
-//      D31 counter on a clean FIB miss.
-//   4. Hit → unpack the L3CompoundEntry from the 8-byte next-hop slot,
-//      resolve the rule's action via rs.l3_actions[action_idx], and
-//      dispatch: allow → kNextL4, drop → kTerminalDrop (per errata
-//      §M5 C1 unit.md wording reconciliation for U6.18: the stale
-//      TERMINAL_L3 wording in unit.md predates the C0 enum shape, and
-//      C0 shipped {kNextL4, kTerminalPass, kTerminalDrop} without a
-//      TERMINAL_L3 slot).
+//      host-order dst IP. The miss-vs-hit discrimination runs on the
+//      unpacked `L3CompoundEntry.valid_tag` byte (M5 C1b retrofit) —
+//      a real match at `action_idx = 0, filter_mask = 0` would
+//      otherwise be byte-identical to the builder_eal miss sentinel
+//      (`rte_fib_conf.default_nh = 0`). On miss (valid_tag != 0xA5)
+//      fall through to kNextL4 without bumping any D31 counter.
+//   4. Hit (valid_tag matches) → resolve the rule's action via
+//      rs.l3_actions[action_idx], and dispatch: allow → kNextL4,
+//      drop → kTerminalDrop (per errata §M5 C1 unit.md wording
+//      reconciliation for U6.18: the stale TERMINAL_L3 wording in
+//      unit.md predates the C0 enum shape, and C0 shipped
+//      {kNextL4, kTerminalPass, kTerminalDrop} without a TERMINAL_L3
+//      slot).
 //
 //   Empty-ruleset / unpopulated-FIB short-circuit: if rs.l3_v4_fib is
 //   nullptr, skip the FIB lookup entirely and fall through to kNextL4.
@@ -263,18 +270,33 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     std::uint32_t da = rte_be_to_cpu_32(ip4->dst_addr);
     std::uint64_t nh = 0;
     int lret = rte_fib_lookup_bulk(rs.l3_v4_fib, &da, &nh, 1);
-    if (lret < 0 || nh == 0) {
-      // C1 miss semantics: fall through to L4. C2 will add the optional
-      // src-prefix secondary probe on miss; we deliberately bump no
-      // counter here on a clean miss.
+    if (lret < 0) {
+      // Lookup error: fall through. A clean lookup contract under n=1
+      // is success-only from DPDK's perspective, so lret<0 indicates a
+      // programming bug (e.g. null FIB handle slipping past the guard
+      // above). We deliberately bump no counter here.
       return ClassifyL3Verdict::kNextL4;
     }
 
     // Unpack the packed L3CompoundEntry from the 8-byte next-hop slot.
     // Layout is static_assert'd to 8 bytes in src/ruleset/types.h, so
     // memcpy round-trip is safe regardless of host alignment.
+    //
+    // M5 C1b: check `entry.valid_tag == L3_ENTRY_VALID_TAG (0xA5)` to
+    // disambiguate a FIB miss (`rte_fib_conf.default_nh = 0` → nh == 0,
+    // valid_tag byte reads as 0x00) from a valid hit at `action_idx = 0,
+    // filter_mask = 0` (packed via `make_l3_entry` which stamps
+    // valid_tag to 0xA5). Any tag value other than the sentinel is
+    // treated as a miss and falls through to L4 — same counter-free
+    // semantics as the pre-C1b `nh == 0` arm.
     ruleset::L3CompoundEntry entry{};
     std::memcpy(&entry, &nh, sizeof(entry));
+    if (entry.valid_tag != ruleset::L3_ENTRY_VALID_TAG) {
+      // Miss (default_nh / unstamped slot). C2 will add the optional
+      // src-prefix secondary probe on miss; for C1 / C1b a clean miss
+      // means fall through, not drop. No counter bump on clean miss.
+      return ClassifyL3Verdict::kNextL4;
+    }
     return detail::l3_dispatch(rs, entry.action_idx);
   }
 
