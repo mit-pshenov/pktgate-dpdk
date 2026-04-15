@@ -135,15 +135,20 @@ int worker_main(void* arg) {
         case ClassifyL2Verdict::kNextL3: {
           // M5 C0: L2 pass → call classify_l3. C0 shipped a pass-through
           // body; C1 added the IPv4 branch (D31 l3_v4 truncation guard,
-          // D14 IHL reject, dst-prefix FIB lookup). The inner verdict
-          // switch was wired in C0 so later cycles only extend the enum
-          // + body without touching worker.cpp.
+          // D14 IHL reject, dst-prefix FIB lookup); C3 added the D17
+          // fragment-policy branch + D40 v4 fragment counters. The inner
+          // verdict switch was wired in C0 so later cycles only extend
+          // the enum + body without touching worker.cpp.
           //
           // D31: pass per-lcore L3 truncation counter array
           // (pkt_truncated_l3[l3_v4]) — optional-counter pattern symmetric
           // to classify_l2's pkt_truncated_l2.
+          // D40: pass per-lcore L3 fragment counter array
+          // (pkt_frag_l3[{dropped_v4, skipped_v4}]) — same pattern.
           const ClassifyL3Verdict l3v =
-              classify_l3(bufs[i], *ctx->ruleset, &ctx->pkt_truncated_l3);
+              classify_l3(bufs[i], *ctx->ruleset,
+                          &ctx->pkt_truncated_l3,
+                          &ctx->pkt_frag_l3);
           switch (l3v) {
             case ClassifyL3Verdict::kNextL4:
               // TODO M6: call classify_l4 on kNextL4 verdict.

@@ -997,6 +997,26 @@ built in-process via U3/U4 helpers.
   classification (mirrors IPv6 first fragment semantics).
 - Covers: D17, D27 (IPv4/IPv6 symmetry under L3_ONLY).
 
+### U6.26a L3 IPv4 — FRAG_DROP bumps `pkt_frag_dropped_total{v4}`
+  (D40 v4 drop sentinel) [new RED, M5 C3]
+- Goal: any IPv4 fragment under `FRAG_DROP` bumps
+  `pkt_frag_dropped_total_v4` exactly once at the single
+  drop-arm site in classify_l3, with no bleed into
+  `pkt_frag_skipped_total_v4` or `pkt_truncated_l3`.
+  Explicit D40 v4 drop invariant sentinel.
+- Covers: D17, D40.
+
+### U6.26b L3 IPv4 — FRAG_L3_ONLY non-first bumps
+  `pkt_frag_skipped_total{v4}` + sets SKIP_L4
+  (D40 v4 skip sentinel) [new RED, M5 C3]
+- Goal: non-first IPv4 fragment under `FRAG_L3_ONLY` bumps
+  `pkt_frag_skipped_total_v4` exactly once AND sets the
+  `SKIP_L4` dynfield flag, with no bleed into
+  `pkt_frag_dropped_total_v4`. Paired with U6.21/U6.22 which
+  cover the verdict semantics; U6.26b is the explicit D40 v4
+  skip counter + flag sentinel.
+- Covers: D17, D40.
+
 ### U6.26 L3 IPv6 — plain TCP → NEXT_L4, `l4_extra = 0`
 - Goal: IPv6 packet with next_header = 6 (TCP). `l4_extra`
   stays 0; L4 classifier reads at `l3off + 40`.

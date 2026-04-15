@@ -405,18 +405,32 @@ int main(int argc, char* argv[]) {
     }
 
     // M4 C9 — F8.14: expose per-lcore dataplane counters that are NOT
-    // per-rule through a sibling `counters` object.  Today the only
-    // counter surfaced here is `qinq_outer_only_total` (D32); M5/M6 add
-    // the D31 truncation buckets and D40 fragment counters, M10 replaces
-    // this ad-hoc JSON with a proper Prometheus scrape endpoint.
+    // per-rule through a sibling `counters` object.  M4 shipped only
+    // `qinq_outer_only_total` (D32); M5 C3 adds the first D40 fragment
+    // counters (`pkt_frag_dropped_total_v4` and `pkt_frag_skipped_total_v4`).
+    // M5 C6 will add the v6 family (`pkt_frag_dropped_total_v6`,
+    // `pkt_frag_skipped_total_v6`). M6 adds the D31 L3 truncation
+    // buckets. M10 replaces this ad-hoc JSON with a proper Prometheus
+    // scrape endpoint; flat keys keep the shape greppable from
+    // functional tests until then.
     //
     // Aggregation is a sum across workers.  The dev VM runs a single
     // worker, so the aggregate equals the single WorkerCtx field.  When
     // M-later adds multi-worker launches, this loop will extend over the
     // worker_ctx array — kept as an explicit sum so that extension does
     // not require a test-surface change.
+    const std::uint64_t frag_dropped_v4 = worker_ctx.pkt_frag_l3[
+        static_cast<std::size_t>(
+            pktgate::dataplane::L3FragBucket::kL3FragDroppedV4)];
+    const std::uint64_t frag_skipped_v4 = worker_ctx.pkt_frag_l3[
+        static_cast<std::size_t>(
+            pktgate::dataplane::L3FragBucket::kL3FragSkippedV4)];
     stats_json += "],\"counters\":{\"qinq_outer_only_total\":" +
-                  std::to_string(worker_ctx.qinq_outer_only_total) + "}}";
+                  std::to_string(worker_ctx.qinq_outer_only_total) +
+                  ",\"pkt_frag_dropped_total_v4\":" +
+                  std::to_string(frag_dropped_v4) +
+                  ",\"pkt_frag_skipped_total_v4\":" +
+                  std::to_string(frag_skipped_v4) + "}}";
     log_json(stats_json);
   }
 

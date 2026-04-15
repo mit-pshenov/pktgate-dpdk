@@ -8,6 +8,15 @@
 //          hit at `action_idx = 0, filter_mask = 0` from the
 //          `rte_fib_conf.default_nh = 0` miss sentinel. Closes memory
 //          grabli `rte_fib_default_nh_aliases_action_idx_0`.
+// M5 C3  — IPv4 fragment handling (D17 `fragment_policy`) + D40 v4
+//          fragment counter family (`pkt_frag_dropped_total{v4}` and
+//          `pkt_frag_skipped_total{v4}`). Reads `rs.fragment_policy`
+//          (u8 encoded as `FragmentPolicy::kL3Only|kDrop|kAllow`),
+//          detects `is_frag` / `is_nonfirst` from the IPv4
+//          `fragment_offset_and_flags` word, dispatches on policy, and
+//          writes the `SKIP_L4` dynfield flag on the non-first L3_ONLY
+//          arm (consumed by §5.4 classify_l4 in M6). Mirrors the v6
+//          fragment branch that C6 will add in the same shape.
 //
 // The classify_l3 stage consumes `dyn->l3_offset` and
 // `dyn->parsed_ethertype` (both written by classify_l2 per D13) and
@@ -91,6 +100,56 @@ inline constexpr std::size_t kL3TruncBucketCount = 1;
 
 // Convenience alias used by WorkerCtx and test code.
 using L3TruncCtrs = std::array<std::uint64_t, kL3TruncBucketCount>;
+
+// -------------------------------------------------------------------------
+// FragmentPolicy — D17 / P9 numeric encoding for `Ruleset.fragment_policy`.
+//
+// The config-layer enum (`config::FragmentPolicy`, src/config/model.h) is
+// declared in insertion order {kL3Only=0, kDrop=1, kAllow=2} so the
+// underlying u8 values line up with the numeric constants used here.
+// classify_l3 reads `rs.fragment_policy` as a u8 and switches on it
+// directly — adding an intermediate enum cast would cost a branch-free
+// compare but no semantic clarity.
+//
+// Default (u8 zero) is `kL3Only` per P9 user resolution, so an
+// unconfigured Ruleset (e.g. a test fixture that skips the config→
+// ruleset fragment_policy wiring) gets the standard behavior: L3 still
+// runs, L4 is skipped on non-first fragments, counter bumps only on the
+// D17 drop-arm and the non-first L3_ONLY arm.
+enum FragmentPolicy : std::uint8_t {
+  kFragL3Only = 0,  // default — L3 runs, L4 skipped on non-first
+  kFragDrop   = 1,  // terminal drop on any fragment (first or non-first)
+  kFragAllow  = 2,  // skip L3+L4 entirely, terminal pass
+};
+
+// -------------------------------------------------------------------------
+// L3FragBucket — D40 per-stage fragment counter buckets for classify_l3.
+//
+// kL3FragDroppedV4 — `pkt_frag_dropped_total{v4}`: any IPv4 fragment seen
+//                    under `FragmentPolicy::kFragDrop` (both first and
+//                    non-first). Bumped once per dropped fragment.
+// kL3FragSkippedV4 — `pkt_frag_skipped_total{v4}`: non-first IPv4 fragment
+//                    seen under `FragmentPolicy::kFragL3Only`. Bumped at
+//                    the same site where `dyn->flags |= kSkipL4` is set.
+//                    First IPv4 fragment under L3_ONLY passes through
+//                    without bumping this counter and without setting
+//                    SKIP_L4 (the first fragment carries the L4 header,
+//                    so L4 classification can proceed normally). Mirrors
+//                    D27 IPv6 semantics that C6 adds.
+//
+// C6 will add `kL3FragDroppedV6` and `kL3FragSkippedV6` at the v6 site,
+// bumping both this D40 symmetric counter and the D27 named
+// `l4_skipped_ipv6_fragment_nonfirst` counter at the same site — the
+// D40 alias invariant (U6.26c sentinel).
+
+enum class L3FragBucket : std::size_t {
+  kL3FragDroppedV4 = 0,
+  kL3FragSkippedV4 = 1,
+};
+inline constexpr std::size_t kL3FragBucketCount = 2;
+
+// Convenience alias used by WorkerCtx and test code.
+using L3FragCtrs = std::array<std::uint64_t, kL3FragBucketCount>;
 
 // -------------------------------------------------------------------------
 // ClassifyL3Verdict — result of classify_l3.
@@ -206,6 +265,16 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 //   pattern established by classify_l2 (memory grabli
 //   `classify_l2_optional_counter_pattern`).
 //
+// frag_ctrs (optional, D40, M5 C3):
+//   Pointer to a L3FragCtrs array (std::array<uint64_t, 2> indexed by
+//   L3FragBucket::{kL3FragDroppedV4, kL3FragSkippedV4}). Pass nullptr
+//   to skip the bump (backward-compatible default — older tests that
+//   predate C3 call without it and observe no counter state). Worker
+//   passes &ctx->pkt_frag_l3. Same optional-counter pattern as trunc
+//   above — hot path stays pure when the caller does not care about
+//   observability. C6 extends the enum with v6 slots and reuses the
+//   same pointer.
+//
 // The function is `noexcept`: like classify_l2 it runs on the hot
 // path and must not throw. All DPDK calls it makes (rte_fib_lookup_bulk
 // / rte_fib6_lookup_bulk in C4 / rte_hash_lookup_data) are C APIs that
@@ -213,11 +282,15 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 
 inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
                                      const ruleset::Ruleset& rs,
-                                     L3TruncCtrs* trunc_ctrs = nullptr) noexcept {
+                                     L3TruncCtrs* trunc_ctrs = nullptr,
+                                     L3FragCtrs*  frag_ctrs  = nullptr) noexcept {
   // D39: caller (worker.cpp) has already run classify_entry_ok which
   // enforces nb_segs == 1. See src/dataplane/classify_entry.h.
 
-  const auto* dyn = eal::mbuf_dynfield(m);
+  // Non-const: C3 fragment branch writes `dyn->flags |= kSkipL4` on the
+  // non-first L3_ONLY arm. C5/C6 will additionally write `dyn->l4_extra`
+  // and `dyn->parsed_l3_proto`.
+  auto* dyn = eal::mbuf_dynfield(m);
   const std::uint8_t  l3_off = dyn->l3_offset;
   const std::uint16_t et     = dyn->parsed_ethertype;
 
@@ -255,12 +328,98 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
       return ClassifyL3Verdict::kTerminalDrop;
     }
 
+    // ---- D17 fragment handling (U6.21-U6.25, U6.26a, U6.26b) -----------
+    // Detect fragment bits from the IPv4 `fragment_offset_and_flags`
+    // 16-bit big-endian word at offset 6:
+    //   bits 0-12: fragment offset (in units of 8 bytes)
+    //   bit 13   : MF (more fragments)
+    //   bit 14   : DF (reserved here)
+    //   bit 15   : reserved / must-be-zero
+    //
+    // `is_frag` is true when EITHER MF is set (fragmented datagram, this
+    // is a first-or-middle fragment that carries the L4 header) OR the
+    // fragment offset is non-zero (non-first fragment, no L4 header in
+    // this datagram). `is_nonfirst` is the pure offset!=0 subset.
+    //
+    // Design anchor: §5.3 IPv4 fragment paragraph (lines 1135-1161) +
+    // review-notes D17 "Resolution (P9, 2026-04-10)".
+    //
+    // Note on `rte_ipv4_hdr` field naming: DPDK 25.11 exposes this as
+    // `fragment_offset` (host-accessible big-endian u16). We read the
+    // big-endian masks directly — no byteswap, no overall host conversion
+    // — so the hot path costs at most one AND and one compare per bit.
+    const std::uint16_t frag_word = ip4->fragment_offset;
+    const bool is_frag =
+        (frag_word & RTE_BE16(0x1FFFu)) != 0 ||      // offset != 0
+        (frag_word & RTE_BE16(0x2000u)) != 0;        // MF set
+    const bool is_nonfirst =
+        (frag_word & RTE_BE16(0x1FFFu)) != 0;        // offset != 0
+
+    if (is_frag) {
+      const std::uint8_t policy = rs.fragment_policy;
+      switch (policy) {
+        case kFragDrop: {
+          // D40: every dropped fragment (first or non-first) bumps the
+          // v4 drop counter at this single site.
+          if (frag_ctrs) {
+            ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragDroppedV4)];
+          }
+          return ClassifyL3Verdict::kTerminalDrop;
+        }
+        case kFragAllow: {
+          // Skip L3+L4 entirely, let default_action apply at the end of
+          // the pipeline (§5.3 "FRAG_ALLOW" arm). No counter bump — this
+          // policy is explicitly unsafe and operator-visible via config
+          // rather than per-packet observability.
+          return ClassifyL3Verdict::kTerminalPass;
+        }
+        case kFragL3Only:
+        default: {
+          // Default policy (P9 user-chosen). Non-first fragment has no
+          // reliable L4 header — mark the packet L4-unclassifiable via
+          // the `SKIP_L4` dynfield flag and bump the D40 v4 skip
+          // counter, then fall through to L3 matching so any pure-L3
+          // rule (dst-prefix match) still applies. First fragment under
+          // L3_ONLY passes through unchanged: L4 header is present in
+          // the first-fragment payload, so classify_l4 can still run.
+          if (is_nonfirst) {
+            dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
+            if (frag_ctrs) {
+              ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragSkippedV4)];
+            }
+          }
+          break;  // fall through to L3 matching
+        }
+      }
+    }
+
+    // After the fragment branch, SKIP_L4 may have been set by the
+    // non-first L3_ONLY arm. Snapshot the bit once so the FIB-miss and
+    // rule-hit paths below can pick the right terminal verdict without
+    // re-reading the dynfield:
+    //
+    //   SKIP_L4 unset — L4 runs next:
+    //     miss       → kNextL4
+    //     allow hit  → kNextL4 (L4 classifier still runs per §5.3)
+    //     drop hit   → kTerminalDrop
+    //
+    //   SKIP_L4 set (non-first fragment under L3_ONLY):
+    //     miss       → kTerminalPass   (U6.21: §5.3 TERMINAL_PASS cliff)
+    //     allow hit  → kTerminalPass   (U6.22: L3 rule applies, L4 skipped)
+    //     drop hit   → kTerminalDrop   (L3 drop wins regardless)
+    //
+    // See design.md §5.3 line 1201 "(dyn->flags & SKIP_L4) ? TERMINAL_PASS
+    // : NEXT_L4" and review-notes D17 Resolution.
+    const bool skip_l4 =
+        (dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4)) != 0;
+
     // ---- dst-prefix primary FIB lookup (U6.18 / U6.18a) -----------------
     // If the FIB is unpopulated (C0 baseline / empty L3 ruleset), skip
-    // the lookup and fall through to kNextL4 — this is the U6.11a path,
-    // and it must remain green post-C1.
+    // the lookup and fall through — this is the U6.11a path, and it
+    // must remain green post-C1.
     if (rs.l3_v4_fib == nullptr) {
-      return ClassifyL3Verdict::kNextL4;
+      return skip_l4 ? ClassifyL3Verdict::kTerminalPass
+                     : ClassifyL3Verdict::kNextL4;
     }
 
     // rte_fib_lookup_bulk takes host-order IPv4 addresses per the DPDK
@@ -275,7 +434,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
       // is success-only from DPDK's perspective, so lret<0 indicates a
       // programming bug (e.g. null FIB handle slipping past the guard
       // above). We deliberately bump no counter here.
-      return ClassifyL3Verdict::kNextL4;
+      return skip_l4 ? ClassifyL3Verdict::kTerminalPass
+                     : ClassifyL3Verdict::kNextL4;
     }
 
     // Unpack the packed L3CompoundEntry from the 8-byte next-hop slot.
@@ -287,17 +447,25 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     // valid_tag byte reads as 0x00) from a valid hit at `action_idx = 0,
     // filter_mask = 0` (packed via `make_l3_entry` which stamps
     // valid_tag to 0xA5). Any tag value other than the sentinel is
-    // treated as a miss and falls through to L4 — same counter-free
-    // semantics as the pre-C1b `nh == 0` arm.
+    // treated as a miss and falls through — same counter-free semantics
+    // as the pre-C1b `nh == 0` arm.
     ruleset::L3CompoundEntry entry{};
     std::memcpy(&entry, &nh, sizeof(entry));
     if (entry.valid_tag != ruleset::L3_ENTRY_VALID_TAG) {
       // Miss (default_nh / unstamped slot). C2 will add the optional
       // src-prefix secondary probe on miss; for C1 / C1b a clean miss
       // means fall through, not drop. No counter bump on clean miss.
-      return ClassifyL3Verdict::kNextL4;
+      return skip_l4 ? ClassifyL3Verdict::kTerminalPass
+                     : ClassifyL3Verdict::kNextL4;
     }
-    return detail::l3_dispatch(rs, entry.action_idx);
+    const ClassifyL3Verdict v = detail::l3_dispatch(rs, entry.action_idx);
+    // Under SKIP_L4 the `kNextL4` arm of l3_dispatch (allow action)
+    // collapses to `kTerminalPass` because L4 classifier cannot run on
+    // a non-first fragment. Drop stays terminal regardless.
+    if (skip_l4 && v == ClassifyL3Verdict::kNextL4) {
+      return ClassifyL3Verdict::kTerminalPass;
+    }
+    return v;
   }
 
   // Non-IPv4 ethertype — IPv6 body lands in C4, unknown ethertypes

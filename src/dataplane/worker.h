@@ -38,6 +38,8 @@ struct WorkerCtx {
   std::uint64_t qinq_outer_only_total   = 0;  // D32: outer S-tag, inner is VLAN TPID
   L2TruncCtrs   pkt_truncated_l2{};           // D31: l2 / l2_vlan truncation buckets
   L3TruncCtrs   pkt_truncated_l3{};           // D31: l3_v4 truncation/IHL-reject bucket (M5 C1)
+  L3FragCtrs    pkt_frag_l3{};                // D40: fragment drop/skip buckets (M5 C3 v4;
+                                              //       C6 adds v6 slots to the same array)
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained
