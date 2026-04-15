@@ -22,6 +22,7 @@
 #include "src/action/action.h"
 #include "src/dataplane/classify_entry.h"
 #include "src/dataplane/classify_l2.h"
+#include "src/dataplane/classify_l3.h"
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 
@@ -131,10 +132,33 @@ int worker_main(void* arg) {
       }
 
       switch (l2v) {
-        case ClassifyL2Verdict::kNextL3:
-          // L2 pass — proceed to L3 (M5 hook).  For now, free.
-          rte_pktmbuf_free(bufs[i]);
+        case ClassifyL2Verdict::kNextL3: {
+          // M5 C0: L2 pass → call classify_l3 skeleton. The C0 body is
+          // a pass-through that unconditionally returns kNextL4; real
+          // IPv4/IPv6 branches land in C1/C4. The inner verdict switch
+          // is wired here now so later cycles only extend the enum +
+          // body without touching worker.cpp.
+          const ClassifyL3Verdict l3v =
+              classify_l3(bufs[i], *ctx->ruleset);
+          switch (l3v) {
+            case ClassifyL3Verdict::kNextL4:
+              // TODO M6: call classify_l4 on kNextL4 verdict.
+              // For now, free (same as the old M4 kNextL3 free arm).
+              rte_pktmbuf_free(bufs[i]);
+              break;
+            case ClassifyL3Verdict::kTerminalPass:
+              // Final allow at L3 (e.g. FRAG_ALLOW in C3). TX path
+              // lands in a later milestone; for now, free.
+              rte_pktmbuf_free(bufs[i]);
+              break;
+            case ClassifyL3Verdict::kTerminalDrop:
+              // Final drop at L3 (truncation sentinel, IHL reject,
+              // fragment drop, L3 DROP rule). Free the mbuf.
+              rte_pktmbuf_free(bufs[i]);
+              break;
+          }
           break;
+        }
         case ClassifyL2Verdict::kDrop:
           rte_pktmbuf_free(bufs[i]);
           break;

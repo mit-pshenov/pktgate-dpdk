@@ -17,6 +17,7 @@
 #include <rte_mbuf.h>
 
 #include "src/dataplane/classify_l2.h"  // L2TruncCtrs, L2TruncBucket
+#include "src/dataplane/classify_l3.h"  // ClassifyL3Verdict (M5 C0)
 #include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {

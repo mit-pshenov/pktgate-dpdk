@@ -25,6 +25,7 @@
 #include "src/config/model.h"
 #include "src/config/sizing.h"
 #include "src/dataplane/classify_l2.h"
+#include "src/dataplane/classify_l3.h"
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
@@ -1399,6 +1400,85 @@ TEST_F(ClassifyL2TruncTest, U6_11_VlanShortFrameDropsL2VlanBucket) {
       << "pkt_truncated_total[l2_vlan] must be 1";
   EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L2TruncBucket::kL2)], 0u)
       << "pkt_truncated_total[l2] must be 0 (pkt_len=16 >= 14, l2 guard doesn't fire)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// U6.11a — M5 C0 classify_l3 baseline: empty L3 ruleset → kNextL4.
+//
+// Supervisor ruling (M5 C0): U6.12 in unit.md stays owned by D31
+// l3_v4 truncation (lands in C1); C0 gets a fresh ID U6.11a, same
+// precedent as M4 C0 U6.0a. This test validates the C0 plumbing
+// skeleton: classify_l3 is a pass-through that unconditionally
+// returns kNextL4 regardless of the mbuf contents, so later cycles
+// (C1 IPv4 body, C4 IPv6 body) can incrementally add parsing
+// without breaking the worker wiring.
+//
+// An "empty L3 ruleset" is a default-constructed ruleset::Ruleset:
+// l3_v4_fib / l3_v6_fib / l3_compound_entries are all nullptr and
+// n_l3_rules == 0. The C0 skeleton does not touch any of these
+// fields; it only reads dyn->l3_offset + dyn->parsed_ethertype
+// (already written by classify_l2 in M4 C3) and returns kNextL4.
+//
+// Assertions:
+//   - verdict == ClassifyL3Verdict::kNextL4
+//   - ruleset fields remain as default-constructed (sanity)
+//
+// Covers: M5 C0 plumbing baseline; §5.3 classify_l3 signature; D41.
+// =========================================================================
+
+class ClassifyL3SkeletonTest : public EalFixture {};
+
+TEST_F(ClassifyL3SkeletonTest, U6_11a_EmptyL3RulesetYieldsNextL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  // Empty L3 ruleset: default-constructed, zero L3 rules, all FIB
+  // handles nullptr (same shape U6.1/C1.8 use for L2 empty ruleset).
+  ruleset::Ruleset rs;
+  ASSERT_EQ(rs.n_l3_rules, 0u);
+  ASSERT_EQ(rs.l3_v4_fib, nullptr);
+  ASSERT_EQ(rs.l3_v6_fib, nullptr);
+  ASSERT_EQ(rs.l3_compound_count, 0u);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_11a_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  // Minimal well-formed IPv4 Ethernet frame: 14 B L2 + 20 B IPv4
+  // header. classify_l2 would normally write dyn->l3_offset=14 and
+  // dyn->parsed_ethertype=0x0800 on this shape, but for a direct
+  // classify_l3 call we write them by hand — the C0 skeleton does
+  // not depend on classify_l2 having run, since the body is a
+  // pure pass-through. Real integration via the worker kNextL3
+  // arm is covered by future functional tests (F4, M5 C10).
+  constexpr std::size_t kFrameLen = 14 + 20;
+  uint8_t* pkt =
+      reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x08;
+  pkt[13] = 0x00;  // 0x0800 IPv4
+  // IPv4 header at offset 14: version=4, IHL=5 (well-formed).
+  pkt[14] = 0x45;
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset = 14;
+  dyn->parsed_ethertype = 0x0800;
+  dyn->parsed_vlan = 0xFFFF;
+  dyn->flags = 0;
+
+  // C0: direct call, pass-through skeleton must return kNextL4.
+  const dataplane::ClassifyL3Verdict verdict =
+      dataplane::classify_l3(m, rs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kNextL4)
+      << "U6.11a: empty L3 ruleset must yield kNextL4 (C0 pass-through)";
 
   rte_pktmbuf_free(m);
   rte_mempool_free(mp);

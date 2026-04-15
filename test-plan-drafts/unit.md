@@ -860,6 +860,11 @@ built in-process via U3/U4 helpers.
   the VLAN tag). Drops, bumps `pkt_truncated_total[l2_vlan]`.
 - Covers: D31 bucket `l2_vlan`.
 
+### U6.11a L3 empty ruleset → kNextL4 [needs EAL]
+- Covers: M5 C0 plumbing baseline. Validates that classify_l3
+  returns kNextL4 on a ruleset with no L3 rules, so later cycles
+  can incrementally add parsing without breaking the skeleton.
+
 ### U6.12 L3 IPv4 — short packet (< l3_off + 20) drops
   `l3_v4`
 - Covers: D31 bucket `l3_v4` (truncation arm).
