@@ -37,6 +37,7 @@ struct WorkerCtx {
   std::uint64_t pkt_multiseg_drop_total = 0;  // D39: nb_segs != 1
   std::uint64_t qinq_outer_only_total   = 0;  // D32: outer S-tag, inner is VLAN TPID
   L2TruncCtrs   pkt_truncated_l2{};           // D31: l2 / l2_vlan truncation buckets
+  L3TruncCtrs   pkt_truncated_l3{};           // D31: l3_v4 truncation/IHL-reject bucket (M5 C1)
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained

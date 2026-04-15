@@ -894,10 +894,31 @@ built in-process via U3/U4 helpers.
   `ctx_stats_bump_pkt_truncated(ctx, "<name>")`.
 - Covers: D31 (structural).
 
-### U6.18 L3 IPv4 — dst FIB hit → TERMINAL_L3
+### U6.18 L3 IPv4 — dst FIB hit → dispatch on rule action
 - Goal: L3v4 rule matches dst prefix; classify_l3 looks up
-  FIB, finds next-hop, dispatches.
-- Covers: D14 (offset via IHL), §5.3.
+  FIB, unpacks the L3CompoundEntry from the 8-byte next-hop
+  slot, resolves the rule action, and dispatches:
+  rule allow → `kNextL4`, rule drop → `kTerminalDrop`.
+- Note: the earlier wording "TERMINAL_L3" predates the M5 C0
+  enum shape. C0 shipped
+  `ClassifyL3Verdict{kNextL4,kTerminalPass,kTerminalDrop}`
+  without a `TERMINAL_L3` slot, so C1 implements and tests
+  the `kNextL4` (allow) / `kTerminalDrop` (drop) dispatch.
+  See `implementation-plan-errata.md` §M5 C1.
+- Covers: §5.3 primary dst-prefix match + action dispatch,
+  D30 (`rte_fib_lookup_bulk(n=1)`).
+
+### U6.18a L3 IPv4 — dst FIB miss → `kNextL4` fall-through [needs EAL]
+- Goal: L3v4 FIB is populated but the packet dst address does
+  not match any prefix; lookup returns the miss sentinel
+  (`default_nh = 0`) and classify_l3 falls through to
+  `kNextL4` without bumping any truncation counter. C2 will
+  add the src-prefix secondary probe on miss; for C1 a clean
+  miss means "no L3 rule applies, continue to L4".
+- Note: new in M5 C1, same pattern as M4 C0's U6.0a and
+  M5 C0's U6.11a (in-cycle test ID allocation). See
+  `implementation-plan-errata.md` §M5 C1.
+- Covers: §5.3 dst-prefix primary miss semantics.
 
 ### U6.19 L3 IPv4 — IHL=6 L4 offset uses `ihl << 2`
   (D14)
