@@ -643,11 +643,8 @@ supervisor does not dispatch rename/growth cycles until P10 is
 resolved.
 
 **Resolution 2026-04-15: option (c) adopted.** Rename
-`src_subnet` → `dst_subnet` landed in M5 C1c commit `<c1c-sha>`
-(placeholder — supervisor patches with the real short sha
-in a follow-up housekeeping commit; sha self-reference is
-the classic content-address fixed-point problem). No
-backcompat shim; parser emits an explicit deprecation
+`src_subnet` → `dst_subnet` landed in M5 C1c commit `de0ff83`.
+No backcompat shim; parser emits an explicit deprecation
 error on the old key. Src-prefix secondary probe deferred
 to v2 as a separate feature.
 

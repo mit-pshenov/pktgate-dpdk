@@ -251,9 +251,7 @@ verification of code paths → P10 promotion.*
 **RESOLVED 2026-04-15 → subsumed into M5 C1c rename.**
 User chose P10 option (c). No secondary FIB cycle; no
 `l3_v4_src`/`l3_v6_src` storage. C2 row in the state
-table became SUBSUMED_BY_C1c. See C1c commit `<c1c-sha>`
-(placeholder — supervisor patches the real short sha
-post-report).
+table became SUBSUMED_BY_C1c. See C1c commit `de0ff83`.
 
 Historical record below preserved verbatim for the
 decision trail.
