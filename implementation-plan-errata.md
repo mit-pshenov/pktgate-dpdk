@@ -313,6 +313,56 @@ rewriting its scope per the chosen option.
 *Origin: M5 C2 worker stop-and-report 2026-04-15 → consultant
 claim verification → P10 promotion + C2 blocking.*
 
+### C3 silent gap: `cfg.fragment_policy` → `rs.fragment_policy` never wired
+
+**Surfaced 2026-04-15 by M5 C3 worker (`559c5b3`).** Not a C3
+defect — a pre-existing compiler/builder hole exposed now that
+`classify_l3` actually consumes `rs->fragment_policy` at
+runtime.
+
+**The hole.** `config::Config.fragment_policy` is parsed
+correctly by M1, but neither `compile_ruleset` nor
+`populate_ruleset_eal` copies the value into
+`Ruleset.fragment_policy`. C3 unit tests work around this by
+setting `rs.fragment_policy` directly on the test fixture
+(`ClassifyL3Ipv4FragmentTest::SetUp`), so all 7 C3 REDs
+(U6.21–U6.25, U6.26a, U6.26b) exercise the classify_l3
+three-arm switch without going through the config path at
+all. Config-path is effectively dead for this field.
+
+**Scope boundary decision.** M5 C3 is a classify_l3 cycle; it
+cannot touch compiler/ruleset under the milestone's layer
+hygiene rules. Worker correctly flagged and did not fix.
+
+**Closure plan: M5 C10 F4 functional.** C10 ships
+`tests/functional/test_f4_l3.py` which drives the full
+`config.json → parse → compile → populate → classify_l3`
+pipeline end-to-end. F4.1–F4.10 cannot exercise
+`fragment_policy` without the wiring, so C10 GREEN is blocked
+until the copy lands. Expected touch: one-line field copy in
+`compile_ruleset` (or wherever `Ruleset` is built from
+`Config`) + one-line copy into the EAL-fill path if it
+bypasses the compiler. No new D-number; the field already
+exists on both sides.
+
+**If C10 reveals the gap is broader** (per-interface override,
+parser schema divergence, etc.) — escalate to a dedicated
+C9b / C10a retrofit, not a quiet inline fix. D41 pipeline
+smoke invariant was supposed to catch this class early;
+the reason it didn't is that M4 smoke predated D17 landing,
+so there was no `fragment_policy` to propagate yet. C3 is
+the first cycle where the field actually matters at runtime.
+
+**Memory echo.** Same class as `grabli_m2_silent_pipeline_gap`
+(M2 compound builders orphaned from `compile()`), but this
+one is one-field-shallow and C10 will pick it up naturally.
+No new grabli file — existing precedent already covers the
+lesson ("pipeline milestones need end-to-end smoke").
+
+*Origin: M5 C3 worker closing report 2026-04-15 → supervisor
+logged here before C4 dispatch so the C10 prompt carries the
+dependency forward.*
+
 ### D32 QinQ `l3_offset = 22` never happens in MVP
 Earlier handoff template prose said "QinQ → l3_offset=22" but
 `classify_l2` walks exactly one tag in MVP (0x8100 or 0x88A8), so
