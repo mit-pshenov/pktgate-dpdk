@@ -500,10 +500,26 @@ until the next batch revision.*
 
 ## §M7 — Action dispatch (lines 434-467)
 
-### Compiler→builder lowering gap: CompiledAction drops dscp/pcp/redirect_port
+### Compiler→builder lowering gap: CompiledAction drops dscp/pcp/redirect_port — RESOLVED by C2b `79bbf9a`
 
 **CRITICAL — same D41 silent pipeline gap class as M2 (compound builders)
 and M5 C3 (fragment_policy).**
+
+**Resolved 2026-04-16 by M7 C2b (`79bbf9a`):**
+`CompiledAction` extended with `dscp` (uint8_t), `pcp` (uint8_t),
+`redirect_port` (uint16_t). `resolve_verb` replaced by a single
+`resolve_action` visitor in `object_compiler.cpp` that fills both
+verb + payload from the `config::RuleAction` variant. REDIRECT
+`role_name` resolved **in-compiler** via `cfg.interface_roles` by
+declaration index (matches `main.cpp` RTE_ETH_FOREACH_DEV zip
+convention) — CompiledAction stays POD, no string storage.
+Both `copy_actions` overloads in `builder.cpp` now copy
+`s.dscp`/`s.pcp`/`s.redirect_port` instead of hardcoding
+zeros/sentinel. `CompileResult.default_action` added alongside
+`fragment_policy` (same pattern), wired in `compile()` from
+`cfg.default_behavior`, copied in `build_ruleset`. Tests
+U3.Smoke2/U3.Smoke3/U3.Smoke4 confirm TAG/REDIRECT/default_action
+config→runtime roundtrips. U6.44-U6.55 stayed green.
 
 `compiler::CompiledAction` (compiler.h:83-88) only carries four fields:
 `rule_id`, `counter_slot`, `verb`, `execution_tier`. The `resolve_verb`
@@ -568,5 +584,6 @@ Insert a **C2b retrofit** cycle between C2 and C3 in the M7 plan:
 
 ---
 
-*Last updated: 2026-04-16 (§M7 compiler→builder lowering gap + scope
-trim). Add new items with date + origin cycle at append time.*
+*Last updated: 2026-04-16 (§M7 lowering gap marked RESOLVED by C2b
+`79bbf9a`; scope trim). Add new items with date + origin cycle at
+append time.*
