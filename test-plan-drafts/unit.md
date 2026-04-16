@@ -1060,8 +1060,29 @@ built in-process via U3/U4 helpers.
   D22).
 - Covers: D22 (IPv6 EXT_MASK UB fix).
 
-### U6.32 L3 IPv6 — fib hit on dst prefix → TERMINAL_L3
-- Covers: §5.3 IPv6, F1 L3.
+### U6.32 L3 IPv6 — dst FIB hit → dispatch on rule action
+- Goal: L3v6 rule matches dst prefix; classify_l3 looks up
+  FIB6, unpacks the L3CompoundEntry from the 8-byte next-hop
+  slot, resolves the rule action, and dispatches:
+  rule allow → `kNextL4`, rule drop → `kTerminalDrop`.
+- Note: the earlier wording "TERMINAL_L3" predates the M5 C0
+  enum shape. C0 shipped
+  `ClassifyL3Verdict{kNextL4,kTerminalPass,kTerminalDrop}`
+  without a `TERMINAL_L3` slot, so C4 implements and tests
+  the `kNextL4` (allow) / `kTerminalDrop` (drop) dispatch.
+  See `implementation-plan-errata.md` §M5 C1 for the IPv4
+  precedent (U6.18).
+- Covers: §5.3 IPv6 primary dst-prefix match + action dispatch,
+  D30 (`rte_fib6_lookup_bulk(n=1)`).
+
+### U6.32a L3 IPv6 — dst FIB miss → `kNextL4` fall-through [needs EAL]
+- Goal: L3v6 FIB is populated but the packet dst address does
+  not match any prefix; lookup returns the miss sentinel
+  (`default_nh = 0`) and classify_l3 falls through to
+  `kNextL4` without bumping any truncation counter. Analogous
+  to U6.18a for IPv4.
+- Note: new in M5 C4, same pattern as M5 C1's U6.18a.
+- Covers: §5.3 IPv6 dst-prefix primary miss semantics.
 
 ### U6.33 L4 — proto+dport primary hit
 - Goal: rule `tcp dst 443`. TCP/443 packet → `l4_proto_dport`

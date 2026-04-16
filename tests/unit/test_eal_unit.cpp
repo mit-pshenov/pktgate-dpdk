@@ -3460,4 +3460,336 @@ TEST_F(ClassifyL2VlanQinQCornerTest, C4_10_SeventeenBytesVlanTruncated) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// M5 C4 — classify_l3 IPv6 branch: dst-prefix FIB lookup + D31 l3_v6
+//         truncation guard + basic IPv6 pass-through.
+//
+// Four unit tests:
+//
+//   U6.14  — IPv6 short packet (pkt_len < l3_off + 40) → kTerminalDrop +
+//            D31 l3_v6 truncation bucket bump.
+//   U6.26  — IPv6 plain TCP (next_header=6), no L3 rules → kNextL4,
+//            l4_extra stays at init value (0). Basic IPv6 pass-through.
+//   U6.32  — IPv6 dst FIB hit on allow/drop rule → dispatch on action
+//            (allow → kNextL4, drop → kTerminalDrop). Same pattern as
+//            U6.18 for IPv4.
+//   U6.32a — IPv6 dst FIB miss → kNextL4 fall-through (analogous to
+//            U6.18a for IPv4).
+//
+// All tests bypass classify_l2 and call classify_l3 directly, writing
+// dyn->l3_offset / parsed_ethertype / flags by hand. Same pattern as
+// U6.12-U6.18b (M5 C1/C1b).
+// =========================================================================
+
+class ClassifyL3Ipv6Test : public EalFixture {};
+
+// -------------------------------------------------------------------------
+// U6.14 — IPv6 short packet (pkt_len < l3_off + 40) → kTerminalDrop
+//
+// IPv6 has a fixed 40-byte header. A frame shorter than l3_off + 40
+// cannot hold a valid IPv6 header. D31 l3_v6 truncation guard fires,
+// bumps pkt_truncated_l3[l3_v6], returns kTerminalDrop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6Test, U6_14_Ipv6ShortPacketTruncDrop) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+
+  // Build a short frame: 14 B Ethernet + 39 B "IPv6 header" (one byte short).
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_14_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  constexpr std::size_t kFrameLen = 14 + 39;  // one byte short of valid IPv6
+  std::uint8_t* pkt = reinterpret_cast<std::uint8_t*>(
+      rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x86;
+  pkt[13] = 0xDD;  // EtherType 0x86DD IPv6
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+
+  dataplane::L3TruncCtrs trunc_ctrs{};
+  const auto verdict = dataplane::classify_l3(m, rs, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "U6.14: IPv6 frame shorter than l3_off+40 must be dropped by D31 l3_v6 guard";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 1u)
+      << "U6.14: pkt_truncated_l3[l3_v6] must be 1";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "U6.14: IPv6 truncation must NOT bleed into l3_v4 bucket";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.26 — IPv6 plain TCP (next_header=6), no L3 rules → kNextL4
+//
+// IPv6 packet with next_header = 6 (TCP). No L3 rules in the ruleset,
+// so the FIB is nullptr → skip lookup → fall through to kNextL4.
+// l4_extra must stay at its init value (0) since C4 does not write it;
+// ext-header handling (C5) and fragment handling (C6) will write l4_extra.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6Test, U6_26_Ipv6PlainTcpNextL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+
+  // Build a 14 B Ethernet + 40 B IPv6 header frame.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_26_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  constexpr std::size_t kFrameLen = 14 + 40;
+  std::uint8_t* pkt = reinterpret_cast<std::uint8_t*>(
+      rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x86;
+  pkt[13] = 0xDD;  // EtherType 0x86DD IPv6
+  pkt[14] = 0x60;  // version=6
+  pkt[20] = 6;     // next_header = TCP (offset 14+6 = 20)
+  // dst_addr at offset 14+24 = 38 (16 bytes). Set to 2001:db8::1.
+  pkt[38] = 0x20; pkt[39] = 0x01;
+  pkt[40] = 0x0d; pkt[41] = 0xb8;
+  pkt[53] = 0x01;  // last byte of dst_addr
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+  dyn->l4_extra         = 0;  // pre-init to 0
+
+  dataplane::L3TruncCtrs trunc_ctrs{};
+  const auto verdict = dataplane::classify_l3(m, rs, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kNextL4)
+      << "U6.26: IPv6 plain TCP with no L3 rules must fall through to kNextL4";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(cdyn->l4_extra, 0u)
+      << "U6.26: l4_extra must stay 0 (C4 does not write l4_extra; ext-headers are C5/C6)";
+  EXPECT_EQ(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "U6.26: plain TCP must not set SKIP_L4";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "U6.26: valid IPv6 frame must NOT bump l3_v6 truncation counter";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.32 — IPv6 dst FIB hit → dispatch on rule action
+//
+// unit.md wording says "TERMINAL_L3" — reconciled to current enum per
+// the same pattern as M5 C1's U6.18 reconciliation:
+//   allow action → kNextL4
+//   drop  action → kTerminalDrop
+//
+// Uses a filler + target rule (same as U6.18) so the target allow rule
+// lands at action_idx=1, avoiding the C1b zero-packed entry path.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6Test, U6_32_Ipv6DstFibHitDispatch) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+
+  // Filler rule (IPv6 prefix) at action_idx=0.
+  SubnetObject filler;
+  filler.name = "v6_filler_u6_32";
+  {
+    Cidr6 c{};
+    c.bytes[0] = 0xfd;  // fd00::/8
+    c.prefix = 8;
+    filler.cidrs.push_back(c);
+  }
+  cfg.objects.subnets.push_back(std::move(filler));
+
+  // Target rule (IPv6 prefix) at action_idx=1.
+  SubnetObject target;
+  target.name = "v6_target_u6_32";
+  {
+    Cidr6 c{};
+    c.bytes[0] = 0x20; c.bytes[1] = 0x01;
+    c.bytes[2] = 0x0d; c.bytes[3] = 0xb8;  // 2001:db8::/32
+    c.prefix = 32;
+    target.cidrs.push_back(c);
+  }
+  cfg.objects.subnets.push_back(std::move(target));
+
+  auto& r_filler = append_rule(cfg.pipeline.layer_3, 6320, ActionDrop{});
+  r_filler.dst_subnet = SubnetRef{"v6_filler_u6_32"};
+  auto& r_target = append_rule(cfg.pipeline.layer_3, 6321, ActionAllow{});
+  r_target.dst_subnet = SubnetRef{"v6_target_u6_32"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+  ASSERT_EQ(cr.l3_compound.size(), 2u);
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_32";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v6_fib, nullptr);
+  ASSERT_GE(rs.n_l3_rules, 2u);
+  EXPECT_EQ(rs.l3_actions[1].verb,
+            static_cast<std::uint8_t>(compiler::ActionVerb::kAllow));
+
+  // Build a 14 B Ethernet + 40 B IPv6 frame addressed to 2001:db8::1.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_32_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  constexpr std::size_t kFrameLen = 14 + 40;
+  std::uint8_t* pkt = reinterpret_cast<std::uint8_t*>(
+      rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x86;
+  pkt[13] = 0xDD;  // 0x86DD IPv6
+  pkt[14] = 0x60;  // version=6
+  pkt[20] = 6;     // next_header = TCP
+  // dst_addr at offset 14+24 = 38 (16 bytes). 2001:db8::1.
+  pkt[38] = 0x20; pkt[39] = 0x01;
+  pkt[40] = 0x0d; pkt[41] = 0xb8;
+  pkt[53] = 0x01;  // last byte
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+
+  dataplane::L3TruncCtrs trunc_ctrs{};
+  const auto verdict = dataplane::classify_l3(m, rs, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kNextL4)
+      << "U6.32: dst FIB hit on IPv6 allow rule must dispatch to kNextL4 "
+         "(unit.md's stale TERMINAL_L3 wording reconciled to C0 enum)";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "U6.32: clean hit must not bump the l3_v6 truncation bucket";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.32a — IPv6 dst FIB miss → kNextL4 fall-through (NEW, M5 C4)
+//
+// Same populated FIB as U6.32; frame addressed to fc00::1 which matches
+// neither the filler (fd00::/8) nor the target (2001:db8::/32) prefix.
+// FIB lookup returns nh=0 (default_nh), classify_l3 falls through to
+// kNextL4 and bumps no counter. Analogous to U6.18a for IPv4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6Test, U6_32a_Ipv6DstFibMissFallsThrough) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  Config cfg = make_config();
+
+  SubnetObject filler;
+  filler.name = "v6_filler_u6_32a";
+  {
+    Cidr6 c{};
+    c.bytes[0] = 0xfd;
+    c.prefix = 8;
+    filler.cidrs.push_back(c);
+  }
+  cfg.objects.subnets.push_back(std::move(filler));
+
+  SubnetObject target;
+  target.name = "v6_target_u6_32a";
+  {
+    Cidr6 c{};
+    c.bytes[0] = 0x20; c.bytes[1] = 0x01;
+    c.bytes[2] = 0x0d; c.bytes[3] = 0xb8;
+    c.prefix = 32;
+    target.cidrs.push_back(c);
+  }
+  cfg.objects.subnets.push_back(std::move(target));
+
+  auto& r_filler = append_rule(cfg.pipeline.layer_3, 6322, ActionDrop{});
+  r_filler.dst_subnet = SubnetRef{"v6_filler_u6_32a"};
+  auto& r_target = append_rule(cfg.pipeline.layer_3, 6323, ActionAllow{});
+  r_target.dst_subnet = SubnetRef{"v6_target_u6_32a"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = "u6_32a";
+  params.socket_id = 0;
+  params.max_entries = 64;
+
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v6_fib, nullptr);
+
+  // Build a 14 B Ethernet + 40 B IPv6 frame addressed to fc00::1 —
+  // outside both populated prefixes.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_32a_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  constexpr std::size_t kFrameLen = 14 + 40;
+  std::uint8_t* pkt = reinterpret_cast<std::uint8_t*>(
+      rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x86;
+  pkt[13] = 0xDD;
+  pkt[14] = 0x60;  // version=6
+  pkt[20] = 6;     // next_header = TCP
+  // dst_addr: fc00::1 — outside both fd00::/8 and 2001:db8::/32.
+  pkt[38] = 0xfc;
+  pkt[53] = 0x01;
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+
+  dataplane::L3TruncCtrs trunc_ctrs{};
+  const auto verdict = dataplane::classify_l3(m, rs, &trunc_ctrs);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kNextL4)
+      << "U6.32a: IPv6 dst FIB miss must fall through to kNextL4";
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "U6.32a: clean miss must NOT bump pkt_truncated_l3[l3_v6]";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test

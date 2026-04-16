@@ -17,6 +17,10 @@
 //          writes the `SKIP_L4` dynfield flag on the non-first L3_ONLY
 //          arm (consumed by §5.4 classify_l4 in M6). Mirrors the v6
 //          fragment branch that C6 will add in the same shape.
+// M5 C4  — IPv6 branch: dst-prefix primary FIB lookup via
+//          rte_fib6_lookup_bulk(n=1), D31 l3_v6 truncation guard.
+//          Mirrors the IPv4 branch from C1; no fragment handling yet
+//          (C6 scope), no ext-header handling (C5 scope).
 //
 // The classify_l3 stage consumes `dyn->l3_offset` and
 // `dyn->parsed_ethertype` (both written by classify_l2 per D13) and
@@ -71,7 +75,9 @@
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_fib.h>
+#include <rte_fib6.h>
 #include <rte_ip.h>
+#include <rte_ip6.h>
 #include <rte_mbuf.h>
 
 #include "src/action/action.h"
@@ -91,12 +97,16 @@ namespace pktgate::dataplane {
 //                "the header we were told to read is malformed" event,
 //                semantically identical to truncation from classify_l3's
 //                perspective.
-//   C4 adds kL3V6; C6 adds kL3V6FragExt.
+// kL3V6        — IPv6 header truncated (pkt_len < l3_off + 40). IPv6 has
+//                a fixed 40-byte header; anything shorter cannot be parsed.
+//                M5 C4 landing.
+//   C6 adds kL3V6FragExt.
 
 enum class L3TruncBucket : std::size_t {
   kL3V4 = 0,
+  kL3V6 = 1,  // C4: IPv6 header truncated (pkt_len < l3_off + 40)
 };
-inline constexpr std::size_t kL3TruncBucketCount = 1;
+inline constexpr std::size_t kL3TruncBucketCount = 2;
 
 // Convenience alias used by WorkerCtx and test code.
 using L3TruncCtrs = std::array<std::uint64_t, kL3TruncBucketCount>;
@@ -257,9 +267,20 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 //   (symmetric to classify_l2's C7 fix — see memory grabli
 //   `empty_ruleset_short_circuit_hides_parse`).
 //
+// C4 body — IPv6 branch:
+//   0. If et == RTE_BE16(RTE_ETHER_TYPE_IPV6):
+//   1. D31 l3_v6 truncation guard — if pkt_len < l3_off + 40, bump
+//      trunc_ctrs[kL3V6] (if non-null) and return kTerminalDrop.
+//   2. No ext-header handling yet (C5 scope).
+//   3. No fragment handling yet (C6 scope).
+//   4. dst-prefix primary FIB lookup — rte_fib6_lookup_bulk(n=1) with
+//      the dst_addr in network byte order (no conversion needed). Same
+//      valid_tag check as IPv4 (C1b retrofit).
+//   5. Hit → l3_dispatch, miss → kNextL4 fall-through.
+//
 // trunc_ctrs (optional, D31):
-//   Pointer to a L3TruncCtrs array (std::array<uint64_t, 1> indexed by
-//   L3TruncBucket::kL3V4). Pass nullptr to skip the bump (backward-
+//   Pointer to a L3TruncCtrs array (std::array<uint64_t, 2> indexed by
+//   L3TruncBucket::kL3V4/kL3V6). Pass nullptr to skip the bump (backward-
 //   compatible default — the C0 baseline test calls without it).
 //   Worker passes &ctx->pkt_truncated_l3. Follows the optional-counter
 //   pattern established by classify_l2 (memory grabli
@@ -468,8 +489,58 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     return v;
   }
 
-  // Non-IPv4 ethertype — IPv6 body lands in C4, unknown ethertypes
-  // pass through. No header read, no counter bump.
+  // --------------------------- IPv6 branch ---------------------------------
+  // C4: dst-prefix primary FIB lookup via rte_fib6_lookup_bulk(n=1),
+  // D31 l3_v6 truncation guard. C5 adds ext-header handling, C6 adds
+  // fragment handling. This branch mirrors the IPv4 branch above.
+  if (et == RTE_BE16(RTE_ETHER_TYPE_IPV6)) {
+    // ---- D31 l3_v6 truncation guard (U6.14) -----------------------------
+    // IPv6 has a fixed 40-byte header. Must fire before any header byte
+    // read. pkt_len >= l3_off + 40 is the minimum.
+    const std::uint32_t need = static_cast<std::uint32_t>(l3_off) +
+                               sizeof(struct rte_ipv6_hdr);
+    if (rte_pktmbuf_pkt_len(m) < need) {
+      if (trunc_ctrs) {
+        ++(*trunc_ctrs)[static_cast<std::size_t>(L3TruncBucket::kL3V6)];
+      }
+      return ClassifyL3Verdict::kTerminalDrop;
+    }
+
+    // Now safe to read the IPv6 header at [l3_off .. l3_off + 40).
+    const auto* raw = rte_pktmbuf_mtod(m, const std::uint8_t*);
+    const auto* ip6 = reinterpret_cast<const struct rte_ipv6_hdr*>(
+        raw + l3_off);
+
+    // C5: ext-header check lands here (before FIB lookup)
+    // C6: fragment ext handling lands here
+
+    // ---- dst-prefix primary FIB lookup (U6.32 / U6.32a) -----------------
+    // If the FIB is unpopulated (empty L3 ruleset), skip the lookup and
+    // fall through to kNextL4 — same baseline path as the IPv4 branch.
+    if (rs.l3_v6_fib == nullptr) {
+      return ClassifyL3Verdict::kNextL4;
+    }
+
+    // rte_fib6_lookup_bulk takes `const struct rte_ipv6_addr*` in network
+    // byte order — no byteswap needed, unlike IPv4 which converts to
+    // host order. Per D30, n=1 is the default per-packet form.
+    std::uint64_t nh = 0;
+    int lret = rte_fib6_lookup_bulk(rs.l3_v6_fib, &ip6->dst_addr, &nh, 1);
+    if (lret < 0) {
+      return ClassifyL3Verdict::kNextL4;
+    }
+
+    // Unpack the packed L3CompoundEntry from the 8-byte next-hop slot
+    // (same as IPv4 — M5 C1b valid_tag check).
+    ruleset::L3CompoundEntry entry{};
+    std::memcpy(&entry, &nh, sizeof(entry));
+    if (entry.valid_tag != ruleset::L3_ENTRY_VALID_TAG) {
+      return ClassifyL3Verdict::kNextL4;  // miss
+    }
+    return detail::l3_dispatch(rs, entry.action_idx);
+  }
+
+  // Unknown ethertype — pass through. No header read, no counter bump.
   return ClassifyL3Verdict::kNextL4;
 }
 
