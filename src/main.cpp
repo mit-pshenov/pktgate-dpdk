@@ -221,7 +221,11 @@ int main(int argc, char* argv[]) {
     std::uint16_t pid;
     RTE_ETH_FOREACH_DEV(pid) {
       port_ids.push_back(pid);
-      if (port_ids.size() >= 2) break;
+      // M7 C4: raise the cap to 3 so F3.9/F3.10 REDIRECT functional
+      // tests can target a third tap vdev distinct from RX (port_ids[0])
+      // and default TX (port_ids[1]). Production deployments only
+      // declare 2 ports; this cap is purely a functional-test affordance.
+      if (port_ids.size() >= 3) break;
     }
 #pragma GCC diagnostic pop
   }

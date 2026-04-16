@@ -53,6 +53,9 @@ DPDK_DRIVER_DIR = os.environ.get(
 
 _INGRESS_IFACE = "dtap_f3_rx"
 _EGRESS_IFACE = "dtap_f3_tx"
+# M7 C4: third tap for F3.9/F3.10 REDIRECT target. main.cpp caps
+# port discovery at 3, and this vdev occupies port_ids[2] when present.
+_REDIR_IFACE = "dtap_f3_redir"
 
 # FIB / ruleset init needs ~128 MB heap even without L3 rules → -m 512.
 _EAL_ARGS_TEMPLATE = [
@@ -62,6 +65,20 @@ _EAL_ARGS_TEMPLATE = [
     "-d", DPDK_DRIVER_DIR,
     "--vdev", f"net_tap0,iface={_INGRESS_IFACE}",
     "--vdev", f"net_tap1,iface={_EGRESS_IFACE}",
+    "-l", "0,1",
+    "--log-level", "lib.*:error",
+]
+
+# F3.9/F3.10 harness adds the redirect tap. Separate template so F3.1-F3.7
+# keep their (binary-exact) 2-port config unchanged.
+_EAL_ARGS_TEMPLATE_WITH_REDIR = [
+    "--no-pci",
+    "--no-huge",
+    "-m", "512",
+    "-d", DPDK_DRIVER_DIR,
+    "--vdev", f"net_tap0,iface={_INGRESS_IFACE}",
+    "--vdev", f"net_tap1,iface={_EGRESS_IFACE}",
+    "--vdev", f"net_tap2,iface={_REDIR_IFACE}",
     "-l", "0,1",
     "--log-level", "lib.*:error",
 ]
@@ -148,9 +165,16 @@ class _F3Harness:
     """Start pktgate_dpdk, wait for ready, run an egress AsyncSniffer in
     parallel with scapy.sendp() on the ingress tap.  Expose the captured
     egress packets via `h.captured` and the stats_on_exit JSON via
-    `h.stdout_text` after __exit__."""
+    `h.stdout_text` after __exit__.
 
-    def __init__(self, config: dict, file_prefix: str):
+    M7 C4: `extra_ifaces` lets F3.9/F3.10 manage the redirect tap the
+    same way as the two original taps (delete-stale, NM-unmanaged via
+    the conftest fixture, sysctl ipv6/arp disable). `eal_template`
+    selects between the 2-port and 3-port vdev layouts."""
+
+    def __init__(self, config: dict, file_prefix: str,
+                 eal_template: list = None,
+                 extra_ifaces: list = None):
         self._config = config
         self._file_prefix = (
             f"{file_prefix}_{time.monotonic_ns() % 10**9:09d}"
@@ -164,10 +188,14 @@ class _F3Harness:
         self._tmpf = None
         self.captured: list = []
         self._sniffer = None
+        self._eal_template = eal_template or _EAL_ARGS_TEMPLATE
+        self._extra_ifaces = list(extra_ifaces or [])
 
     def __enter__(self):
         _delete_stale_tap(_INGRESS_IFACE)
         _delete_stale_tap(_EGRESS_IFACE)
+        for iface in self._extra_ifaces:
+            _delete_stale_tap(iface)
 
         self._tmpf = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False
@@ -175,7 +203,7 @@ class _F3Harness:
         json.dump(self._config, self._tmpf)
         self._tmpf.close()
 
-        eal_args = _EAL_ARGS_TEMPLATE + ["--file-prefix", self._file_prefix]
+        eal_args = self._eal_template + ["--file-prefix", self._file_prefix]
         cmd = [self._binary] + eal_args + ["--config", self._tmpf.name]
 
         self._proc = subprocess.Popen(
@@ -228,14 +256,16 @@ class _F3Harness:
                 f"stdout={self.stdout_text!r}"
             )
 
-        if not _tap_iface_up(_INGRESS_IFACE) or not _tap_iface_up(_EGRESS_IFACE):
-            self._proc.terminate()
-            raise RuntimeError(
-                f"Tap interfaces did not appear within 5s"
-            )
+        all_ifaces = [_INGRESS_IFACE, _EGRESS_IFACE] + self._extra_ifaces
+        for iface in all_ifaces:
+            if not _tap_iface_up(iface):
+                self._proc.terminate()
+                raise RuntimeError(
+                    f"Tap interface {iface} did not appear within 5s"
+                )
 
-        # Defence-in-depth against kernel control traffic on both taps.
-        for iface in (_INGRESS_IFACE, _EGRESS_IFACE):
+        # Defence-in-depth against kernel control traffic on all taps.
+        for iface in all_ifaces:
             subprocess.run(
                 ["sysctl", "-qw",
                  f"net.ipv6.conf.{iface}.disable_ipv6=1"],
@@ -256,13 +286,17 @@ class _F3Harness:
 
         return self
 
-    def inject_and_sniff(self, packets, sniff_timeout: float = 1.5):
-        """Start the egress sniffer, send `packets` on the ingress tap,
-        then stop the sniffer after `sniff_timeout`. Populates
-        `self.captured` with the list of rte_eth_tx_burst'd packets that
-        landed on dtap_f3_tx."""
+    def inject_and_sniff(self, packets, sniff_timeout: float = 1.5,
+                          sniff_iface: str = None):
+        """Start an AsyncSniffer on `sniff_iface` (default: egress tap),
+        send `packets` on the ingress tap, then stop the sniffer after
+        `sniff_timeout`. Populates `self.captured` with the list of
+        rte_eth_tx_burst'd packets that landed on the sniffed tap."""
         from scapy.all import sendp, conf as sc
         sc.ifaces.reload()
+
+        if sniff_iface is None:
+            sniff_iface = _EGRESS_IFACE
 
         # Filter: only frames with our anchored src_mac. The kernel tap
         # will also see any control frames the kernel itself posts
@@ -275,7 +309,7 @@ class _F3Harness:
                 return False
 
         self._sniffer = AsyncSniffer(
-            iface=_EGRESS_IFACE,
+            iface=sniff_iface,
             store=True,
             lfilter=_lfilter,
         )
@@ -338,13 +372,29 @@ class _F3Harness:
 
 def _config(l2_rules=None, l3_rules=None, l4_rules=None,
             default_behavior: str = "drop",
-            objects_subnets: dict = None) -> dict:
+            objects_subnets: dict = None,
+            with_redirect_role: bool = False) -> dict:
+    roles = {
+        "upstream_port":   {"vdev": "net_tap0"},
+        "downstream_port": {"vdev": "net_tap1"},
+    }
+    if with_redirect_role:
+        # Role name "zz_redirect_port" is chosen so that nlohmann::json
+        # iterates interface_roles lex-sorted and the resulting index
+        # maps 1:1 to DPDK port_ids:
+        #   downstream_port (d) → idx 0 → port_ids[0] (dtap_f3_rx)
+        #   upstream_port   (u) → idx 1 → port_ids[1] (dtap_f3_tx)
+        #   zz_redirect_port(z) → idx 2 → port_ids[2] (dtap_f3_redir)
+        # resolve_role_idx() in object_compiler.cpp uses the post-parse
+        # ordering, which is alphabetical under nlohmann — see the
+        # grabli `grabli_nlohmann_json_order.md`. The semantic name
+        # mismatch (dtap_f3_rx being labeled "downstream_port") is
+        # harmless because main.cpp picks RX/TX by DPDK port order, not
+        # by role name.
+        roles["zz_redirect_port"] = {"vdev": "net_tap2"}
     cfg = {
         "version": 1,
-        "interface_roles": {
-            "upstream_port":   {"vdev": "net_tap0"},
-            "downstream_port": {"vdev": "net_tap1"},
-        },
+        "interface_roles": roles,
         "default_behavior": default_behavior,
         "pipeline": {
             "layer_2": l2_rules or [],
@@ -737,3 +787,269 @@ def test_f3_7_tag_combined_dscp_pcp():
     ctrs = _get_counters(h.stdout_text)
     assert ctrs.get("dispatch_unreachable_total", -1) == 0, ctrs
     assert ctrs.get("tag_pcp_noop_untagged_total", -1) == 0, ctrs
+
+
+# ---------------------------------------------------------------------------
+# F3.9 — REDIRECT to a port distinct from default egress (D16)
+# ---------------------------------------------------------------------------
+
+def test_f3_9_redirect_to_port():
+    """F3.9: REDIRECT rule → packet lands on dtap_f3_redir (port_ids[2]),
+    NOT on dtap_f3_tx (default egress). The REDIRECT path goes through
+    stage_redirect + redirect_drain (D16): per-target-port staging, TX
+    at burst end, partial-send free + counter bump. With a single
+    packet and an idle 3rd tap the drain transmits all of it, so
+    redirect_dropped_total == 0.
+
+    Rule fires at L4 (proto=udp dport=5678) — same layer-choice logic
+    as F3.3-F3.7: classify_l2/l3 don't return kMatch for non-DROP verbs,
+    so L4 is the reliable surface to exercise apply_action.
+    """
+    config = _config(
+        l4_rules=[{
+            "id": 3009,
+            "proto": 17,
+            "dst_port": 5678,
+            "action": {"type": "target-port",
+                       "target_port": "zz_redirect_port"},
+        }],
+        default_behavior="drop",
+        with_redirect_role=True,
+    )
+
+    pkt = (
+        Ether(src=_TEST_SRC, dst=_TEST_DST) /
+        IP(src="192.168.1.1", dst="10.0.0.1") /
+        UDP(sport=1234, dport=5678) /
+        Raw(b"F3.9-REDIRECT-PAYLOAD")
+    )
+
+    with _F3Harness(
+        config, "pktgate_f3_9",
+        eal_template=_EAL_ARGS_TEMPLATE_WITH_REDIR,
+        extra_ifaces=[_REDIR_IFACE],
+    ) as h:
+        # Sniff the redirect tap AND the default egress tap in parallel
+        # so we can both (a) confirm redirection succeeded and (b)
+        # confirm the packet did NOT leak onto the default egress.
+        from scapy.all import sendp, conf as sc
+        sc.ifaces.reload()
+
+        def _lfilter(p):
+            try:
+                return p.haslayer(Ether) and p[Ether].src == _TEST_SRC
+            except Exception:
+                return False
+
+        redir_sniffer = AsyncSniffer(
+            iface=_REDIR_IFACE, store=True, lfilter=_lfilter,
+        )
+        egress_sniffer = AsyncSniffer(
+            iface=_EGRESS_IFACE, store=True, lfilter=_lfilter,
+        )
+        redir_sniffer.start()
+        egress_sniffer.start()
+        time.sleep(0.3)
+
+        sendp(pkt, iface=_INGRESS_IFACE, verbose=False)
+
+        time.sleep(1.5)
+        redir_sniffer.stop()
+        egress_sniffer.stop()
+
+        redir_captured = list(redir_sniffer.results or [])
+        egress_captured = list(egress_sniffer.results or [])
+
+    assert h.returncode == 0, (
+        f"exit={h.returncode} stdout={h.stdout_text!r}"
+    )
+    assert _has_frame_for(redir_captured), (
+        f"REDIRECT: expected frame on {_REDIR_IFACE}; "
+        f"captured={[p.summary() for p in redir_captured]!r}"
+    )
+    assert not _has_frame_for(egress_captured), (
+        f"REDIRECT: default egress {_EGRESS_IFACE} must NOT receive the "
+        f"redirected frame; captured={[p.summary() for p in egress_captured]!r}"
+    )
+
+    # Payload round-trip (apply_action does not touch UDP payload for
+    # REDIRECT — no rewrite, just re-stage + TX).
+    first = next(p for p in redir_captured if p[Ether].src == _TEST_SRC)
+    assert first.haslayer(UDP), first.summary()
+    assert bytes(first[Raw].load).startswith(b"F3.9-REDIRECT-PAYLOAD"), (
+        first[Raw].load
+    )
+
+    ctrs = _get_counters(h.stdout_text)
+    assert ctrs.get("dispatch_unreachable_total", -1) == 0, ctrs
+    # Single packet, idle target port → drain sends it all, no drops.
+    assert ctrs.get("redirect_dropped_total", -1) == 0, ctrs
+
+
+# ---------------------------------------------------------------------------
+# F3.10 — REDIRECT burst drain (D16)
+# ---------------------------------------------------------------------------
+
+def test_f3_10_redirect_burst():
+    """F3.10: send a burst of N=16 packets → redirect_drain() flushes the
+    staging buffer once per RX burst; all N packets must appear on the
+    redirect tap. redirect_dropped_total stays 0 (burst fits inside
+    kRedirectBurstMax=32 and the tap TX ring is idle).
+
+    N=16 is a deliberate in-buffer value — we are testing that the drain
+    cadence works end-to-end, NOT that the stage-full drop path fires
+    (that path's exercised by unit U6.55). Overflow-drop testing needs a
+    backpressured TX ring, which the net_tap PMD on the dev VM does not
+    reliably produce.
+    """
+    N = 16
+    config = _config(
+        l4_rules=[{
+            "id": 3010,
+            "proto": 17,
+            "dst_port": 5678,
+            "action": {"type": "target-port",
+                       "target_port": "zz_redirect_port"},
+        }],
+        default_behavior="drop",
+        with_redirect_role=True,
+    )
+
+    packets = [
+        (Ether(src=_TEST_SRC, dst=_TEST_DST) /
+         IP(src="192.168.1.1", dst="10.0.0.1") /
+         UDP(sport=1234 + i, dport=5678) /
+         Raw(f"F3.10-BURST-{i:03d}".encode()))
+        for i in range(N)
+    ]
+
+    with _F3Harness(
+        config, "pktgate_f3_10",
+        eal_template=_EAL_ARGS_TEMPLATE_WITH_REDIR,
+        extra_ifaces=[_REDIR_IFACE],
+    ) as h:
+        captured = h.inject_and_sniff(
+            packets, sniff_timeout=2.5, sniff_iface=_REDIR_IFACE,
+        )
+
+    assert h.returncode == 0, (
+        f"exit={h.returncode} stdout={h.stdout_text!r}"
+    )
+
+    # Count how many of our N injected packets landed on the redirect tap.
+    # We key by UDP sport because sport is unique per-packet in this test.
+    received_sports = set()
+    for p in captured:
+        if p.haslayer(UDP) and p[Ether].src == _TEST_SRC:
+            received_sports.add(int(p[UDP].sport))
+
+    expected_sports = {1234 + i for i in range(N)}
+    missing = expected_sports - received_sports
+    assert not missing, (
+        f"REDIRECT burst: expected {N} packets, missing sports={sorted(missing)}; "
+        f"got {len(received_sports)}/{N}"
+    )
+
+    ctrs = _get_counters(h.stdout_text)
+    assert ctrs.get("dispatch_unreachable_total", -1) == 0, ctrs
+    # Burst fits into kRedirectBurstMax=32, target tap is idle →
+    # redirect_drain transmits everything, no drops.
+    assert ctrs.get("redirect_dropped_total", -1) == 0, ctrs
+
+
+# ---------------------------------------------------------------------------
+# F3.17 — MIRROR action → compile-time reject (D7)
+# ---------------------------------------------------------------------------
+#
+# MIRROR is parser-accepted (D7: the config schema keeps the field so
+# Phase-2 can flip the gate without a schema break) but compiler-rejected
+# in MVP. main.cpp prints a JSON error on stdout and returns 1 *before*
+# rte_eal_init runs, so this test does not need tap vdevs or hugepages —
+# just launch the binary with a --config that contains a mirror rule and
+# verify (a) non-zero exit, (b) "compile_err" / "mirror" on stdout, (c)
+# no "ready" ever emitted.
+
+def test_f3_17_mirror_compile_reject():
+    """F3.17: a rule with action.type=mirror must be rejected at compile
+    time. The binary exits with status != 0 and emits a JSON
+    compile_err line mentioning mirror / not implemented.
+    """
+    config = {
+        "version": 1,
+        "interface_roles": {
+            "upstream_port":   {"vdev": "net_tap0"},
+            "downstream_port": {"vdev": "net_tap1"},
+        },
+        "default_behavior": "drop",
+        "pipeline": {
+            "layer_2": [],
+            "layer_3": [],
+            "layer_4": [{
+                "id": 3017,
+                "proto": 17,
+                "dst_port": 5678,
+                "action": {"type": "mirror",
+                           "target_port": "downstream_port"},
+            }],
+        },
+        "sizing": _SIZING,
+    }
+
+    binary = _find_binary()
+
+    tmpf = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False,
+    )
+    try:
+        json.dump(config, tmpf)
+        tmpf.close()
+
+        # Compile error happens before rte_eal_init — EAL args are only
+        # here to make behaviour deterministic if a regression ever
+        # delays the compiler-reject past EAL init. --no-huge keeps
+        # this launch independent of hugepage availability.
+        file_prefix = f"pktgate_f3_17_{time.monotonic_ns() % 10**9:09d}"
+        cmd = [
+            binary,
+            "--no-pci", "--no-huge", "-m", "512",
+            "-d", DPDK_DRIVER_DIR,
+            "-l", "0",
+            "--log-level", "lib.*:error",
+            "--file-prefix", file_prefix,
+            "--config", tmpf.name,
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        stdout_text = proc.stdout.decode(errors="replace")
+        stderr_text = proc.stderr.decode(errors="replace")
+    finally:
+        if os.path.exists(tmpf.name):
+            os.unlink(tmpf.name)
+
+    assert proc.returncode != 0, (
+        f"MIRROR must cause non-zero exit; got rc={proc.returncode} "
+        f"stdout={stdout_text!r} stderr={stderr_text!r}"
+    )
+
+    combined = stdout_text + stderr_text
+    assert "compile_err" in combined, (
+        f"expected 'compile_err' in output; got stdout={stdout_text!r} "
+        f"stderr={stderr_text!r}"
+    )
+    # The compile-error message body comes from
+    # object_compiler.cpp: "mirror action not implemented in this build"
+    assert "mirror" in combined.lower(), (
+        f"expected 'mirror' in output; got stdout={stdout_text!r} "
+        f"stderr={stderr_text!r}"
+    )
+
+    # No packet actually enters the pipeline → stats_on_exit is never
+    # emitted, and in particular 'ready' is never printed.
+    assert '"ready":true' not in stdout_text and '"ready": true' not in stdout_text, (
+        f"MIRROR reject must abort before ready; stdout={stdout_text!r}"
+    )

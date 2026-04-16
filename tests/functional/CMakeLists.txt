@@ -104,9 +104,11 @@ set_tests_properties(functional.test_f4_l3 PROPERTIES
 )
 
 # M7 C3 — F3.1-F3.7: ALLOW/DROP/TAG action end-to-end functional tests.
+# M7 C4 — extended with F3.9/F3.10 (REDIRECT, needs a third tap vdev
+# dtap_f3_redir) + F3.17 (MIRROR compile-time reject, no taps needed).
 # First functional suite that verifies egress *packet contents* (scapy
 # AsyncSniffer on dtap_f3_tx).  FIB needs --no-huge -m 512 even without
-# L3 rules.  7 sub-tests, each boots a fresh EAL instance → generous
+# L3 rules.  10 sub-tests, each boots a fresh EAL instance → generous
 # timeout.
 add_test(
   NAME functional.test_f3_action
@@ -115,5 +117,5 @@ add_test(
 set_tests_properties(functional.test_f3_action PROPERTIES
   LABELS "functional"
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
-  TIMEOUT 300
+  TIMEOUT 420
 )

@@ -54,6 +54,10 @@ _TAP_IFACES_TO_UNMANAGE = [
     # is *sniffed* via scapy.sniff() to verify apply_action actually
     # forwards/tags/drops packets end-to-end (not just counter deltas).
     "dtap_f3_rx", "dtap_f3_tx",
+    # M7 C4 — F3.9/F3.10 REDIRECT tests need a third tap so REDIRECT's
+    # target port resolves to something different from the default
+    # egress (dtap_f3_tx). Sniffed independently.
+    "dtap_f3_redir",
 ]
 
 
