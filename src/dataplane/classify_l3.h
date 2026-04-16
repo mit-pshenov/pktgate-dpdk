@@ -111,9 +111,10 @@ namespace pktgate::dataplane {
 
 enum class L3TruncBucket : std::size_t {
   kL3V4 = 0,
-  kL3V6 = 1,  // C4: IPv6 header truncated (pkt_len < l3_off + 40)
+  kL3V6 = 1,          // C4: IPv6 header truncated (pkt_len < l3_off + 40)
+  kL3V6FragExt = 2,   // C6: IPv6 fragment ext truncated (pkt_len < l3_off + 48)
 };
-inline constexpr std::size_t kL3TruncBucketCount = 2;
+inline constexpr std::size_t kL3TruncBucketCount = 3;
 
 // Convenience alias used by WorkerCtx and test code.
 using L3TruncCtrs = std::array<std::uint64_t, kL3TruncBucketCount>;
@@ -162,8 +163,10 @@ enum FragmentPolicy : std::uint8_t {
 enum class L3FragBucket : std::size_t {
   kL3FragDroppedV4 = 0,
   kL3FragSkippedV4 = 1,
+  kL3FragDroppedV6 = 2,  // C6: D40 any v6 fragment under FRAG_DROP
+  kL3FragSkippedV6 = 3,  // C6: D40 non-first v6 fragment under L3_ONLY
 };
-inline constexpr std::size_t kL3FragBucketCount = 2;
+inline constexpr std::size_t kL3FragBucketCount = 4;
 
 // Convenience alias used by WorkerCtx and test code.
 using L3FragCtrs = std::array<std::uint64_t, kL3FragBucketCount>;
@@ -319,7 +322,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
                                      const ruleset::Ruleset& rs,
                                      L3TruncCtrs* trunc_ctrs = nullptr,
                                      L3FragCtrs*  frag_ctrs  = nullptr,
-                                     std::uint64_t* exthdr_ctr = nullptr) noexcept {
+                                     std::uint64_t* exthdr_ctr = nullptr,
+                                     std::uint64_t* frag_nonfirst_ctr = nullptr) noexcept {
   // D39: caller (worker.cpp) has already run classify_entry_ok which
   // enforces nb_segs == 1. See src/dataplane/classify_entry.h.
 
@@ -543,7 +547,75 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
       if (exthdr_ctr) ++(*exthdr_ctr);
     }
 
-    // C6: fragment (nxt == 44) handling lands here
+    // ---- D27 Fragment extension header (U6.15, U6.28-U6.30) ----------------
+    // IPv6 Fragment ext header (proto 44) is excluded from is_ext_proto above
+    // — it gets its own branch because the first-vs-non-first differentiation
+    // (D27) requires reading the 8-byte frag ext header fields. Mirrors the
+    // IPv4 C3 fragment pattern but with the IPv6 Fragment Extension Header
+    // struct (`struct rte_ipv6_fragment_ext` in rte_ip6.h).
+    if (nxt == 44) {
+      // D31 l3_v6_frag_ext: need 8 more bytes for the fragment ext header
+      // (8 = sizeof(rte_ipv6_fragment_ext)). Total: l3_off + 40 + 8 = 48
+      // bytes from frame start.
+      const std::uint32_t frag_need = static_cast<std::uint32_t>(l3_off) +
+          sizeof(struct rte_ipv6_hdr) + 8u;
+      if (rte_pktmbuf_pkt_len(m) < frag_need) {
+        if (trunc_ctrs) {
+          ++(*trunc_ctrs)[static_cast<std::size_t>(L3TruncBucket::kL3V6FragExt)];
+        }
+        return ClassifyL3Verdict::kTerminalDrop;
+      }
+
+      // Read fragment ext header at l3_off + 40.
+      const auto* fh = reinterpret_cast<const struct rte_ipv6_fragment_ext*>(
+          raw + l3_off + sizeof(struct rte_ipv6_hdr));
+      // frag_data layout (after host conversion):
+      //   bits [3..15] = 13-bit fragment offset (in units of 8 bytes)
+      //   bits [1..2]  = reserved
+      //   bit  [0]     = MF (more fragments)
+      // frag_offset != 0 → non-first fragment.
+      const std::uint16_t frag_data = rte_be_to_cpu_16(fh->frag_data);
+      const bool is_first = (frag_data & RTE_IPV6_EHDR_FO_MASK) == 0;
+
+      // D17 fragment_policy switch (mirrors IPv4 C3)
+      const std::uint8_t policy = rs.fragment_policy;
+      switch (policy) {
+        case kFragDrop: {
+          if (frag_ctrs) {
+            ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragDroppedV6)];
+          }
+          return ClassifyL3Verdict::kTerminalDrop;
+        }
+        case kFragAllow: {
+          return ClassifyL3Verdict::kTerminalPass;
+        }
+        case kFragL3Only:
+        default: {
+          if (is_first) {
+            // D27: first fragment — drill one step to reach L4 header.
+            // l4_extra = 8 so M6 knows L4 starts at l3off + 40 + 8.
+            dyn->l4_extra = 8;
+            // Check if inner next_header is itself an ext-header (or
+            // nested fragment=44). Chain-after-fragment → SKIP_L4 (D27).
+            const std::uint8_t inner_nxt = fh->next_header;
+            if (is_ext_proto(inner_nxt) || inner_nxt == 44) {
+              dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
+              if (exthdr_ctr) ++(*exthdr_ctr);
+            }
+          } else {
+            // D27: non-first fragment — no L4 header, SKIP_L4.
+            dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
+            // D27 named counter + D40 alias invariant (U6.26c sentinel):
+            // both bump at the same site.
+            if (frag_nonfirst_ctr) ++(*frag_nonfirst_ctr);
+            if (frag_ctrs) {
+              ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragSkippedV6)];
+            }
+          }
+          break;  // fall through to FIB lookup
+        }
+      }
+    }
 
     // Snapshot the SKIP_L4 bit once (same pattern as IPv4 branch).
     // If an ext-header was detected above, SKIP_L4 is set and all

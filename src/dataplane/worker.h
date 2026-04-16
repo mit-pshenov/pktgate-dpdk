@@ -41,6 +41,7 @@ struct WorkerCtx {
   L3FragCtrs    pkt_frag_l3{};                // D40: fragment drop/skip buckets (M5 C3 v4;
                                               //       C6 adds v6 slots to the same array)
   std::uint64_t l4_skipped_ipv6_extheader = 0;  // D20: IPv6 non-fragment ext-header → SKIP_L4 (M5 C5)
+  std::uint64_t l4_skipped_ipv6_fragment_nonfirst = 0;  // D27: non-first v6 fragment → SKIP_L4 (M5 C6)
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained

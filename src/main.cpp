@@ -408,8 +408,9 @@ int main(int argc, char* argv[]) {
     // per-rule through a sibling `counters` object.  M4 shipped only
     // `qinq_outer_only_total` (D32); M5 C3 adds the first D40 fragment
     // counters (`pkt_frag_dropped_total_v4` and `pkt_frag_skipped_total_v4`).
-    // M5 C6 will add the v6 family (`pkt_frag_dropped_total_v6`,
-    // `pkt_frag_skipped_total_v6`). M6 adds the D31 L3 truncation
+    // M5 C6 adds the v6 family (`pkt_frag_dropped_total_v6`,
+    // `pkt_frag_skipped_total_v6`) + D27 `l4_skipped_ipv6_fragment_nonfirst`.
+    // M6 adds the D31 L3 truncation
     // buckets. M10 replaces this ad-hoc JSON with a proper Prometheus
     // scrape endpoint; flat keys keep the shape greppable from
     // functional tests until then.
@@ -425,14 +426,27 @@ int main(int argc, char* argv[]) {
     const std::uint64_t frag_skipped_v4 = worker_ctx.pkt_frag_l3[
         static_cast<std::size_t>(
             pktgate::dataplane::L3FragBucket::kL3FragSkippedV4)];
+    // M5 C6: D40 v6 fragment counters (symmetric to v4 above).
+    const std::uint64_t frag_dropped_v6 = worker_ctx.pkt_frag_l3[
+        static_cast<std::size_t>(
+            pktgate::dataplane::L3FragBucket::kL3FragDroppedV6)];
+    const std::uint64_t frag_skipped_v6 = worker_ctx.pkt_frag_l3[
+        static_cast<std::size_t>(
+            pktgate::dataplane::L3FragBucket::kL3FragSkippedV6)];
     stats_json += "],\"counters\":{\"qinq_outer_only_total\":" +
                   std::to_string(worker_ctx.qinq_outer_only_total) +
                   ",\"pkt_frag_dropped_total_v4\":" +
                   std::to_string(frag_dropped_v4) +
                   ",\"pkt_frag_skipped_total_v4\":" +
                   std::to_string(frag_skipped_v4) +
+                  ",\"pkt_frag_dropped_total_v6\":" +
+                  std::to_string(frag_dropped_v6) +
+                  ",\"pkt_frag_skipped_total_v6\":" +
+                  std::to_string(frag_skipped_v6) +
                   ",\"l4_skipped_ipv6_extheader\":" +
-                  std::to_string(worker_ctx.l4_skipped_ipv6_extheader) + "}}";
+                  std::to_string(worker_ctx.l4_skipped_ipv6_extheader) +
+                  ",\"l4_skipped_ipv6_fragment_nonfirst\":" +
+                  std::to_string(worker_ctx.l4_skipped_ipv6_fragment_nonfirst) + "}}";
     log_json(stats_json);
   }
 

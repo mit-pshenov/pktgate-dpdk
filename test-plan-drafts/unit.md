@@ -1032,6 +1032,16 @@ built in-process via U3/U4 helpers.
   bumped, L3 still runs.
 - Covers: D20, §5.3.
 
+### U6.26c L3 IPv6 — D27/D40 alias invariant sentinel
+  (D40 v6 skip / D27 non-first alias) [new RED, M5 C6]
+- Goal: non-first IPv6 fragment under `FRAG_L3_ONLY` bumps
+  BOTH `l4_skipped_ipv6_fragment_nonfirst` (D27 named counter)
+  AND `pkt_frag_skipped_total_v6` (D40 family counter) at the
+  same code site. If someone refactors and separates the bump
+  sites, this sentinel breaks. Paired with U6.26a/U6.26b which
+  cover the v4 analogues.
+- Covers: D27, D40.
+
 ### U6.28 L3 IPv6 — Fragment ext, first fragment → walks
   8 bytes, `l4_extra = 8`, NEXT_L4 (D27)
 - Goal: IPv6 with frag-ext (44), `frag_offset == 0`, inner
