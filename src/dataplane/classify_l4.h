@@ -138,10 +138,10 @@ inline ClassifyL4Verdict classify_l4(struct rte_mbuf* m,
   std::uint16_t l4off;
   if (et == RTE_ETHER_TYPE_IPV4) {
     auto* ip = rte_pktmbuf_mtod_offset(m, const struct rte_ipv4_hdr*, l3_off);
-    l4off = static_cast<std::uint16_t>(l3_off) +
-            static_cast<std::uint16_t>((ip->version_ihl & 0x0F) << 2);
+    l4off = static_cast<std::uint16_t>(
+                static_cast<unsigned>(l3_off) + ((ip->version_ihl & 0x0Fu) << 2));
   } else if (et == RTE_ETHER_TYPE_IPV6) {
-    l4off = static_cast<std::uint16_t>(l3_off) + 40u + dyn->l4_extra;
+    l4off = static_cast<std::uint16_t>(static_cast<unsigned>(l3_off) + 40u + dyn->l4_extra);
   } else {
     // Non-IP — should never arrive here per the pipeline invariant,
     // but if it does, terminal pass (don't leak, don't crash).
