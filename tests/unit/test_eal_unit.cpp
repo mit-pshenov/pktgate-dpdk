@@ -3792,4 +3792,82 @@ TEST_F(ClassifyL3Ipv6Test, U6_32a_Ipv6DstFibMissFallsThrough) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// U6.27 — IPv6 non-fragment extension header (0 = hop-by-hop) → SKIP_L4,
+//         `l4_skipped_ipv6_extheader` bumped, FIB lookup still runs.
+//
+// D20 first-protocol-only: if next_header is a recognized extension header
+// protocol, mark the packet L4-unclassifiable (SKIP_L4 flag in dynfield)
+// and bump the per-lcore `l4_skipped_ipv6_extheader` counter. L3 FIB
+// lookup still runs (same semantics as IPv4 fragment L3_ONLY). Fragment
+// header (44) is excluded from the ext-header mask — C6 handles it.
+//
+// D22 EXT_MASK_LT64: only bits < 64 go in the bitmask; values >= 64 are
+// explicit comparisons. No UB from shifting beyond 63.
+//
+// Test: no L3 rules → FIB is null → since SKIP_L4 is set, result must be
+// kTerminalPass (not kNextL4). Verify SKIP_L4 flag in dynfield. Verify
+// counter bumped to 1.
+// =========================================================================
+
+TEST_F(ClassifyL3Ipv6Test, U6_27_Ipv6ExtHeaderHopByHopSkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  ruleset::Ruleset rs;
+
+  // Build a 14 B Ethernet + 40 B IPv6 header frame.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_27_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  constexpr std::size_t kFrameLen = 14 + 40;
+  std::uint8_t* pkt = reinterpret_cast<std::uint8_t*>(
+      rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x86;
+  pkt[13] = 0xDD;  // EtherType 0x86DD IPv6
+  pkt[14] = 0x60;  // version=6
+  pkt[20] = 0;     // next_header = 0 (hop-by-hop extension header)
+  // dst_addr at offset 14+24 = 38 (16 bytes). Set to 2001:db8::1.
+  pkt[38] = 0x20; pkt[39] = 0x01;
+  pkt[40] = 0x0d; pkt[41] = 0xb8;
+  pkt[53] = 0x01;  // last byte of dst_addr
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+  dyn->l4_extra         = 0;
+
+  dataplane::L3TruncCtrs trunc_ctrs{};
+  dataplane::L3FragCtrs  frag_ctrs{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto verdict = dataplane::classify_l3(
+      m, rs, &trunc_ctrs, &frag_ctrs, &exthdr_ctr);
+
+  // With SKIP_L4 set and FIB null, must return kTerminalPass (not kNextL4).
+  EXPECT_EQ(verdict, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "U6.27: IPv6 ext-header (hop-by-hop=0) with no L3 rules must "
+         "return kTerminalPass when SKIP_L4 is set";
+
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "U6.27: hop-by-hop ext-header must set SKIP_L4 flag in dynfield";
+
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "U6.27: l4_skipped_ipv6_extheader counter must be 1 (D20)";
+
+  EXPECT_EQ(trunc_ctrs[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "U6.27: valid IPv6 frame must NOT bump l3_v6 truncation counter";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test

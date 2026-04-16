@@ -430,7 +430,9 @@ int main(int argc, char* argv[]) {
                   ",\"pkt_frag_dropped_total_v4\":" +
                   std::to_string(frag_dropped_v4) +
                   ",\"pkt_frag_skipped_total_v4\":" +
-                  std::to_string(frag_skipped_v4) + "}}";
+                  std::to_string(frag_skipped_v4) +
+                  ",\"l4_skipped_ipv6_extheader\":" +
+                  std::to_string(worker_ctx.l4_skipped_ipv6_extheader) + "}}";
     log_json(stats_json);
   }
 

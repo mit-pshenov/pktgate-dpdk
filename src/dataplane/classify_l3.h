@@ -21,6 +21,13 @@
 //          rte_fib6_lookup_bulk(n=1), D31 l3_v6 truncation guard.
 //          Mirrors the IPv4 branch from C1; no fragment handling yet
 //          (C6 scope), no ext-header handling (C5 scope).
+// M5 C5  — IPv6 ext-header detection (D20 first-protocol-only + D22
+//          EXT_MASK_LT64 UB fix): if next_header is a recognized
+//          extension header protocol (except fragment=44, which is C6),
+//          set SKIP_L4 in dynfield and bump `l4_skipped_ipv6_extheader`.
+//          L3 FIB lookup still runs. All kNextL4 return paths collapse
+//          to kTerminalPass when SKIP_L4 is set (same pattern as IPv4
+//          fragment L3_ONLY in C3).
 //
 // The classify_l3 stage consumes `dyn->l3_offset` and
 // `dyn->parsed_ethertype` (both written by classify_l2 per D13) and
@@ -296,6 +303,13 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 //   observability. C6 extends the enum with v6 slots and reuses the
 //   same pointer.
 //
+// exthdr_ctr (optional, D20, M5 C5):
+//   Pointer to a uint64_t counter for `l4_skipped_ipv6_extheader`.
+//   Bumped when an IPv6 packet's next_header is a recognized extension
+//   header protocol (excluding fragment=44, which is C6). Pass nullptr
+//   to skip the bump (backward-compatible default — all pre-C5 tests
+//   compile unchanged). Worker passes &ctx->l4_skipped_ipv6_extheader.
+//
 // The function is `noexcept`: like classify_l2 it runs on the hot
 // path and must not throw. All DPDK calls it makes (rte_fib_lookup_bulk
 // / rte_fib6_lookup_bulk in C4 / rte_hash_lookup_data) are C APIs that
@@ -304,7 +318,8 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
                                      const ruleset::Ruleset& rs,
                                      L3TruncCtrs* trunc_ctrs = nullptr,
-                                     L3FragCtrs*  frag_ctrs  = nullptr) noexcept {
+                                     L3FragCtrs*  frag_ctrs  = nullptr,
+                                     std::uint64_t* exthdr_ctr = nullptr) noexcept {
   // D39: caller (worker.cpp) has already run classify_entry_ok which
   // enforces nb_segs == 1. See src/dataplane/classify_entry.h.
 
@@ -511,14 +526,37 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     const auto* ip6 = reinterpret_cast<const struct rte_ipv6_hdr*>(
         raw + l3_off);
 
-    // C5: ext-header check lands here (before FIB lookup)
-    // C6: fragment ext handling lands here
+    const std::uint8_t nxt = ip6->proto;  // next_header field
+
+    // ---- D20 first-protocol-only ext-header detection (U6.27) -----------
+    // D22: EXT_MASK_LT64 — only bits < 64 in the bitmask, values >= 64
+    // are explicit OR clauses. Fragment (44) excluded — D27 (C6).
+    static constexpr std::uint64_t kExtMaskLt64 =
+        (1ull << 0) | (1ull << 43) | (1ull << 50) | (1ull << 51) | (1ull << 60);
+    auto is_ext_proto = [](std::uint8_t p) noexcept -> bool {
+      return (p < 64 && ((1ull << p) & kExtMaskLt64)) ||
+             p == 135 || p == 139 || p == 140 || p == 253 || p == 254;
+    };
+
+    if (is_ext_proto(nxt)) {
+      dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
+      if (exthdr_ctr) ++(*exthdr_ctr);
+    }
+
+    // C6: fragment (nxt == 44) handling lands here
+
+    // Snapshot the SKIP_L4 bit once (same pattern as IPv4 branch).
+    // If an ext-header was detected above, SKIP_L4 is set and all
+    // kNextL4 return paths below collapse to kTerminalPass.
+    const bool skip_l4 =
+        (dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4)) != 0;
 
     // ---- dst-prefix primary FIB lookup (U6.32 / U6.32a) -----------------
     // If the FIB is unpopulated (empty L3 ruleset), skip the lookup and
-    // fall through to kNextL4 — same baseline path as the IPv4 branch.
+    // fall through — same baseline path as the IPv4 branch.
     if (rs.l3_v6_fib == nullptr) {
-      return ClassifyL3Verdict::kNextL4;
+      return skip_l4 ? ClassifyL3Verdict::kTerminalPass
+                     : ClassifyL3Verdict::kNextL4;
     }
 
     // rte_fib6_lookup_bulk takes `const struct rte_ipv6_addr*` in network
@@ -527,7 +565,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     std::uint64_t nh = 0;
     int lret = rte_fib6_lookup_bulk(rs.l3_v6_fib, &ip6->dst_addr, &nh, 1);
     if (lret < 0) {
-      return ClassifyL3Verdict::kNextL4;
+      return skip_l4 ? ClassifyL3Verdict::kTerminalPass
+                     : ClassifyL3Verdict::kNextL4;
     }
 
     // Unpack the packed L3CompoundEntry from the 8-byte next-hop slot
@@ -535,9 +574,17 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     ruleset::L3CompoundEntry entry{};
     std::memcpy(&entry, &nh, sizeof(entry));
     if (entry.valid_tag != ruleset::L3_ENTRY_VALID_TAG) {
-      return ClassifyL3Verdict::kNextL4;  // miss
+      return skip_l4 ? ClassifyL3Verdict::kTerminalPass
+                     : ClassifyL3Verdict::kNextL4;  // miss
     }
-    return detail::l3_dispatch(rs, entry.action_idx);
+    const ClassifyL3Verdict v = detail::l3_dispatch(rs, entry.action_idx);
+    // Under SKIP_L4 the `kNextL4` arm of l3_dispatch (allow action)
+    // collapses to `kTerminalPass` because L4 classifier cannot run on
+    // an ext-header packet. Drop stays terminal regardless.
+    if (skip_l4 && v == ClassifyL3Verdict::kNextL4) {
+      return ClassifyL3Verdict::kTerminalPass;
+    }
+    return v;
   }
 
   // Unknown ethertype — pass through. No header read, no counter bump.

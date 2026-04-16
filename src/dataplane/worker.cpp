@@ -148,7 +148,8 @@ int worker_main(void* arg) {
           const ClassifyL3Verdict l3v =
               classify_l3(bufs[i], *ctx->ruleset,
                           &ctx->pkt_truncated_l3,
-                          &ctx->pkt_frag_l3);
+                          &ctx->pkt_frag_l3,
+                          &ctx->l4_skipped_ipv6_extheader);
           switch (l3v) {
             case ClassifyL3Verdict::kNextL4:
               // TODO M6: call classify_l4 on kNextL4 verdict.
