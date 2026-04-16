@@ -72,7 +72,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++-14 clang-18 \
-            pkg-config libdpdk-dev
+            pkg-config libdpdk-dev nlohmann-json3-dev
+          # D2: presets use unversioned g++/clang++; pin to installed versions
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
 
       - name: Pick rotating sanitizer from SHA
         id: pick
@@ -122,7 +127,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++-14 clang-18 \
-            pkg-config libdpdk-dev
+            pkg-config libdpdk-dev nlohmann-json3-dev
+          # D2: presets use unversioned g++/clang++; pin to installed versions
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
