@@ -16,13 +16,16 @@
 
 #include "src/ctl/reload.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <variant>
 
@@ -53,6 +56,22 @@ namespace {
 //
 // The `g_active` atomic IS the process-wide pointer (D9). It is the
 // ONE atomic the project owns (D1 exception). Never add more.
+// -------------------------------------------------------------------------
+// PendingEntry — one {ruleset, token} pair on the pending_free queue.
+// The token was produced by `rte_rcu_qsbr_start(qs)` AFTER the publish
+// exchange (§9.2 D30); each drain attempt polls
+// `rte_rcu_qsbr_check(qs, token, wait=false)` and frees the ruleset on
+// success.
+struct PendingEntry {
+  ruleset::Ruleset* rs    = nullptr;
+  std::uint64_t     token = 0;
+};
+
+// K_PENDING=8 is FIXED per design §9.2 — "each entry is ~bytes; 8 is
+// plenty for plausible stuck-worker scenarios before the watchdog
+// escalates". Not configurable; see review-notes.md D36.
+static constexpr std::size_t kPendingMax = 8;
+
 struct ReloadManager {
   std::mutex                                reload_mutex;
   std::atomic<ruleset::Ruleset*>            g_active{nullptr};
@@ -64,17 +83,29 @@ struct ReloadManager {
 
   ReloadCounters  counters{};
 
-  // C2 — scalar stash for rs_old pointers whose RCU synchronize timed
-  // out. In C3 this is replaced by a K_PENDING=8 array + drain
-  // discipline. For C2 we just keep the pointer LIVE-REACHABLE so
-  // LeakSanitizer doesn't flag the intentional leak; shutdown() drops
-  // it with `delete` (no quiescent guarantee — fine for test
-  // teardown, where workers are being joined anyway).
+  // C3 — D36 pending_free queue. Fixed-size array (§9.2 K_PENDING=8).
+  // `pending_depth` is the live occupancy; all slots `[depth..max)`
+  // are undefined. Every mutation happens under `reload_mutex`.
+  std::array<PendingEntry, kPendingMax> pending_free{};
+  std::size_t                           pending_depth = 0;
+
+  // Throttling state for the "reload_pending_full dataplane_wedged"
+  // ERROR log. The invariant: at most ONE log line is emitted per
+  // overflow event. An "overflow event" STARTS when an overflow
+  // happens and the flag is false → we log and flip the flag to true.
+  // An "event ENDS" when a drain actually frees a slot → flag resets
+  // to false. Subsequent overflows within the same event do NOT log.
   //
-  // Not a real pending_free queue: single slot, last-writer-wins,
-  // older timed-out pointers ARE leaked if two timeouts land in a row
-  // (vanishingly rare; C3 is the real fix).
-  ruleset::Ruleset* c2_pending_leak = nullptr;
+  // This matches X1.5's "exactly once per overflow (not once per
+  // subsequent retry)" assertion and design §9.2 / D36 Q5 cadence.
+  bool overflow_event_logged = false;
+
+  // Overflow retention. Design spec says "intentionally leak rs_old"
+  // on overflow, but LeakSanitizer must stay clean for dev-asan runs.
+  // Retaining the pointer in a live-reachable unique_ptr container is
+  // functionally equivalent (process is wedged; operator escalation
+  // will restart). Never drained — by design.
+  std::vector<std::unique_ptr<ruleset::Ruleset>> overflow_holder{};
 };
 
 ReloadManager g_{};
@@ -92,12 +123,92 @@ std::string compose_name_prefix(const std::string& base,
 }
 
 // Actually delete the old ruleset and bump the `freed_total`
-// counter. Caller must hold `reload_mutex`. Kept as a single helper
-// so C3's pending_free drain has one call site to swap over.
+// counter. Caller must hold `reload_mutex`. Also used by the
+// pending_free drain to free entries whose grace period has elapsed.
 void do_free_ruleset_locked(ruleset::Ruleset* rs_old) {
   if (rs_old == nullptr) return;
   delete rs_old;
   ++g_.counters.freed_total;
+}
+
+// C3 — D36 drain. Called at the TOP of every deploy() (before any
+// ruleset-pointer manipulation) so a successful drain happens under
+// the same lock that will take the next token. For each entry, poll
+// `rte_rcu_qsbr_check(qs, entry.token, wait=false)` once; if it
+// returns 1 the grace period has elapsed and the ruleset can be
+// freed. Entries that are not yet quiescent are compacted back to
+// the head of the array.
+//
+// If the drain frees AT LEAST ONE slot the overflow-log throttle is
+// cleared — a future overflow starts a fresh event and WILL log.
+//
+// Caller must hold `reload_mutex`.
+void drain_pending_free_locked() {
+  if (g_.pending_depth == 0) return;
+  // Without a QSBR handle there is no quiescent state to poll — fall
+  // back to immediate drain (matches the no-qs mode elsewhere).
+  struct rte_rcu_qsbr* const qs = g_.params.qs;
+  std::size_t dst = 0;
+  bool freed_any = false;
+  for (std::size_t src = 0; src < g_.pending_depth; ++src) {
+    PendingEntry& e = g_.pending_free[src];
+    const int ok = (qs == nullptr)
+                       ? 1
+                       : rte_rcu_qsbr_check(qs, e.token, /*wait=*/false);
+    if (ok == 1) {
+      do_free_ruleset_locked(e.rs);
+      freed_any = true;
+      // drop the slot (do not copy forward)
+    } else {
+      if (dst != src) {
+        g_.pending_free[dst] = e;
+      }
+      ++dst;
+    }
+  }
+  // Zero-out the tail to avoid dangling ruleset* in unused slots.
+  for (std::size_t i = dst; i < g_.pending_depth; ++i) {
+    g_.pending_free[i] = PendingEntry{};
+  }
+  g_.pending_depth = dst;
+  g_.counters.pending_depth = static_cast<std::uint64_t>(dst);
+  if (freed_any) {
+    // End-of-event: the next overflow starts a fresh throttle cycle.
+    g_.overflow_event_logged = false;
+  }
+}
+
+// C3 — handle a reload-timeout: either push {rs_old, token} onto
+// pending_free, or declare overflow. On overflow, bump the counter
+// and (throttled) emit the ERROR log + retain the ruleset in
+// overflow_holder so LSAN stays clean.
+//
+// Caller must hold `reload_mutex`.
+void handle_timeout_locked(ruleset::Ruleset* rs_old, std::uint64_t token) {
+  if (rs_old == nullptr) return;
+
+  if (g_.pending_depth < kPendingMax) {
+    g_.pending_free[g_.pending_depth++] = PendingEntry{rs_old, token};
+    g_.counters.pending_depth = static_cast<std::uint64_t>(g_.pending_depth);
+    return;
+  }
+
+  // Overflow path.
+  ++g_.counters.pending_full;
+  if (!g_.overflow_event_logged) {
+    // One ERROR line per overflow EVENT (§9.2 Q5 cadence, X1.5 spec).
+    // Structured-ish format; main.cpp's log_json helper is TU-local,
+    // so keep this self-contained here.
+    std::fprintf(stderr,
+                 "{\"level\":\"error\",\"event\":\"reload_pending_full\","
+                 "\"reason\":\"dataplane_wedged\",\"pending_depth\":%zu}\n",
+                 g_.pending_depth);
+    ++g_.counters.overflow_log_total;
+    g_.overflow_event_logged = true;
+  }
+  // Live-reachable retention: LSAN clean, semantically a leak (never
+  // drained — by design, process is wedged).
+  g_.overflow_holder.emplace_back(rs_old);
 }
 
 // C2 — bounded RCU synchronize.
@@ -145,6 +256,14 @@ DeployResult deploy_locked(std::string_view config_json) {
     ++g_.counters.internal_error;
     return out;
   }
+
+  // ---- 0. Drain pending_free (D36) -------------------------------------
+  //
+  // Happens BEFORE any new publish/synchronize so:
+  //   * freed_total bumps before the new token is in play
+  //   * a successful drain resets the overflow-log throttle BEFORE we
+  //     possibly hit overflow again on this deploy
+  drain_pending_free_locked();
 
   // ---- 1. Parse --------------------------------------------------------
   config::ParseResult pr = config::parse(config_json);
@@ -230,17 +349,10 @@ DeployResult deploy_locked(std::string_view config_json) {
   const int sync_ok = wait_for_quiescent(g_.params.qs, token, deadline,
                                          g_.params.poll_interval);
   if (sync_ok != 1) {
-    // TODO(M8 C3): push {rs_old, token} onto K_PENDING=8 pending_free
-    // queue instead of stashing in a single-slot leak holder. For C2,
-    // we intentionally keep rs_old live-reachable via `c2_pending_leak`
-    // so LeakSanitizer doesn't flag the deliberate leak; the sentinel
-    // test (X1.4) observes `freed_total` unchanged.
-    if (g_.c2_pending_leak != nullptr) {
-      // Second back-to-back timeout: the older pointer IS actually
-      // leaked in C2 (last-writer-wins). C3's K_PENDING=8 slots fix
-      // this; for the single-slot C2 stash this is documented.
-    }
-    g_.c2_pending_leak = rs_old;
+    // C3 D36 — push {rs_old, token} onto pending_free. Overflow path
+    // (queue was already full) retains rs_old in overflow_holder and
+    // bumps pending_full + emits throttled ERROR log.
+    handle_timeout_locked(rs_old, token);
     ++g_.counters.timeout;
     out.ok = false;
     out.kind = DeployError::kReloadTimeout;
@@ -287,7 +399,7 @@ void shutdown() {
   //   3. rte_rcu_qsbr_synchronize with bounded deadline
   //   4. then exchange g_active → nullptr and free
   //
-  // For C2 we keep the immediate free in shutdown: the fixture path
+  // For C2/C3 we keep the immediate free in shutdown: the fixture path
   // either has already joined its fake workers (so QSBR is idle) or
   // is tearing down an EAL that never had real workers. C4 owns the
   // real shutdown-sequence fix (D12).
@@ -296,13 +408,24 @@ void shutdown() {
   if (rs_old) {
     do_free_ruleset_locked(rs_old);
   }
-  // Drain C2's single-slot pending_free stash. In production C4 would
-  // run a final bounded synchronize first; for tests the fixture has
-  // already joined its fake workers by the time shutdown() is called.
-  if (g_.c2_pending_leak != nullptr) {
-    do_free_ruleset_locked(g_.c2_pending_leak);
-    g_.c2_pending_leak = nullptr;
+  // C3 D36 — drain any pending_free entries and the overflow_holder.
+  // The fixture has already un-frozen its workers by this point, so
+  // they have reported quiescent; we can free everything directly
+  // without re-polling. (Bypassing the drain helper is fine for
+  // teardown — C4 will add the proper final-synchronize.)
+  for (std::size_t i = 0; i < g_.pending_depth; ++i) {
+    do_free_ruleset_locked(g_.pending_free[i].rs);
+    g_.pending_free[i] = PendingEntry{};
   }
+  g_.pending_depth = 0;
+  // overflow_holder: unique_ptr destructors free the retained
+  // rulesets. Bump freed_total for test visibility.
+  for (auto& up : g_.overflow_holder) {
+    if (up) ++g_.counters.freed_total;
+  }
+  g_.overflow_holder.clear();
+  g_.overflow_event_logged = false;
+
   g_.initialised = false;
   g_.params = {};
   g_.generation_counter = 0;
@@ -339,6 +462,9 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs) {
     return out;
   }
 
+  // C3 — drain pending_free before this publish, same as deploy().
+  drain_pending_free_locked();
+
   const std::uint64_t gen = ++g_.generation_counter;
   rs->generation = gen;
 
@@ -354,10 +480,8 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs) {
   const int sync_ok = wait_for_quiescent(g_.params.qs, token, deadline,
                                          g_.params.poll_interval);
   if (sync_ok != 1) {
-    // TODO(M8 C3): push {rs_old, token} onto K_PENDING=8 pending_free.
-    // C2 stashes in a single slot — LSAN stays happy, freed_total
-    // stays unchanged, test harness can observe both invariants.
-    g_.c2_pending_leak = rs_old;
+    // C3 D36 — pending_free push + overflow handling (see deploy_locked).
+    handle_timeout_locked(rs_old, token);
     ++g_.counters.timeout;
     out.ok = false;
     out.kind = DeployError::kReloadTimeout;

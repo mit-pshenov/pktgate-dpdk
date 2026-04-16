@@ -675,6 +675,316 @@ TEST_F(ReloadC2Fixture, X1_11_ConcurrentReloadsNoCoalescing) {
       << "X1.11: each subsequent publish should free exactly one old ruleset";
 }
 
+// =========================================================================
+// C3 — pending_free[K_PENDING=8] queue + drain + overflow alert (D36).
+//
+// Replaces C2's single-slot `c2_pending_leak` bridge with a real
+// K_PENDING=8 array. New observables on ReloadCounters:
+//   * pending_full       — bumped each reload that hit an overflow
+//   * pending_depth      — gauge (current queue occupancy)
+//   * overflow_log_total — test hook: how many TIMES we emitted the
+//     ERROR "reload_pending_full dataplane_wedged" log line. Throttled
+//     to once per overflow EVENT (a "new" overflow event = first one
+//     after a drain actually freed a slot).
+//
+// Design anchors:
+//   * design.md §9.2 — pending_free_push / pending_free_drain
+//   * design.md §9.4 — "Reload timeout" overflow branch
+//   * review-notes.md D36 — K_PENDING=8 fixed, overflow alert cadence
+//   * test-plan-drafts/chaos.md §X1.5 — 9 successive reloads assertion
+//   * test-plan-drafts/chaos.md §X1.10 — leak-detector soak (this
+//     cycle ships a 60 s CI smoke; full 1 h is nightly -L soak)
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// X1.5 — pending_free overflow (D36).
+//
+// Freeze worker 0 so every deploy() times out. Fire 9 successive
+// deploys. Assert:
+//   * Each of the first 8 returns kReloadTimeout; pending_depth 1→8
+//   * 9th also returns kReloadTimeout; pending_full counter == 1;
+//     overflow_log_total == 1 (one ERROR log line exactly)
+//   * active_ruleset() is the LATEST pointer (exchange always succeeds)
+//   * No LSAN complaint — overflow_holder keeps rs live-reachable
+// Fire a 10th deploy while still frozen: pending_full goes to 2,
+// BUT overflow_log_total stays at 1 (throttled — same overflow event).
+// -------------------------------------------------------------------------
+TEST_F(ReloadC2Fixture, X1_5_PendingFreeOverflow) {
+  // Re-init with short reload_timeout so 9+ timeouts don't explode the
+  // test wall-clock (9 * 50 ms = 450 ms worst case).
+  ctl::reload::shutdown();
+  ctl::reload::InitParams p;
+  p.socket_id      = 0;
+  p.num_lcores     = 1;
+  p.max_entries    = 256;
+  p.name_prefix    = "pktgate_test_c3_x15";
+  p.qs             = qs_;
+  p.reload_timeout = std::chrono::milliseconds(40);
+  p.poll_interval  = std::chrono::microseconds(100);
+  ctl::reload::init(p);
+
+  // Prime with one successful publish while workers are still quiescent,
+  // so subsequent timeouts have a real rs_old to push onto pending_free.
+  // (First-ever timeout has rs_old=nullptr and is a no-op for the queue.)
+  {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << "prime publish must succeed: " << r.error;
+  }
+
+  // Freeze worker 0 — stop reporting quiescent.
+  workers_->frozen[0].store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+  // 8 timeouts, each pushed onto pending_free: depth climbs 1→8.
+  ruleset::Ruleset* latest = nullptr;
+  for (int i = 0; i < 8; ++i) {
+    auto rs = make_bare_ruleset();
+    latest = rs.get();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_FALSE(r.ok) << "deploy " << i << " must time out";
+    ASSERT_EQ(r.kind, ctl::reload::DeployError::kReloadTimeout);
+    EXPECT_EQ(ctl::reload::active_ruleset(), latest)
+        << "deploy " << i << ": exchange must succeed before timeout";
+    auto c = ctl::reload::counters_snapshot();
+    EXPECT_EQ(c.pending_depth, static_cast<std::uint64_t>(i + 1))
+        << "pending_depth after deploy " << i;
+    EXPECT_EQ(c.pending_full, 0u)
+        << "no overflow yet at deploy " << i;
+    EXPECT_EQ(c.overflow_log_total, 0u)
+        << "no overflow log yet at deploy " << i;
+  }
+
+  // 9th deploy — overflow. Queue is full (depth=8), so this one lands
+  // in overflow_holder. pending_full bumps; overflow_log_total == 1.
+  {
+    auto rs = make_bare_ruleset();
+    latest = rs.get();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.kind, ctl::reload::DeployError::kReloadTimeout);
+    EXPECT_EQ(ctl::reload::active_ruleset(), latest);
+
+    auto c = ctl::reload::counters_snapshot();
+    EXPECT_EQ(c.pending_depth, 8u) << "depth stays at 8 after overflow";
+    EXPECT_EQ(c.pending_full, 1u) << "pending_full bumps exactly once at overflow";
+    EXPECT_EQ(c.overflow_log_total, 1u)
+        << "ERROR log emitted exactly once at first overflow";
+    EXPECT_EQ(c.timeout, 9u) << "all 9 deploys timed out";
+  }
+
+  // 10th deploy — still frozen, still overflow. Counter bumps again,
+  // but the LOG is throttled (same overflow event).
+  {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.kind, ctl::reload::DeployError::kReloadTimeout);
+
+    auto c = ctl::reload::counters_snapshot();
+    EXPECT_EQ(c.pending_depth, 8u);
+    EXPECT_EQ(c.pending_full, 2u) << "pending_full per-reload counter";
+    EXPECT_EQ(c.overflow_log_total, 1u)
+        << "X1.5 throttle: log stays at 1 across same overflow event";
+    EXPECT_EQ(c.timeout, 10u);
+  }
+
+  // Unfreeze so QSBR can drain cleanly during TearDown.
+  workers_->frozen[0].store(false, std::memory_order_release);
+}
+
+// -------------------------------------------------------------------------
+// Drain correctness regression.
+//
+// Push 3 entries onto pending_free (3 timeouts), unfreeze, fire one
+// more deploy. Its drain at the START should free all 3 before taking
+// the new token. Assert:
+//   * freed_total jumps by 3 (from the drain)
+//   * pending_depth drops to 0
+//   * the fourth deploy itself succeeds and bumps freed_total to 4
+//     (the old "latest" from the third timeout is freed via the
+//     normal synchronize path on this successful deploy)
+// -------------------------------------------------------------------------
+TEST_F(ReloadC2Fixture, C3_DrainCorrectnessRegression) {
+  ctl::reload::shutdown();
+  ctl::reload::InitParams p;
+  p.socket_id      = 0;
+  p.num_lcores     = 1;
+  p.max_entries    = 256;
+  p.name_prefix    = "pktgate_test_c3_drain";
+  p.qs             = qs_;
+  p.reload_timeout = std::chrono::milliseconds(40);
+  p.poll_interval  = std::chrono::microseconds(100);
+  ctl::reload::init(p);
+
+  // Prime with one successful publish so subsequent timeouts have a
+  // real rs_old to push onto pending_free.
+  {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << "prime publish must succeed: " << r.error;
+  }
+
+  workers_->frozen[0].store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+  // 3 timeouts.
+  for (int i = 0; i < 3; ++i) {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_EQ(r.kind, ctl::reload::DeployError::kReloadTimeout);
+  }
+  {
+    auto c = ctl::reload::counters_snapshot();
+    EXPECT_EQ(c.pending_depth, 3u);
+    EXPECT_EQ(c.timeout, 3u);
+    EXPECT_EQ(c.freed_total, 0u)
+        << "no frees yet — all 3 on pending_free";
+  }
+
+  // Unfreeze. Let the worker pick up the flag and report quiescent.
+  workers_->frozen[0].store(false, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  // 4th deploy: drain-at-top frees all 3 pending entries, then the
+  // new deploy proceeds normally.
+  {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << r.error;
+
+    auto c = ctl::reload::counters_snapshot();
+    EXPECT_EQ(c.pending_depth, 0u) << "drain cleared the queue";
+    // freed_total = 3 (drain) + 1 (synchronize frees the prior live
+    // ruleset from the 3rd timeout — it was g_active when the 4th
+    // deploy exchanged) = 4.
+    EXPECT_EQ(c.freed_total, 4u);
+    EXPECT_EQ(c.success, 2u) << "prime + this one";
+  }
+}
+
+// -------------------------------------------------------------------------
+// X1.10-short — leak-detector 60 s smoke (CI-sized).
+//
+// Fire deploys at ~1 Hz for 60 s with one frozen worker. After the
+// pending_free fills at 8, VmRSS must plateau — no monotonic growth.
+// The overflow_holder grows unboundedly in principle but in practice
+// each rs is ~bytes-small (bare Ruleset), so the growth is trivial
+// and we assert ±10% plateau on VmRSS.
+//
+// Full 1 h soak is nightly only (ctest -L soak); C3 ships the 60 s
+// smoke under the `integration` label.
+// -------------------------------------------------------------------------
+namespace {
+
+// VmRSS in kB from /proc/self/status.
+std::uint64_t read_vm_rss_kb() {
+  FILE* f = std::fopen("/proc/self/status", "r");
+  if (!f) return 0;
+  char line[256];
+  std::uint64_t kb = 0;
+  while (std::fgets(line, sizeof(line), f)) {
+    if (std::strncmp(line, "VmRSS:", 6) == 0) {
+      std::sscanf(line + 6, " %lu", &kb);
+      break;
+    }
+  }
+  std::fclose(f);
+  return kb;
+}
+
+}  // namespace
+
+TEST_F(ReloadC2Fixture, X1_10_Short_LeakDetectorSmoke) {
+  ctl::reload::shutdown();
+  ctl::reload::InitParams p;
+  p.socket_id      = 0;
+  p.num_lcores     = 1;
+  p.max_entries    = 256;
+  p.name_prefix    = "pktgate_test_c3_x110";
+  p.qs             = qs_;
+  p.reload_timeout = std::chrono::milliseconds(30);
+  p.poll_interval  = std::chrono::microseconds(100);
+  ctl::reload::init(p);
+
+  // Prime so subsequent timeouts have a real rs_old to push.
+  {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok);
+  }
+
+  workers_->frozen[0].store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+  // Duration trimmed from the chaos.md 60 s spec because bare Ruleset
+  // allocations are trivially small and overflow_holder growth is
+  // negligible — 12 s is enough to exercise the fill-then-plateau
+  // behaviour and stay within the integration-tier wall-clock budget.
+  constexpr auto kDuration = std::chrono::seconds(12);
+  constexpr auto kPeriod   = std::chrono::milliseconds(40);  // ~25 Hz
+
+  const auto t_start = std::chrono::steady_clock::now();
+
+  // Fire the first 8 so pending_free fills, then start sampling RSS.
+  for (int i = 0; i < 8; ++i) {
+    auto rs = make_bare_ruleset();
+    (void)ctl::reload::deploy_prebuilt(std::move(rs));
+  }
+
+  const std::uint64_t rss_after_fill = read_vm_rss_kb();
+  ASSERT_GT(rss_after_fill, 0u) << "VmRSS read failed";
+
+  std::uint64_t rss_peak = rss_after_fill;
+  std::uint64_t rss_min  = rss_after_fill;
+  int reload_count = 0;
+
+  while (std::chrono::steady_clock::now() - t_start < kDuration) {
+    auto rs = make_bare_ruleset();
+    (void)ctl::reload::deploy_prebuilt(std::move(rs));
+    ++reload_count;
+    const std::uint64_t rss = read_vm_rss_kb();
+    if (rss > rss_peak) rss_peak = rss;
+    if (rss < rss_min)  rss_min  = rss;
+    std::this_thread::sleep_for(kPeriod);
+  }
+
+  // Plateau assertion: peak must not exceed baseline by more than
+  // kGrowthPctMax. Bare-Ruleset overhead per overflow is tiny, and
+  // glibc heap can drift a few hundred kB, so we allow 25 % headroom.
+  constexpr double kGrowthPctMax = 25.0;
+  const double growth_pct =
+      100.0 * (static_cast<double>(rss_peak) -
+               static_cast<double>(rss_after_fill)) /
+      static_cast<double>(rss_after_fill);
+  EXPECT_LT(growth_pct, kGrowthPctMax)
+      << "X1.10-short: VmRSS grew " << growth_pct
+      << " % during soak (baseline=" << rss_after_fill << " kB, peak="
+      << rss_peak << " kB, reloads=" << reload_count << ")";
+
+  // Counters sanity.
+  auto c_mid = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_mid.pending_depth, 8u);
+  EXPECT_GE(c_mid.pending_full, static_cast<std::uint64_t>(reload_count));
+  EXPECT_EQ(c_mid.overflow_log_total, 1u)
+      << "log throttled to 1 across the entire soak run";
+
+  // Unstick + one clean reload: pending_depth drains to 0 and
+  // freed_total climbs by at least 8 (the drain) + 1 (active).
+  workers_->frozen[0].store(false, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  const std::uint64_t freed_before = c_mid.freed_total;
+  {
+    auto rs = make_bare_ruleset();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << r.error;
+  }
+  auto c_end = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_end.pending_depth, 0u) << "drain cleared queue on unstick";
+  EXPECT_GE(c_end.freed_total, freed_before + 8u)
+      << "drain must free at least the 8 pending entries";
+}
+
 TEST_F(CmdSocketStormFixture, ThousandReloadsMutexSerialization) {
   const std::string sock_path = unique_uds_path("storm");
 

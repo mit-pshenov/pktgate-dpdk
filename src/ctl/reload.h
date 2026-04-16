@@ -32,6 +32,23 @@
 //   * `freed_total` counter so tests can assert "old ruleset freed"
 //     without UAF-reading the raw pointer
 //
+// C3 scope (this file):
+//   * K_PENDING=8 pending_free queue (§9.2, D36). Each deploy() starts
+//     by attempting to drain every entry via rte_rcu_qsbr_check(wait=0)
+//     using the token stored with each entry. Drained rulesets are
+//     freed (freed_total bumps); un-drained entries are compacted back
+//     into the queue head.
+//   * On a timeout, the old ruleset is pushed onto pending_free with
+//     the token taken AFTER the publish exchange. The C2 single-slot
+//     `c2_pending_leak` bridge is REMOVED.
+//   * On overflow (9th stuck entry), `pending_full` counter bumps per
+//     overflow, `overflow_log_total` bumps once per overflow EVENT
+//     (throttled by `overflow_event_logged` flag that resets whenever
+//     a drain actually frees a slot). The overflowing ruleset is
+//     retained in `overflow_holder` so ASAN/LSAN stay clean — design
+//     spec is "leak rs_old" semantically, but live-reachable retention
+//     keeps the sanitisers quiet.
+//
 // D30 compliance — SIGNATURES verified against DPDK 25.11 on 2026-04-16:
 //   * /home/mit/Dev/dpdk-25.11/lib/rcu/rte_rcu_qsbr.h (live header)
 //   * doc.dpdk.org/api-25.11/rte__rcu__qsbr_8h.html
@@ -123,8 +140,23 @@ struct ReloadCounters {
   // Side-channel for tests: counts ruleset frees that actually ran
   // (i.e. reached `delete rs_old` after QSBR said quiescent). Lets
   // the X1.4 sentinel assert "old ruleset NOT freed on timeout"
-  // without UAF-reading the stale pointer.
+  // without UAF-reading the stale pointer. C3: pending_free drain also
+  // bumps this counter (one bump per entry freed).
   std::uint64_t freed_total = 0;
+  // C3 — D36 pending_free observables.
+  //
+  // `pending_depth` is a GAUGE (current queue occupancy, 0..K_PENDING).
+  // `pending_full` is a COUNTER (bumps once per reload that overflowed
+  //                              because the queue was already full).
+  // `overflow_log_total` is a COUNTER that tests inspect: it counts
+  //                              ERROR log emissions "reload_pending_full
+  //                              dataplane_wedged". Throttled to ONE
+  //                              per overflow event (a new event starts
+  //                              the next time a drain actually frees a
+  //                              slot), NOT one per overflow retry.
+  std::uint64_t pending_depth = 0;
+  std::uint64_t pending_full = 0;
+  std::uint64_t overflow_log_total = 0;
 };
 
 // -------------------------------------------------------------------------
