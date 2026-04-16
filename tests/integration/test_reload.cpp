@@ -411,6 +411,270 @@ bool fire_one_reload(const std::string& path, std::string_view payload) {
 
 }  // namespace
 
+// =========================================================================
+// C2 — RCU token+deadline bounded synchronize (D30, D12).
+//
+// Fixture brings up a real `rte_rcu_qsbr` and N fake worker threads that
+// report quiescent state in a tight loop. Tests pass the QSBR handle to
+// the reload manager via InitParams.qs so deploy() exercises the real
+// rte_rcu_qsbr_start / rte_rcu_qsbr_check poll path.
+//
+// D30 SIGNATURES verified against DPDK 25.11:
+//   * /home/mit/Dev/dpdk-25.11/lib/rcu/rte_rcu_qsbr.h
+//   * doc.dpdk.org/api-25.11/rte__rcu__qsbr_8h.html
+// `rte_rcu_qsbr_check(qs, token, wait)`: `token` is from
+// `rte_rcu_qsbr_start`, `wait` is a BLOCKING FLAG. We pass wait=false
+// and layer our own steady_clock deadline.
+// =========================================================================
+
+namespace {
+
+// Fake-worker harness: each worker registers on the QSBR, goes online,
+// and loops calling rte_rcu_qsbr_quiescent(). Per-worker `frozen` flag
+// lets X1.4 stop a specific worker from reporting quiescent without
+// affecting the others — that's what makes rte_rcu_qsbr_check time out.
+struct C2Workers {
+  struct rte_rcu_qsbr*                 qs = nullptr;
+  std::atomic<bool>                    keep_going{true};
+  std::vector<std::atomic<bool>>       frozen;
+  std::vector<std::thread>             threads;
+  std::vector<unsigned int>            thread_ids;
+
+  explicit C2Workers(unsigned n) : frozen(n) {
+    for (unsigned i = 0; i < n; ++i) {
+      frozen[i].store(false, std::memory_order_relaxed);
+    }
+  }
+};
+
+void c2_worker_loop(C2Workers* w, unsigned int tid, std::size_t idx) {
+  rte_rcu_qsbr_thread_register(w->qs, tid);
+  rte_rcu_qsbr_thread_online(w->qs, tid);
+  while (w->keep_going.load(std::memory_order_acquire)) {
+    if (!w->frozen[idx].load(std::memory_order_acquire)) {
+      rte_rcu_qsbr_quiescent(w->qs, tid);
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  rte_rcu_qsbr_thread_offline(w->qs, tid);
+  rte_rcu_qsbr_thread_unregister(w->qs, tid);
+}
+
+// Shared state — one QSBR handle per test process (we can't re-init
+// DPDK in-process, but we CAN have multiple QSBR variables; using one
+// is plenty and matches production). Allocated in the fixture and
+// reused; cleared by the per-test TearDown via `keep_going=false`.
+
+}  // namespace
+
+class ReloadC2Fixture : public IntegrationEalFixture {
+ protected:
+  static constexpr std::uint32_t kMaxThreadsC2 = 4;
+  static constexpr unsigned      kC2Workers     = 2;
+
+  void SetUp() override {
+    // One QSBR variable per fixture instance — aligned_alloc is fine,
+    // DPDK doesn't require rte_malloc for QSBR storage.
+    size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreadsC2);
+    ASSERT_GT(sz, 0u);
+    qs_raw_ = std::aligned_alloc(alignof(std::max_align_t), sz);
+    ASSERT_NE(qs_raw_, nullptr);
+    qs_ = static_cast<struct rte_rcu_qsbr*>(qs_raw_);
+    ASSERT_EQ(rte_rcu_qsbr_init(qs_, kMaxThreadsC2), 0);
+
+    workers_ = std::make_unique<C2Workers>(kC2Workers);
+    workers_->qs = qs_;
+    workers_->thread_ids.resize(kC2Workers);
+    for (unsigned i = 0; i < kC2Workers; ++i) {
+      workers_->thread_ids[i] = i;
+      workers_->threads.emplace_back(c2_worker_loop, workers_.get(),
+                                     i, static_cast<std::size_t>(i));
+    }
+
+    // Let workers call quiescent at least once so the first deploy()
+    // sees them in a fresh state.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    ctl::reload::InitParams p;
+    p.socket_id      = 0;
+    p.num_lcores     = 1;
+    p.max_entries    = 256;
+    p.name_prefix    = "pktgate_test_c2";
+    p.qs             = qs_;
+    p.reload_timeout = std::chrono::milliseconds(200);  // sane default for non-X1.4 tests
+    p.poll_interval  = std::chrono::microseconds(100);
+    ctl::reload::init(p);
+  }
+
+  void TearDown() override {
+    // Unfreeze anything the test froze so QSBR can drain cleanly.
+    if (workers_) {
+      for (auto& f : workers_->frozen) {
+        f.store(false, std::memory_order_release);
+      }
+    }
+    ctl::reload::shutdown();
+    if (workers_) {
+      workers_->keep_going.store(false, std::memory_order_release);
+      for (auto& t : workers_->threads) {
+        if (t.joinable()) t.join();
+      }
+      workers_.reset();
+    }
+    std::free(qs_raw_);
+    qs_raw_ = nullptr;
+    qs_ = nullptr;
+  }
+
+  static std::unique_ptr<ruleset::Ruleset> make_bare_ruleset() {
+    return std::make_unique<ruleset::Ruleset>();
+  }
+
+  struct rte_rcu_qsbr*          qs_    = nullptr;
+  void*                         qs_raw_ = nullptr;
+  std::unique_ptr<C2Workers>    workers_;
+};
+
+// -------------------------------------------------------------------------
+// Happy-path regression: with live QSBR + quiescent workers, deploy()
+// completes quickly and `freed_total` bumps AFTER the synchronize
+// returns quiescent (not immediately after the exchange). This pins
+// C2's "poll loop reaches 1" contract.
+// -------------------------------------------------------------------------
+TEST_F(ReloadC2Fixture, DeployPrebuiltSynchronizeFreesOldRuleset) {
+  auto rs1 = make_bare_ruleset();
+  auto r1 = ctl::reload::deploy_prebuilt(std::move(rs1));
+  ASSERT_TRUE(r1.ok) << "first publish must succeed: " << r1.error;
+  // Nothing to free yet (first publish) — freed_total == 0.
+  auto c0 = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c0.freed_total, 0u);
+
+  auto t0 = std::chrono::steady_clock::now();
+  auto rs2 = make_bare_ruleset();
+  auto r2 = ctl::reload::deploy_prebuilt(std::move(rs2));
+  auto t1 = std::chrono::steady_clock::now();
+  ASSERT_TRUE(r2.ok) << "second publish must succeed: " << r2.error;
+
+  // With live quiescent workers the poll should complete in well under
+  // 10 ms even on a loaded VM.
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0)
+                .count();
+  EXPECT_LT(ms, 100) << "synchronize poll too slow: " << ms << " ms";
+
+  auto c1 = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c1.success, 2u);
+  EXPECT_EQ(c1.timeout, 0u);
+  // CRITICAL C2 assertion: freed_total bumped exactly ONCE (the old
+  // rs1 got freed after synchronize said quiescent).
+  EXPECT_EQ(c1.freed_total, 1u)
+      << "freed_total must bump after QSBR reports quiescent";
+}
+
+// -------------------------------------------------------------------------
+// X1.4 — reload timeout SENTINEL (the flagship D30 test).
+//
+// Freeze one fake worker (stop reporting quiescent), shrink the reload
+// timeout to 50 ms, call deploy_prebuilt(). Expect:
+//   * result == kReloadTimeout
+//   * reload_total{timeout} == 1
+//   * g_active now holds the NEW ruleset (exchange happened BEFORE the
+//     timeout)
+//   * freed_total == 0 — the old ruleset was NOT freed (C2 leaks on
+//     timeout; C3 adds pending_free)
+// Unfreeze on teardown so the fixture destructor is clean.
+// -------------------------------------------------------------------------
+TEST_F(ReloadC2Fixture, X1_4_ReloadTimeoutSentinel) {
+  // Shrink reload timeout before the deploy under test. We do this by
+  // re-init — the manager is idempotent on same-params, but shutdown
+  // first resets. Keep it simple: shutdown+init with short timeout.
+  ctl::reload::shutdown();
+  ctl::reload::InitParams p;
+  p.socket_id      = 0;
+  p.num_lcores     = 1;
+  p.max_entries    = 256;
+  p.name_prefix    = "pktgate_test_c2_x14";
+  p.qs             = qs_;
+  p.reload_timeout = std::chrono::milliseconds(50);  // tight for X1.4
+  p.poll_interval  = std::chrono::microseconds(100);
+  ctl::reload::init(p);
+
+  // Prime: first publish succeeds (workers are still quiescent).
+  auto rs0 = make_bare_ruleset();
+  auto r0 = ctl::reload::deploy_prebuilt(std::move(rs0));
+  ASSERT_TRUE(r0.ok) << r0.error;
+
+  // Freeze worker 0 — it stops calling rte_rcu_qsbr_quiescent, so the
+  // token taken after the next exchange will NEVER become visible to
+  // rte_rcu_qsbr_check.
+  workers_->frozen[0].store(true, std::memory_order_release);
+  // Give it a tick to pick up the flag.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+  auto rs_new = make_bare_ruleset();
+  auto* raw_new = rs_new.get();
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto r = ctl::reload::deploy_prebuilt(std::move(rs_new));
+
+  // D30 flagship assertion: deploy reports timeout with the right kind.
+  EXPECT_FALSE(r.ok);
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kReloadTimeout)
+      << "X1.4: deploy must report kReloadTimeout on synchronize miss; "
+      << "got error='" << r.error << "'";
+
+  // Publish already happened — g_active is the NEW pointer.
+  EXPECT_EQ(ctl::reload::active_ruleset(), raw_new)
+      << "X1.4: atomic_exchange must happen BEFORE the synchronize poll";
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.timeout, c_before.timeout + 1u)
+      << "X1.4: reload_total{timeout} must increment exactly once";
+
+  // C2 intentionally leaks on timeout — C3 adds pending_free.
+  // Therefore freed_total MUST NOT have incremented.
+  EXPECT_EQ(c_after.freed_total, c_before.freed_total)
+      << "X1.4: C2 leaks on timeout; freed_total must not bump "
+      << "(C3 TODO: push onto pending_free instead)";
+
+  // Unfreeze so QSBR can drain cleanly during TearDown.
+  workers_->frozen[0].store(false, std::memory_order_release);
+}
+
+// -------------------------------------------------------------------------
+// X1.11 — debounce correctness (M8 variant).
+//
+// There is no debounce in the UDS path — reload_mutex serialises every
+// caller. Assertion: 10 concurrent deploy_prebuilt() calls complete in
+// strict sequence, no coalescing, each produces a distinct
+// reload_total{success} increment.
+// -------------------------------------------------------------------------
+TEST_F(ReloadC2Fixture, X1_11_ConcurrentReloadsNoCoalescing) {
+  constexpr int kCallers = 10;
+  std::atomic<int> successes{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kCallers);
+  for (int i = 0; i < kCallers; ++i) {
+    threads.emplace_back([&] {
+      auto rs = make_bare_ruleset();
+      auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+      if (r.ok) successes.fetch_add(1, std::memory_order_relaxed);
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  EXPECT_EQ(successes.load(), kCallers);
+  auto c = ctl::reload::counters_snapshot();
+  // No caller coalescing: success == kCallers (every caller produced
+  // exactly one distinct increment).
+  EXPECT_EQ(c.success, static_cast<std::uint64_t>(kCallers))
+      << "X1.11: reload_mutex must serialize without coalescing callers";
+  EXPECT_EQ(c.timeout, 0u);
+  // freed_total = kCallers - 1 (first publish has no old, each
+  // subsequent publish frees the one before).
+  EXPECT_EQ(c.freed_total, static_cast<std::uint64_t>(kCallers - 1))
+      << "X1.11: each subsequent publish should free exactly one old ruleset";
+}
+
 TEST_F(CmdSocketStormFixture, ThousandReloadsMutexSerialization) {
   const std::string sock_path = unique_uds_path("storm");
 

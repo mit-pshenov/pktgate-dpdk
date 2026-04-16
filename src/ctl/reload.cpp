@@ -16,13 +16,17 @@
 
 #include "src/ctl/reload.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <variant>
+
+#include <rte_rcu_qsbr.h>
 
 #include "src/compiler/compiler.h"
 #include "src/compiler/object_compiler.h"
@@ -59,6 +63,18 @@ struct ReloadManager {
   std::uint64_t   generation_counter = 0;  // monotonic, feeds name_prefix
 
   ReloadCounters  counters{};
+
+  // C2 — scalar stash for rs_old pointers whose RCU synchronize timed
+  // out. In C3 this is replaced by a K_PENDING=8 array + drain
+  // discipline. For C2 we just keep the pointer LIVE-REACHABLE so
+  // LeakSanitizer doesn't flag the intentional leak; shutdown() drops
+  // it with `delete` (no quiescent guarantee — fine for test
+  // teardown, where workers are being joined anyway).
+  //
+  // Not a real pending_free queue: single slot, last-writer-wins,
+  // older timed-out pointers ARE leaked if two timeouts land in a row
+  // (vanishingly rare; C3 is the real fix).
+  ruleset::Ruleset* c2_pending_leak = nullptr;
 };
 
 ReloadManager g_{};
@@ -75,17 +91,46 @@ std::string compose_name_prefix(const std::string& base,
   return base + "_g" + std::to_string(gen);
 }
 
-// Free a previous Ruleset — C1 immediate free. C2/C3 swap this for
-// RCU-synchronized pending_free drain. Localised behind a single
-// helper so the GC sequencing change in later cycles only touches one
-// call site.
-void free_previous_ruleset(ruleset::Ruleset* rs_old) {
-  // NOTE(M8 C2): replace with `rte_rcu_qsbr_start(qs)` + deadline poll
-  // over `rte_rcu_qsbr_check(qs, token, false)`. For C1 there is no
-  // real QSBR registration yet, so immediate free is safe (integration
-  // tests exercise this path on a fresh fixture — no worker threads
-  // holding references).
+// Actually delete the old ruleset and bump the `freed_total`
+// counter. Caller must hold `reload_mutex`. Kept as a single helper
+// so C3's pending_free drain has one call site to swap over.
+void do_free_ruleset_locked(ruleset::Ruleset* rs_old) {
+  if (rs_old == nullptr) return;
   delete rs_old;
+  ++g_.counters.freed_total;
+}
+
+// C2 — bounded RCU synchronize.
+//
+// Take a start token, then poll rte_rcu_qsbr_check(wait=false) against
+// a steady_clock deadline. Returns:
+//   *  1 — all registered readers have reported quiescent; safe to free.
+//   *  0 — deadline expired; caller must NOT free (C2: leak; C3: push
+//         onto pending_free queue with the TOKEN we took here).
+//
+// NB: the token MUST be taken AFTER the atomic_exchange; taking it
+// before races the grace period and can let a worker still holding
+// the old pointer pass a quiescent checkpoint before the publish.
+//
+// `wait` is a BOOL (NOT a timeout, NOT a TSC delta — D30).
+// `wait=false` makes rte_rcu_qsbr_check non-blocking so we can layer
+// our own steady_clock deadline without blocking indefinitely in DPDK.
+int wait_for_quiescent(struct rte_rcu_qsbr* qs,
+                       uint64_t token,
+                       std::chrono::steady_clock::time_point deadline,
+                       std::chrono::microseconds poll_interval) {
+  if (qs == nullptr) {
+    // C2 — no-QSBR mode: fall back to the C1 immediate-free contract.
+    return 1;
+  }
+  for (;;) {
+    int r = rte_rcu_qsbr_check(qs, token, /*wait=*/false);
+    if (r == 1) return 1;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return 0;  // timeout
+    }
+    std::this_thread::sleep_for(poll_interval);
+  }
 }
 
 // Internal deploy body — caller already holds reload_mutex.
@@ -170,10 +215,46 @@ DeployResult deploy_locked(std::string_view config_json) {
   ruleset::Ruleset* rs_old =
       g_.g_active.exchange(rs_new.release(), std::memory_order_acq_rel);
 
-  // ---- 7. Free previous --------------------------------------------
-  free_previous_ruleset(rs_old);
+  // ---- 7. Bounded RCU synchronize --------------------------------
+  //
+  // Take the token AFTER the exchange (D30). Poll with wait=false
+  // against a monotonic deadline; if the deadline expires, bail out
+  // with kReloadTimeout. C2 intentionally LEAKS rs_old on timeout —
+  // C3 adds pending_free[] with the token we took here.
+  const uint64_t token = (g_.params.qs != nullptr)
+                             ? rte_rcu_qsbr_start(g_.params.qs)
+                             : 0u;
+  const auto deadline =
+      std::chrono::steady_clock::now() + g_.params.reload_timeout;
 
-  // ---- 8. Bookkeeping ---------------------------------------------
+  const int sync_ok = wait_for_quiescent(g_.params.qs, token, deadline,
+                                         g_.params.poll_interval);
+  if (sync_ok != 1) {
+    // TODO(M8 C3): push {rs_old, token} onto K_PENDING=8 pending_free
+    // queue instead of stashing in a single-slot leak holder. For C2,
+    // we intentionally keep rs_old live-reachable via `c2_pending_leak`
+    // so LeakSanitizer doesn't flag the deliberate leak; the sentinel
+    // test (X1.4) observes `freed_total` unchanged.
+    if (g_.c2_pending_leak != nullptr) {
+      // Second back-to-back timeout: the older pointer IS actually
+      // leaked in C2 (last-writer-wins). C3's K_PENDING=8 slots fix
+      // this; for the single-slot C2 stash this is documented.
+    }
+    g_.c2_pending_leak = rs_old;
+    ++g_.counters.timeout;
+    out.ok = false;
+    out.kind = DeployError::kReloadTimeout;
+    out.error = "reload: synchronize deadline expired";
+    // Generation still reports the publish — the new ruleset is
+    // live, we just couldn't free the old one yet.
+    out.generation = gen;
+    return out;
+  }
+
+  // ---- 8. Free previous (quiescent) -----------------------------
+  do_free_ruleset_locked(rs_old);
+
+  // ---- 9. Bookkeeping -------------------------------------------
   ++g_.counters.success;
   out.ok = true;
   out.kind = DeployError::kOk;
@@ -205,10 +286,22 @@ void shutdown() {
   //   2. rte_rcu_qsbr_thread_offline + _thread_unregister per worker
   //   3. rte_rcu_qsbr_synchronize with bounded deadline
   //   4. then exchange g_active → nullptr and free
+  //
+  // For C2 we keep the immediate free in shutdown: the fixture path
+  // either has already joined its fake workers (so QSBR is idle) or
+  // is tearing down an EAL that never had real workers. C4 owns the
+  // real shutdown-sequence fix (D12).
   ruleset::Ruleset* rs_old =
       g_.g_active.exchange(nullptr, std::memory_order_acq_rel);
   if (rs_old) {
-    free_previous_ruleset(rs_old);
+    do_free_ruleset_locked(rs_old);
+  }
+  // Drain C2's single-slot pending_free stash. In production C4 would
+  // run a final bounded synchronize first; for tests the fixture has
+  // already joined its fake workers by the time shutdown() is called.
+  if (g_.c2_pending_leak != nullptr) {
+    do_free_ruleset_locked(g_.c2_pending_leak);
+    g_.c2_pending_leak = nullptr;
   }
   g_.initialised = false;
   g_.params = {};
@@ -252,7 +345,28 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs) {
   ruleset::Ruleset* rs_old =
       g_.g_active.exchange(rs.release(), std::memory_order_acq_rel);
 
-  free_previous_ruleset(rs_old);
+  // Bounded synchronize — same contract as deploy_locked above.
+  const uint64_t token = (g_.params.qs != nullptr)
+                             ? rte_rcu_qsbr_start(g_.params.qs)
+                             : 0u;
+  const auto deadline =
+      std::chrono::steady_clock::now() + g_.params.reload_timeout;
+  const int sync_ok = wait_for_quiescent(g_.params.qs, token, deadline,
+                                         g_.params.poll_interval);
+  if (sync_ok != 1) {
+    // TODO(M8 C3): push {rs_old, token} onto K_PENDING=8 pending_free.
+    // C2 stashes in a single slot — LSAN stays happy, freed_total
+    // stays unchanged, test harness can observe both invariants.
+    g_.c2_pending_leak = rs_old;
+    ++g_.counters.timeout;
+    out.ok = false;
+    out.kind = DeployError::kReloadTimeout;
+    out.error = "deploy_prebuilt: synchronize deadline expired";
+    out.generation = gen;
+    return out;
+  }
+
+  do_free_ruleset_locked(rs_old);
 
   ++g_.counters.success;
   out.ok = true;

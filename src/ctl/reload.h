@@ -18,8 +18,33 @@
 //   * publish a small ReloadCounters struct so tests / later cycles
 //     can observe success / error buckets
 //
+// C2 scope (this file):
+//   * take a `rte_rcu_qsbr*` handle in InitParams (optional — nullptr
+//     reverts to the C1 immediate-free path for unit-style tests)
+//   * bounded synchronize: after atomic_exchange, `rte_rcu_qsbr_start`
+//     to take a TOKEN, then poll `rte_rcu_qsbr_check(qs, token,
+//     wait=false)` against a `steady_clock` deadline
+//   * on deadline expiry: return DeployError::kReloadTimeout, bump the
+//     `timeout` counter, and INTENTIONALLY LEAK the old ruleset
+//     (C3 adds pending_free; for C2 a TODO marks the leak)
+//   * configurable `reload_timeout` (default 500 ms, tests may shrink
+//     to 50 ms so X1.4 doesn't stall)
+//   * `freed_total` counter so tests can assert "old ruleset freed"
+//     without UAF-reading the raw pointer
+//
+// D30 compliance — SIGNATURES verified against DPDK 25.11 on 2026-04-16:
+//   * /home/mit/Dev/dpdk-25.11/lib/rcu/rte_rcu_qsbr.h (live header)
+//   * doc.dpdk.org/api-25.11/rte__rcu__qsbr_8h.html
+//     - `uint64_t rte_rcu_qsbr_start(struct rte_rcu_qsbr *v)`
+//       returns a TOKEN (not a TSC delta).
+//     - `int rte_rcu_qsbr_check(struct rte_rcu_qsbr *v, uint64_t t,
+//        bool wait)` — `t` is a token; `wait` is a BLOCKING FLAG
+//       (bool), not a timeout. Returns 1 when all registered readers
+//       have reported quiescent since `t` was issued; 0 otherwise.
+//     - We pass `wait=false` and manage our own deadline via
+//       `std::chrono::steady_clock`.
+//
 // Later cycles extend this module:
-//   * C2 — rte_rcu_qsbr_start/check token + steady_clock deadline
 //   * C3 — pending_free[K_PENDING=8] queue + drain + overflow alert
 //   * C4 — shutdown sequence (offline+unregister+synchronize) + D37
 //          validator memory-budget pre-flight
@@ -36,6 +61,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -43,6 +69,12 @@
 #include <string_view>
 
 #include "src/ruleset/ruleset.h"
+
+// Opaque forward declaration — we take a `rte_rcu_qsbr*` but do not
+// pull the DPDK RCU header into every C++ TU that includes reload.h.
+// The actual struct lives in `lib/rcu/rte_rcu_qsbr.h`; the reload TU
+// includes it locally.
+struct rte_rcu_qsbr;
 
 namespace pktgate::ctl::reload {
 
@@ -53,11 +85,12 @@ namespace pktgate::ctl::reload {
 // model (design.md §9.2). C5 will surface these as Prometheus labels.
 enum class DeployError {
   kOk = 0,
-  kParse,        // JSON syntax or schema mismatch
-  kValidate,     // semantic validation failed
-  kCompile,      // compiler rejected the ruleset
-  kBuildEal,     // EAL table population failed (rte_hash/fib)
-  kInternal,     // programmer error / not-initialized
+  kParse,          // JSON syntax or schema mismatch
+  kValidate,       // semantic validation failed
+  kCompile,        // compiler rejected the ruleset
+  kBuildEal,       // EAL table population failed (rte_hash/fib)
+  kReloadTimeout,  // C2 — RCU synchronize deadline expired (D30/D12)
+  kInternal,       // programmer error / not-initialized
 };
 
 // DeployResult — one deploy() outcome.
@@ -85,7 +118,13 @@ struct ReloadCounters {
   std::uint64_t validate_error = 0;
   std::uint64_t compile_error = 0;
   std::uint64_t build_eal_error = 0;
+  std::uint64_t timeout = 0;        // C2 — reload synchronize deadline expired
   std::uint64_t internal_error = 0;
+  // Side-channel for tests: counts ruleset frees that actually ran
+  // (i.e. reached `delete rs_old` after QSBR said quiescent). Lets
+  // the X1.4 sentinel assert "old ruleset NOT freed on timeout"
+  // without UAF-reading the stale pointer.
+  std::uint64_t freed_total = 0;
 };
 
 // -------------------------------------------------------------------------
@@ -103,6 +142,26 @@ struct InitParams {
   unsigned      num_lcores  = 1;
   std::uint32_t max_entries = 1024;
   std::string   name_prefix = "pktgate_reload";
+
+  // C2 — RCU-QSBR bounded synchronize.
+  //
+  // `qs` is borrowed — the caller (main.cpp in production, the
+  // integration fixture in tests) owns the QSBR storage and the
+  // thread_register/online lifecycle. When `qs == nullptr` the reload
+  // manager falls back to the C1 immediate-free path (unit-style
+  // tests that don't care about quiescent-state sequencing).
+  //
+  // `reload_timeout` is the upper bound on how long `deploy()` is
+  // willing to poll `rte_rcu_qsbr_check` after publish. Production
+  // default is 500 ms per design §9.2; X1.4 shrinks this to 50 ms so
+  // the sentinel doesn't stall the test wall-clock.
+  //
+  // `poll_interval` is the quantum between check() calls. 100 µs
+  // keeps the busy-loop off the CPU without adding meaningful
+  // latency to the common (fast) quiescent path.
+  struct rte_rcu_qsbr*      qs              = nullptr;
+  std::chrono::milliseconds reload_timeout  = std::chrono::milliseconds(500);
+  std::chrono::microseconds poll_interval   = std::chrono::microseconds(100);
 };
 
 // Initialise the reload manager. Must be called once per process
