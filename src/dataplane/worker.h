@@ -67,6 +67,12 @@ struct WorkerCtx {
   // arms (outer disposition switch + inner verb switch). MUST stay 0
   // across the full suite (X2.9 simplified form).
   std::uint64_t dispatch_unreachable_total = 0;
+  // M7 C1: D19 TAG semantics. Bumped when apply_action handles a TAG
+  // verb with pcp != 0 against an untagged frame — the PCP rewrite
+  // is a no-op (design §5.5 TAG case: we MUST NOT insert a VLAN tag
+  // on behalf of the operator). stats_on_exit surfacing in C3 per
+  // handoff plan.
+  std::uint64_t tag_pcp_noop_untagged_total = 0;
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained

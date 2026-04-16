@@ -8759,4 +8759,373 @@ TEST_F(ApplyActionTest, U6_47_TerminalPassDropFreesMbuf) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// M7 C1 — TAG DSCP/PCP rewrite (U6.48 — U6.51) per D19.
+//
+// TAG verb rewrites DSCP (IPv4 ToS high 6 bits / IPv6 TC high 6 bits) and
+// VLAN PCP (TCI high 3 bits).  PCP on untagged frames is a no-op — D19
+// explicitly forbids inserting a VLAN tag — and bumps
+// `tag_pcp_noop_untagged_total`.  After the rewrite the mbuf is still
+// transmitted (TAG is an ALLOW variant with a header tweak).
+//
+// VLAN detection predicate: outer ethertype bytes at offset 12-13 read
+// as host-order u16. 0x8100 (C-tag) or 0x88A8 (S-tag) => tagged. This is
+// self-contained (does not require classify_l2 to have run — unit tests
+// bypass classify entirely) and matches classify_l2's predicate (D32
+// via `detail::is_vlan_tpid`).
+//
+// IPv4 cksum: design §5.5 TAG case says apply_dscp_pcp clears the
+// existing checksum, sets RTE_MBUF_F_TX_IP_CKSUM + RTE_MBUF_F_TX_IPV4
+// in ol_flags, and lets the NIC recompute on TX.  Dev-VM e1000 does
+// not support HW ip-cksum — that gate is F3.8, deferred to M13 lab
+// per handoff §"Potential obstacles #3".  C1 only sets the flag; does
+// not attempt SW fallback.
+// =========================================================================
+
+namespace tag_test_helpers {
+
+// Build a tiny Ethernet+IPv4 frame in a fresh mbuf: 14 B L2 + 20 B IPv4
+// header with ToS = 0 (DSCP = 0, ECN = 0).  Protocol is set to UDP (17)
+// but no L4 payload is needed — apply_action only touches the L3 ToS
+// byte and mbuf ol_flags.  Returns nullptr on alloc failure.
+inline rte_mbuf* make_ipv4_mbuf(rte_mempool* mp) {
+  auto* m = rte_pktmbuf_alloc(mp);
+  if (m == nullptr) return nullptr;
+
+  constexpr std::size_t kLen = 14 + 20;
+  auto* p = reinterpret_cast<std::uint8_t*>(rte_pktmbuf_append(m, kLen));
+  if (p == nullptr) {
+    rte_pktmbuf_free(m);
+    return nullptr;
+  }
+  std::memset(p, 0, kLen);
+  // Ethernet header: dst, src MACs arbitrary; ethertype = 0x0800 (IPv4).
+  p[0] = 0x02; p[1] = 0x00; p[2] = 0x00;
+  p[3] = 0x00; p[4] = 0x00; p[5] = 0x02;  // dst
+  p[6] = 0x02; p[7] = 0x00; p[8] = 0x00;
+  p[9] = 0x00; p[10] = 0x00; p[11] = 0x01;  // src
+  p[12] = 0x08; p[13] = 0x00;  // ethertype = IPv4
+
+  // IPv4 header at offset 14: version=4, IHL=5, ToS=0, total_len=20,
+  // id=0, flags/frag=0, ttl=64, proto=17 (UDP), cksum=0, srcIP/dstIP=0.
+  p[14] = 0x45;  // version(4) << 4 | IHL(5)
+  p[15] = 0x00;  // ToS — TARGET BYTE (will become 0xB8 after TAG dscp=46)
+  p[16] = 0x00; p[17] = 20;  // total_len (BE)
+  p[18] = 0x00; p[19] = 0x00;  // id
+  p[20] = 0x00; p[21] = 0x00;  // flags/frag
+  p[22] = 64;                 // TTL
+  p[23] = 17;                 // proto = UDP
+  p[24] = 0x00; p[25] = 0x00;  // hdr cksum (irrelevant — HW recomputes)
+  return m;
+}
+
+// IPv6 frame: 14 B L2 + 40 B IPv6 header with version=6, TC=0, FL=0.
+inline rte_mbuf* make_ipv6_mbuf(rte_mempool* mp) {
+  auto* m = rte_pktmbuf_alloc(mp);
+  if (m == nullptr) return nullptr;
+
+  constexpr std::size_t kLen = 14 + 40;
+  auto* p = reinterpret_cast<std::uint8_t*>(rte_pktmbuf_append(m, kLen));
+  if (p == nullptr) {
+    rte_pktmbuf_free(m);
+    return nullptr;
+  }
+  std::memset(p, 0, kLen);
+  // Ethernet
+  p[12] = 0x86; p[13] = 0xDD;  // ethertype = IPv6
+
+  // IPv6 header at offset 14: first 32-bit word = version(4) | TC(8) | FL(20)
+  // All zero = version=0 (invalid) — fix version to 6 in high nibble of [14].
+  p[14] = 0x60;  // version=6 << 4 | TC_high=0 — TC byte straddles [14] low
+                 //    nibble and [15] high nibble.  After dscp=46 rewrite
+                 //    TC = 0xB8: [14]=0x6B, [15]=0x80.
+  p[15] = 0x00;
+  p[16] = 0x00; p[17] = 0x00;  // flow label low
+  p[18] = 0x00; p[19] = 0x00;  // payload len
+  p[20] = 17;                  // next header = UDP
+  p[21] = 64;                  // hop limit
+  // src/dst IPv6 addrs left zero.
+  return m;
+}
+
+// VLAN-tagged IPv4 frame: 14 B Ethernet + 4 B VLAN + 20 B IPv4.
+// Outer ethertype = 0x8100, TCI = 0x0064 (vid=100, pcp=0).  Inner
+// ethertype = 0x0800.
+inline rte_mbuf* make_vlan_ipv4_mbuf(rte_mempool* mp) {
+  auto* m = rte_pktmbuf_alloc(mp);
+  if (m == nullptr) return nullptr;
+
+  constexpr std::size_t kLen = 14 + 4 + 20;
+  auto* p = reinterpret_cast<std::uint8_t*>(rte_pktmbuf_append(m, kLen));
+  if (p == nullptr) {
+    rte_pktmbuf_free(m);
+    return nullptr;
+  }
+  std::memset(p, 0, kLen);
+  p[12] = 0x81; p[13] = 0x00;  // outer ethertype = 0x8100 (VLAN C-tag)
+  p[14] = 0x00; p[15] = 0x64;  // TCI: pcp=0, dei=0, vid=100 (BE on-wire)
+  p[16] = 0x08; p[17] = 0x00;  // inner ethertype = IPv4
+  // IPv4 header at offset 18.
+  p[18] = 0x45;
+  p[19] = 0x00;
+  p[20] = 0x00; p[21] = 20;
+  p[22] = 64;  // ttl (at offset 22 here because of +4 VLAN shift)
+  // Don't bother with other IPv4 fields — TAG only touches ToS on
+  // the L3 header, which for VLAN case is at offset 18+1 = 19.
+  return m;
+}
+
+}  // namespace tag_test_helpers
+
+// -------------------------------------------------------------------------
+// U6.48 — TAG IPv4 DSCP rewrite.
+//
+// Craft an IPv4 mbuf with ToS=0, dispatch TAG with dscp=46.  After
+// apply_action:
+//   * Byte at L3 offset 1 (ToS) == (46 << 2) | 0 == 0xB8
+//   * mbuf ol_flags has RTE_MBUF_F_TX_IP_CKSUM + RTE_MBUF_F_TX_IPV4
+//   * TX hook called once (TAG falls through to ALLOW behaviour)
+//   * dispatch_unreachable_total stays 0
+//   * tag_pcp_noop_untagged_total stays 0 (pcp=0 means no rewrite attempt)
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_48_TagIpv4DscpRewrite) {
+  using namespace action_dispatch_detail;
+  using namespace tag_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_48_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = make_ipv4_mbuf(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  action::RuleAction tag{};
+  tag.rule_id = 4800;
+  tag.verb    = static_cast<std::uint8_t>(compiler::ActionVerb::kTag);
+  tag.dscp    = 46;
+  tag.pcp     = 0;  // no PCP rewrite
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 3;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kMatch, &tag);
+
+  // ToS byte at offset 15 (14 L2 + 1 within IPv4 header).
+  auto* bytes = rte_pktmbuf_mtod(m, const std::uint8_t*);
+  EXPECT_EQ(bytes[15], 0xB8u)
+      << "U6.48: IPv4 ToS must be (dscp << 2) | ecn — 46<<2 = 0xB8";
+
+  EXPECT_NE(m->ol_flags & RTE_MBUF_F_TX_IP_CKSUM, 0ull)
+      << "U6.48: RTE_MBUF_F_TX_IP_CKSUM must be set (HW recomputes cksum)";
+  EXPECT_NE(m->ol_flags & RTE_MBUF_F_TX_IPV4, 0ull)
+      << "U6.48: RTE_MBUF_F_TX_IPV4 must be set alongside IP_CKSUM";
+
+  EXPECT_EQ(spy.calls, 1u) << "U6.48: TAG must fall through to TX";
+  EXPECT_EQ(spy.last_mbuf, m);
+  EXPECT_EQ(spy.last_port, 3u);
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+  EXPECT_EQ(ctx.tag_pcp_noop_untagged_total, 0u)
+      << "U6.48: pcp=0 rule must not bump untagged-no-op counter";
+
+  // Spy returned 1 (sent) → caller retains ownership; free manually.
+  rte_pktmbuf_free(m);
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.49 — TAG IPv6 TC rewrite.
+//
+// IPv6 TC occupies low nibble of byte 14 (version_tc_flow[0]) and high
+// nibble of byte 15.  Before: [14]=0x60, [15]=0x00 (version=6, TC=0).
+// After dscp=46: TC = 0xB8, so [14]=0x6B (version=6, TC_high=0xB),
+// [15]=0x80 (TC_low=0x8, FL_high=0).
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_49_TagIpv6TcRewrite) {
+  using namespace action_dispatch_detail;
+  using namespace tag_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_49_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = make_ipv6_mbuf(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  action::RuleAction tag{};
+  tag.verb = static_cast<std::uint8_t>(compiler::ActionVerb::kTag);
+  tag.dscp = 46;
+  tag.pcp  = 0;
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 2;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kMatch, &tag);
+
+  auto* bytes = rte_pktmbuf_mtod(m, const std::uint8_t*);
+  // TC = 0xB8 → split across [14] low nibble (0xB) and [15] high nibble (0x8).
+  EXPECT_EQ(bytes[14], 0x6Bu)
+      << "U6.49: IPv6 version_tc_flow[0] must preserve version=6 high nibble "
+         "and carry TC_high=0xB in low nibble";
+  EXPECT_EQ(bytes[15] & 0xF0u, 0x80u)
+      << "U6.49: IPv6 version_tc_flow[1] high nibble must be TC_low=0x8";
+  // Flow label low nibble in [15] must stay zero.
+  EXPECT_EQ(bytes[15] & 0x0Fu, 0x00u)
+      << "U6.49: IPv6 FL high nibble must be preserved (was zero)";
+
+  // IPv6 must NOT set the IPv4 cksum flag.
+  EXPECT_EQ(m->ol_flags & RTE_MBUF_F_TX_IP_CKSUM, 0ull)
+      << "U6.49: IPv6 TAG must not set IP_CKSUM flag (no L3 cksum on v6)";
+  EXPECT_EQ(m->ol_flags & RTE_MBUF_F_TX_IPV4, 0ull)
+      << "U6.49: IPv6 TAG must not set TX_IPV4 flag";
+
+  EXPECT_EQ(spy.calls, 1u);
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+
+  rte_pktmbuf_free(m);
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.50 — TAG PCP rewrite on VLAN-tagged frame.
+//
+// VLAN TCI = 0x0064 (pcp=0, vid=100).  After pcp=5 rewrite: TCI high 3
+// bits must be 5 (binary 101).  PCP lives in bits [15:13] of the TCI
+// (on-wire BE).  TCI byte 0 (frame offset 14) holds [15:8]; new byte 0
+// = (5 << 5) | (0x00 & 0x1F) = 0xA0.  TCI byte 1 (frame offset 15)
+// holds vid low 8 bits — unchanged at 0x64.
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_50_TagPcpOnTagged) {
+  using namespace action_dispatch_detail;
+  using namespace tag_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_50_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = make_vlan_ipv4_mbuf(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  action::RuleAction tag{};
+  tag.verb = static_cast<std::uint8_t>(compiler::ActionVerb::kTag);
+  tag.dscp = 0;   // no DSCP rewrite
+  tag.pcp  = 5;
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 1;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kMatch, &tag);
+
+  auto* bytes = rte_pktmbuf_mtod(m, const std::uint8_t*);
+  // TCI byte 0 at frame offset 14: PCP in bits [7:5], DEI bit 4, VID high
+  // nibble in bits [3:0].  Before: 0x00 (PCP=0, VID=0x064). After pcp=5:
+  // byte 0 = (5 << 5) | 0x00 = 0xA0.
+  EXPECT_EQ(bytes[14], 0xA0u)
+      << "U6.50: VLAN TCI byte 0 must carry new PCP in high 3 bits";
+  // VID low 8 bits unchanged.
+  EXPECT_EQ(bytes[15], 0x64u)
+      << "U6.50: VLAN TCI byte 1 (VID low 8 bits) must be unchanged";
+
+  // PCP rewrite is a NO-OP w.r.t. mbuf ol_flags — no cksum concern.
+  EXPECT_EQ(m->ol_flags & RTE_MBUF_F_TX_IP_CKSUM, 0ull)
+      << "U6.50: pure PCP rewrite must not touch IP_CKSUM (dscp=0 on "
+         "tagged frame carrying IPv4 — dscp branch short-circuits)";
+
+  EXPECT_EQ(spy.calls, 1u) << "U6.50: TAG must forward to TX";
+  EXPECT_EQ(ctx.tag_pcp_noop_untagged_total, 0u)
+      << "U6.50: tagged frame + PCP rewrite must NOT bump no-op counter";
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+
+  rte_pktmbuf_free(m);
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.51 — TAG PCP on untagged frame is a no-op + counter bump.
+//
+// D19: PCP rewrite on untagged frames does NOT insert a VLAN tag.
+// The mbuf bytes are unchanged, tag_pcp_noop_untagged_total is bumped,
+// and the packet still flows to TX (TAG is ALLOW-with-header-tweak, and
+// an ignored tweak is still a forward).
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_51_TagPcpOnUntaggedIsNoop) {
+  using namespace action_dispatch_detail;
+  using namespace tag_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_51_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = make_ipv4_mbuf(mp);  // untagged IPv4
+  ASSERT_NE(m, nullptr);
+
+  // Snapshot of the first 34 bytes (14 L2 + 20 IPv4) for byte-level compare.
+  std::uint8_t before[34];
+  std::memcpy(before, rte_pktmbuf_mtod(m, const void*), sizeof(before));
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  action::RuleAction tag{};
+  tag.verb = static_cast<std::uint8_t>(compiler::ActionVerb::kTag);
+  tag.dscp = 0;  // no DSCP rewrite either — pure PCP
+  tag.pcp  = 5;
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 4;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kMatch, &tag);
+
+  // Bytes must be unchanged — D19 forbids inserting a VLAN tag.
+  std::uint8_t after[34];
+  std::memcpy(after, rte_pktmbuf_mtod(m, const void*), sizeof(after));
+  EXPECT_EQ(std::memcmp(before, after, sizeof(before)), 0)
+      << "U6.51: untagged + PCP TAG must leave frame bytes unchanged";
+
+  EXPECT_EQ(ctx.tag_pcp_noop_untagged_total, 1u)
+      << "U6.51: D19 — untagged + PCP rewrite must bump counter";
+  EXPECT_EQ(spy.calls, 1u)
+      << "U6.51: TAG on untagged frame still forwards — does NOT drop";
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+
+  rte_pktmbuf_free(m);
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test
