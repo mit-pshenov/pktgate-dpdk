@@ -178,26 +178,43 @@ L4CompileOutput compile_l4_rules(
     const bool has_tcp_flags = rule.tcp_flags.has_value();
 
     // Determine primary kind and key.
+    //
+    // D15 selectivity order (most → least selective):
+    //   1. proto + dport → kProtoDport
+    //   2. proto + sport (no dport) → kProtoSport
+    //   3. proto only (no port) → kProtoOnly
+    //
+    // All three share the single l4_compound_hash; the key helpers
+    // in rule_compiler.h tag the high byte to prevent collisions.
     L4PrimaryKind primary;
     std::uint32_t primary_key;
 
     if (has_proto && has_dport) {
       primary = L4PrimaryKind::kProtoDport;
-      primary_key =
-          (static_cast<std::uint32_t>(rule.proto) << 16) |
-          static_cast<std::uint32_t>(rule.dst_port & 0xFFFF);
+      primary_key = l4_key::proto_dport(
+          static_cast<std::uint8_t>(rule.proto),
+          static_cast<std::uint16_t>(rule.dst_port & 0xFFFF));
+    } else if (has_proto && has_sport) {
+      primary = L4PrimaryKind::kProtoSport;
+      primary_key = l4_key::proto_sport(
+          static_cast<std::uint8_t>(rule.proto),
+          static_cast<std::uint16_t>(rule.src_port & 0xFFFF));
     } else if (has_proto) {
       primary = L4PrimaryKind::kProtoOnly;
-      primary_key = static_cast<std::uint32_t>(rule.proto);
+      primary_key = l4_key::proto_only(
+          static_cast<std::uint8_t>(rule.proto));
     } else {
       // No proto — degenerate. Still emit as proto-only with key 0.
       primary = L4PrimaryKind::kProtoOnly;
-      primary_key = 0;
+      primary_key = l4_key::proto_only(0);
     }
 
     // Build filter_mask: set bits for secondary constraints.
+    // Sport is only a secondary when it's NOT the primary key
+    // (i.e., when primary is kProtoDport or kProtoOnly, not kProtoSport).
     std::uint8_t mask = 0;
-    if (has_sport) mask |= l4_mask::kSrcPort;
+    if (has_sport && primary != L4PrimaryKind::kProtoSport)
+      mask |= l4_mask::kSrcPort;
     if (has_tcp_flags) mask |= l4_mask::kTcpFlags;
 
     // Build the L4CompoundEntry.

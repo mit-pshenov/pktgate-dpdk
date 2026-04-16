@@ -90,6 +90,28 @@ enum class ClassifyL4Verdict : std::uint8_t {
 };
 
 // -------------------------------------------------------------------------
+// l4_filter_ok — filter_mask secondary check for an L4 compound entry.
+//
+// `alt_port` is the "other" port — for a proto_dport primary, it's sport;
+// for a proto_sport primary, it's dport; for proto_only, it's sport.
+// The entry's filter_mask bits determine which secondary constraints to
+// check:
+//   kSrcPort:  want_src_port must match alt_port (D29: also ICMP code).
+//   kTcpFlags: TODO — reserved for a later cycle.
+//   kVrf:      TODO — reserved for a later cycle.
+
+inline bool l4_filter_ok(const ruleset::L4CompoundEntry* e,
+                          std::uint16_t alt_port) noexcept {
+  if (e->filter_mask & compiler::l4_mask::kSrcPort) {
+    if (e->want_src_port != alt_port) {
+      return false;
+    }
+  }
+  // TODO: add kTcpFlags and kVrf checks here.
+  return true;
+}
+
+// -------------------------------------------------------------------------
 // classify_l4 — Layer 4 classifier (§5.4).
 //
 // Called from the worker kNextL4 arm after classify_l3 has written the
@@ -194,37 +216,59 @@ inline ClassifyL4Verdict classify_l4(struct rte_mbuf* m,
   dyn->parsed_l4_sport = sport;
   dyn->parsed_l4_dport = dport;
 
-  // ---- C1: proto_dport primary hash probe (D15 selectivity tier 1) ------
+  // ---- D15 selectivity-ordered probing (C1+C2) --------------------------
   //
-  // Key: (proto << 16) | dport — most-selective L4 compound primary.
-  // On hit, check filter_mask secondary constraints (SRC_PORT).
-  // On match, write verdict_action_idx and return kMatch.
+  // Three tiers against the single l4_compound_hash, keyed with
+  // l4_key helpers (tag byte in bits 24-31 prevents collisions):
+  //   1. proto_dport  — most selective
+  //   2. proto_sport  — mid selective
+  //   3. proto_only   — least selective (catch-all)
+  //
+  // First hit with passing filter_mask wins → dispatch.
   if (rs.l4_compound_hash) {
-    const std::uint32_t key_pd =
-        (static_cast<std::uint32_t>(proto) << 16) | dport;
-    void* data = nullptr;
-    int ret = rte_hash_lookup_data(rs.l4_compound_hash, &key_pd, &data);
-    if (ret >= 0 && data) {
-      const auto* e = static_cast<const ruleset::L4CompoundEntry*>(data);
-      // Filter_mask secondary check: SRC_PORT bit (D29: also serves as
-      // ICMP code match). If the bit is set, want_src_port must match
-      // the packet's sport (or ICMP code). If not set, sport is wildcard.
-      bool filter_ok = true;
-      if (e->filter_mask & compiler::l4_mask::kSrcPort) {
-        if (e->want_src_port != sport) {
-          filter_ok = false;
+    // Tier 1: proto_dport — key = (proto << 16) | dport
+    {
+      const std::uint32_t key_pd = compiler::l4_key::proto_dport(proto, dport);
+      void* data = nullptr;
+      int ret = rte_hash_lookup_data(rs.l4_compound_hash, &key_pd, &data);
+      if (ret >= 0 && data) {
+        const auto* e = static_cast<const ruleset::L4CompoundEntry*>(data);
+        if (l4_filter_ok(e, sport)) {
+          dyn->verdict_action_idx = e->action_idx;
+          return ClassifyL4Verdict::kMatch;
         }
       }
-      // TODO C2: add kTcpFlags and kVrf checks here.
-
-      if (filter_ok) {
-        dyn->verdict_action_idx = e->action_idx;
-        return ClassifyL4Verdict::kMatch;
+    }
+    // Tier 2: proto_sport — key = (1<<24) | (proto << 16) | sport
+    {
+      const std::uint32_t key_ps = compiler::l4_key::proto_sport(proto, sport);
+      void* data = nullptr;
+      int ret = rte_hash_lookup_data(rs.l4_compound_hash, &key_ps, &data);
+      if (ret >= 0 && data) {
+        const auto* e = static_cast<const ruleset::L4CompoundEntry*>(data);
+        // For proto_sport primary, the sport is already matched by the
+        // hash key — no SRC_PORT secondary needed. filter_mask may still
+        // have TCP_FLAGS or VRF bits for secondary checks.
+        if (l4_filter_ok(e, dport)) {
+          dyn->verdict_action_idx = e->action_idx;
+          return ClassifyL4Verdict::kMatch;
+        }
+      }
+    }
+    // Tier 3: proto_only — key = (2<<24) | proto
+    {
+      const std::uint32_t key_po = compiler::l4_key::proto_only(proto);
+      void* data = nullptr;
+      int ret = rte_hash_lookup_data(rs.l4_compound_hash, &key_po, &data);
+      if (ret >= 0 && data) {
+        const auto* e = static_cast<const ruleset::L4CompoundEntry*>(data);
+        if (l4_filter_ok(e, sport)) {
+          dyn->verdict_action_idx = e->action_idx;
+          return ClassifyL4Verdict::kMatch;
+        }
       }
     }
   }
-
-  // ---- C2 scope: proto_sport + proto_only probes go here ----------------
 
   // ---- L4 miss → TERMINAL_PASS -----------------------------------------
   //

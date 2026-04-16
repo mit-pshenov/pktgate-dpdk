@@ -564,8 +564,9 @@ TEST(L4CompoundConstruction, ProtoOnlyTable_U3_11) {
   // Primary must be kProtoOnly
   EXPECT_EQ(cr.primary_kind, L4PrimaryKind::kProtoOnly);
 
-  // Key = proto (just the protocol number)
-  EXPECT_EQ(cr.primary_key, 1u);
+  // Key = proto_only(1) — tagged with (2<<24) to avoid collisions
+  // in the single l4_compound_hash.
+  EXPECT_EQ(cr.primary_key, l4_key::proto_only(1));
 
   // filter_mask: no secondary constraints → 0
   EXPECT_EQ(cr.entry.filter_mask, 0u)

@@ -73,19 +73,41 @@ enum class L2PrimaryKind : std::uint8_t {
 };
 
 // -------------------------------------------------------------------------
-// L4PrimaryKind — which L4 hash table the rule's primary key lands in.
+// L4PrimaryKind — which L4 primary key shape the rule uses.
 //
-// §5.4 selectivity order:
-//   l4_proto_dport  key = (proto << 16) | dport   // most common
-//   l4_proto_only   key = proto                    // catch-all (proto only, no port)
+// §5.4 / D15 selectivity order (most to least selective):
+//   kProtoDport  key = (proto << 16) | dport
+//   kProtoSport  key = (1u << 24) | (proto << 16) | sport
+//   kProtoOnly   key = (2u << 24) | proto
 //
-// l4_proto_sport is a separate primary for rare sport-keyed rules
-// but is not used in C4 scope (those rules have sport as secondary).
+// All three kinds share the single `l4_compound_hash` rte_hash in the
+// Ruleset. The high byte of the uint32_t key is a kind tag that
+// prevents collisions between different primary kinds:
+//   kProtoDport:  tag = 0 (proto is max 255, so bits 24-31 are 0)
+//   kProtoSport:  tag = 1 << 24
+//   kProtoOnly:   tag = 2 << 24
 
 enum class L4PrimaryKind : std::uint8_t {
-  kProtoDport,    // primary key = (proto << 16) | dport
-  kProtoOnly,     // primary key = proto (no port constraint)
+  kProtoDport,    // key = (proto << 16) | dport
+  kProtoSport,    // key = (1u << 24) | (proto << 16) | sport
+  kProtoOnly,     // key = (2u << 24) | proto
 };
+
+// L4 key construction helpers (shared by compiler + classifier).
+namespace l4_key {
+inline constexpr std::uint32_t kSportTag    = 1u << 24;
+inline constexpr std::uint32_t kProtoOnlyTag = 2u << 24;
+
+inline constexpr std::uint32_t proto_dport(std::uint8_t proto, std::uint16_t dport) {
+  return (static_cast<std::uint32_t>(proto) << 16) | dport;
+}
+inline constexpr std::uint32_t proto_sport(std::uint8_t proto, std::uint16_t sport) {
+  return kSportTag | (static_cast<std::uint32_t>(proto) << 16) | sport;
+}
+inline constexpr std::uint32_t proto_only(std::uint8_t proto) {
+  return kProtoOnlyTag | static_cast<std::uint32_t>(proto);
+}
+}  // namespace l4_key
 
 // -------------------------------------------------------------------------
 // L2CompiledRule — one L2 rule after compound construction.

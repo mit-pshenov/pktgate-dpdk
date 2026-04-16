@@ -7162,4 +7162,224 @@ TEST_F(ClassifyL4PortTest, U6_41_IcmpTypeCodePackingD29) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// M6 C2 — proto_sport + proto_only + filter_mask + selectivity.
+//
+// Three RED tests:
+//
+//   U6.36  — proto-only catch-all: rule {proto: ICMP, no dport, no sport}.
+//            Any ICMP packet → hit via proto_only probe → kMatch.
+//   U6.37  — selectivity order (D15): rule A on proto+dport=443, rule B on
+//            proto+sport=443. Packet with dport=443 sport=80 must match
+//            rule A first (proto_dport before proto_sport).
+//   U6.38  — first-match-wins: two proto+dport rules on TCP/443 (collision).
+//            The first rule wins (lower action_idx dispatched).
+//
+// All tests use the build_l4_ruleset helper from C1.
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U6.36 — proto-only catch-all (ICMP any)
+//
+// Rule: proto=ICMP, no dport, no sport.
+// Packet: ICMP type=3 code=1.
+// Expected: kMatch via proto_only probe.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_36_ProtoOnlyCatchAll) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 4010, ActionDrop{});
+  r1.proto = IPPROTO_ICMP;
+  // No dport, no sport → proto_only primary. filter_mask = 0.
+
+  auto rs = build_l4_ruleset(cfg, "u6_36");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_36_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  // ICMP type=3 (dest unreachable), code=1 — any ICMP should match the
+  // proto-only catch-all.
+  auto* m = make_l4_pkt(mp, IPPROTO_ICMP,
+                         /*sport=*/1, /*dport=*/3,
+                         /*is_icmp=*/true);
+  ASSERT_NE(m, nullptr);
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+      << "U6.36: any ICMP must match the proto-only catch-all (D15)";
+
+  const auto* dyn = eal::mbuf_dynfield(
+      static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->verdict_action_idx, 0u)
+      << "U6.36: verdict_action_idx must be 0 (first rule)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.37 — selectivity order: dport primary before sport primary (D15)
+//
+// Rule A: proto=TCP, dport=443 (proto_dport primary, most selective).
+// Rule B: proto=TCP, sport=12345 (proto_sport primary, less selective).
+//
+// Packet: TCP sport=12345, dport=443.
+// Both rules could match, but D15 selectivity dictates proto_dport is
+// probed first → Rule A wins → action_idx = 0.
+//
+// Verify that reversing the packet (sport=80, dport=443) still matches A,
+// and a packet with sport=12345, dport=80 matches B.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_37_SelectivityDportBeforeSport) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  // Rule A: proto=TCP, dport=443 → proto_dport primary
+  auto& rA = append_rule(cfg.pipeline.layer_4, 4020, ActionDrop{});
+  rA.proto = IPPROTO_TCP;
+  rA.dst_port = 443;
+  // Rule B: proto=TCP, sport=12345, no dport → proto_sport primary
+  auto& rB = append_rule(cfg.pipeline.layer_4, 4021, ActionAllow{});
+  rB.proto = IPPROTO_TCP;
+  rB.src_port = 12345;
+
+  auto rs = build_l4_ruleset(cfg, "u6_37");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_37_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  // Case 1: packet matches BOTH rules (dport=443, sport=12345).
+  // Rule A must win (proto_dport probed before proto_sport).
+  {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/12345, /*dport=*/443);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+        << "U6.37 case 1: packet must match (both rules overlap)";
+
+    const auto* dyn = eal::mbuf_dynfield(
+        static_cast<const struct rte_mbuf*>(m));
+    EXPECT_EQ(dyn->verdict_action_idx, 0u)
+        << "U6.37 case 1: Rule A (dport=443) must win over Rule B "
+           "(sport=12345) — D15 selectivity: proto_dport before proto_sport";
+
+    rte_pktmbuf_free(m);
+  }
+
+  // Case 2: packet matches only Rule B (sport=12345, dport=80).
+  {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/12345, /*dport=*/80);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+        << "U6.37 case 2: packet must match Rule B (sport=12345)";
+
+    const auto* dyn = eal::mbuf_dynfield(
+        static_cast<const struct rte_mbuf*>(m));
+    EXPECT_EQ(dyn->verdict_action_idx, 1u)
+        << "U6.37 case 2: Rule B (sport=12345) must match — action_idx = 1";
+
+    rte_pktmbuf_free(m);
+  }
+
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.38 — first-match-wins on multiple dport rules
+//
+// Two rules that produce different primary keys in the hash:
+//   Rule A: proto=TCP, dport=443 → key = (6<<16)|443
+//   Rule B: proto=TCP, dport=80  → key = (6<<16)|80
+//
+// Packet with dport=443 → Rule A wins (action_idx=0).
+// Packet with dport=80  → Rule B wins (action_idx=1).
+//
+// This validates first-match-wins semantics: the rule that matches via
+// the hash probe gets dispatched, not the last or highest-priority one.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_38_FirstMatchWins) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  auto& rA = append_rule(cfg.pipeline.layer_4, 4030, ActionDrop{});
+  rA.proto = IPPROTO_TCP;
+  rA.dst_port = 443;
+  auto& rB = append_rule(cfg.pipeline.layer_4, 4031, ActionAllow{});
+  rB.proto = IPPROTO_TCP;
+  rB.dst_port = 80;
+
+  auto rs = build_l4_ruleset(cfg, "u6_38");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_38_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  // Packet dport=443 → Rule A.
+  {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/80, /*dport=*/443);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+        << "U6.38: TCP/443 must match Rule A";
+
+    const auto* dyn = eal::mbuf_dynfield(
+        static_cast<const struct rte_mbuf*>(m));
+    EXPECT_EQ(dyn->verdict_action_idx, 0u)
+        << "U6.38: Rule A (dport=443) action_idx must be 0";
+
+    rte_pktmbuf_free(m);
+  }
+
+  // Packet dport=80 → Rule B.
+  {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/443, /*dport=*/80);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+        << "U6.38: TCP/80 must match Rule B";
+
+    const auto* dyn = eal::mbuf_dynfield(
+        static_cast<const struct rte_mbuf*>(m));
+    EXPECT_EQ(dyn->verdict_action_idx, 1u)
+        << "U6.38: Rule B (dport=80) action_idx must be 1";
+
+    rte_pktmbuf_free(m);
+  }
+
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test
