@@ -10,8 +10,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstring>
 #include <map>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <rte_byteorder.h>
@@ -9484,5 +9487,154 @@ TEST_F(RedirectDispatchTest, U6_55_StagingFullDropsNewMbuf) {
   g_redirect_spy = nullptr;
   rte_mempool_free(mp);
 }
+
+// =========================================================================
+// M8 C0 — D9 structural assertions (U6.42, U6.43).
+//
+// These tests live in the unit tier (this binary) because they are
+// self-contained: U6.42 is an in-process RCU-free swap test, U6.43 is
+// a pure compile-time reflective assertion on WorkerCtx. Real RCU
+// swap scenarios (token + deadline, pending_free) live in the
+// integration tier (tests/integration/test_reload.cpp) per the M8
+// plan; U6.42/U6.43 only pin the *architectural invariants* D9
+// depends on.
+//
+// D9 (review-notes.md): there is a single process-wide `g_active`
+// pointer to the live Ruleset; workers read it via acquire-load;
+// there is NO per-worker `active` field on WorkerCtx (that design
+// caused the original UAF the architect flagged in §4.2/§5.1/§9.2).
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// U6.42 — single `g_active` pointer swap semantics (in-process RCU-free).
+//
+// An `std::atomic<Ruleset*>` initialized to rs_a is swapped to rs_b
+// between two "bursts" (reads). Each burst performs an acquire-load
+// and records which Ruleset it saw. Expect burst 1 -> rs_a, burst 2
+// -> rs_b. Exercises the acquire/release discipline that D9's single
+// pointer relies on for publication to workers without a lock.
+//
+// This is *not* a test of rte_rcu_qsbr — the RCU machinery lives in
+// the integration tier (C2+). U6.42 is strictly the *pointer swap*
+// invariant: the ONE atomic allowed in the project (D1 exception)
+// behaves as specified.
+// -------------------------------------------------------------------------
+TEST(U6_42_GActiveSwap, AcquireLoadObservesReleaseStore) {
+  ruleset::Ruleset rs_a{};
+  ruleset::Ruleset rs_b{};
+
+  // Model the eventual g_active: one atomic<Ruleset*> in the whole
+  // process. Initial publisher state = rs_a.
+  std::atomic<ruleset::Ruleset*> active{&rs_a};
+
+  // Burst 1 — acquire-load reads the initial value.
+  const ruleset::Ruleset* seen_1 =
+      active.load(std::memory_order_acquire);
+  EXPECT_EQ(seen_1, &rs_a)
+      << "U6.42: burst 1 must observe initial g_active = &rs_a";
+
+  // Publisher swaps via exchange (the D9 publication path that C1
+  // will wire into deploy()). Release semantics: every write made
+  // before the exchange becomes visible to any subsequent acquire-
+  // load that sees the new pointer.
+  ruleset::Ruleset* prev =
+      active.exchange(&rs_b, std::memory_order_release);
+  EXPECT_EQ(prev, &rs_a)
+      << "U6.42: exchange must return the previously-stored pointer";
+
+  // Burst 2 — acquire-load reads the swapped value.
+  const ruleset::Ruleset* seen_2 =
+      active.load(std::memory_order_acquire);
+  EXPECT_EQ(seen_2, &rs_b)
+      << "U6.42: burst 2 must observe the swapped g_active = &rs_b";
+
+  EXPECT_NE(seen_1, seen_2)
+      << "U6.42: two bursts straddling the swap must see distinct rulesets";
+}
+
+// -------------------------------------------------------------------------
+// U6.43 — no per-WorkerCtx `active` field (D9 architectural invariant).
+//
+// The original architect draft placed `active` on each WorkerCtx so
+// every worker carried its own "which ruleset am I on" pointer. D9
+// overrides that: a single process-wide pointer, acquire-loaded by
+// workers, keeps lifetime management in one place and eliminates the
+// UAF that fell out of per-worker pointers.
+//
+// Reflective check: the SFINAE template `has_active_member<T>` only
+// specialises true if `T::active` names a member. WorkerCtx must NOT
+// match. If a future CL re-adds the field the static_assert will fire
+// at *compile* time, which is exactly what D9 wants — no way to
+// silently regress into the old design.
+//
+// We also keep a companion runtime EXPECT so test reports visibly
+// record the invariant as "GREEN" in each build. Equivalent to the
+// static_assert, but makes the assertion show up in gtest output.
+//
+// NOTE on the ownership half of U6.43 (g_active lives in the reload
+// manager, not main.cpp): that moves in M8 C1. The assertion is
+// present but disabled via M8_C1_DONE below so C1 flips a single
+// preprocessor flag to exercise it.
+// -------------------------------------------------------------------------
+template <typename, typename = void>
+struct has_active_member : std::false_type {};
+
+template <typename T>
+struct has_active_member<T, std::void_t<decltype(std::declval<T&>().active)>>
+    : std::true_type {};
+
+static_assert(!has_active_member<dataplane::WorkerCtx>::value,
+              "U6.43: D9 forbids a per-WorkerCtx `active` field — the "
+              "ruleset pointer comes from the single process-wide "
+              "g_active, not a copy on each worker's context.");
+
+TEST(U6_43_NoPerWorkerActive, WorkerCtxHasNoActiveField) {
+  EXPECT_FALSE(has_active_member<dataplane::WorkerCtx>::value)
+      << "U6.43: WorkerCtx must not carry a per-worker `active` ruleset "
+         "pointer (D9 — single process-wide g_active).";
+}
+
+// -------------------------------------------------------------------------
+// U6.43b — g_active owned by reload manager, not main.cpp.
+//
+// RED today. M3 parked g_active as a scaffold in src/main.cpp (line 68,
+// anonymous namespace). M8 C1 moves that declaration into the reload
+// manager (src/ctl/reload.h or src/gen/reload_manager.h — C1 decides
+// and sticks with it). At that point the header will expose a symbol
+// such as `ctl::reload::g_active` (or equivalent), and the assertion
+// below will flip GREEN by including that header and checking its
+// presence.
+//
+// Wiring: C1 flips this to a real ownership assertion by (a) defining
+// M8_C1_DONE in the relevant CMake preset / target and (b) filling
+// the body with an include + reference to the new g_active symbol.
+// Mechanism keeps the test TEXTUALLY PRESENT so C1 is a one-flag
+// change, not a re-write.
+// -------------------------------------------------------------------------
+#ifdef M8_C1_DONE
+// C1: include the new reload manager header and assert the symbol
+// `reload::g_active` (or equivalent) is the ONE definition.
+// #include "src/ctl/reload.h"   // or src/gen/reload_manager.h — C1 picks
+TEST(U6_43b_GActiveOwnership, OwnedByReloadManagerNotMain) {
+  // C1 fills this: e.g.
+  //   auto* rm_ptr = &ctl::reload::g_active;
+  //   EXPECT_NE(rm_ptr, nullptr);
+  // The assertion intentionally references the reload manager's
+  // symbol so that if someone re-adds g_active to main.cpp the
+  // -Wshadow / link-level duplicate-definition check fires.
+  FAIL() << "U6.43b: M8 C1 must move g_active out of main.cpp";
+}
+#else
+// C0 stub: the test is textually present but compiled out. C1 flips
+// M8_C1_DONE (via target_compile_definitions on test_eal_unit) and
+// fills the body. See scratch/m8-supervisor-handoff.md row C1.
+TEST(U6_43b_GActiveOwnership, OwnedByReloadManagerNotMain_PendingC1) {
+  GTEST_SKIP()
+      << "U6.43b: pending M8 C1 — today g_active lives in "
+         "src/main.cpp:68 (M3 scaffold). C1 moves it into the "
+         "reload manager; flip M8_C1_DONE then to enable the "
+         "ownership assertion.";
+}
+#endif  // M8_C1_DONE
 
 }  // namespace pktgate::test
