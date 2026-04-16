@@ -29,6 +29,7 @@
 #include "src/config/sizing.h"
 #include "src/dataplane/classify_l2.h"
 #include "src/dataplane/classify_l3.h"
+#include "src/dataplane/classify_l4.h"
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
@@ -6612,6 +6613,241 @@ TEST_F(ClassifyL3FragPolicyMatrixTest, C5_16_V6NonFirstAllow) {
 
   rte_pktmbuf_free(ff.m);
   rte_mempool_free(ff.mp);
+}
+
+// =========================================================================
+// M6 C0 — classify_l4 skeleton: SKIP_L4 guard + D14 L4 offset + D31
+//          l4 truncation + L4 miss path.
+//
+// Four RED tests per the M6 C0 cycle row:
+//
+//   U6.16  — D31 l4 truncation sentinel: TCP packet with < 4 B after
+//            L4 offset → kTerminalDrop + pkt_truncated_l4[kL4] bumped.
+//   U6.19  — D14 IHL=6 L4 offset: IPv4 with 24-byte header. L4 offset
+//            must be l3_offset + 24, not l3_offset + 20.
+//   U6.39  — D21 SKIP_L4 flag set → classify_l4 returns kTerminalPass
+//            immediately without touching L4 header.
+//   U6.40  — L4 miss (no hash tables populated) → kTerminalPass.
+//
+// All tests bypass classify_l2/classify_l3 and call classify_l4 directly,
+// pre-setting the dynfield the way the upstream stages would.
+//
+// Covers: D14, D21, D31 (bucket `l4`), D41 (pipeline smoke at L4).
+// =========================================================================
+
+class ClassifyL4SkeletonTest : public EalFixture {};
+
+// -------------------------------------------------------------------------
+// U6.16 — L4 truncated TCP → D31 l4 sentinel
+//
+// IPv4 IHL=5 → L4 offset = 14 + 20 = 34. Frame size = 14 + 20 + 2 = 36.
+// TCP needs 4 B at l4off; only 2 B available → truncation drop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4SkeletonTest, U6_16_L4TruncatedTcpDropsSentinel) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;  // empty — no L4 tables
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_16_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  // 14 B Ethernet + 20 B IPv4 + 2 B partial TCP = 36 B total.
+  // L4 offset = 34, need = 4, available = 36 - 34 = 2 → truncation.
+  constexpr std::size_t kFrameLen = 14 + 20 + 2;
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+
+  // Ethernet: ethertype 0x0800 IPv4
+  pkt[12] = 0x08; pkt[13] = 0x00;
+  // IPv4 at offset 14: version=4, IHL=5
+  pkt[14] = 0x45;
+  // Protocol = TCP (6)
+  pkt[23] = IPPROTO_TCP;
+
+  // Pre-set dynfield as if classify_l2 + classify_l3 ran.
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;  // 0x0800 HOST order
+  dyn->parsed_l3_proto  = IPPROTO_TCP;
+  dyn->flags            = 0;   // no SKIP_L4
+  dyn->l4_extra         = 0;
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kTerminalDrop)
+      << "U6.16: TCP with <4 B at L4 offset must be dropped (D31 l4 sentinel)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L4TruncBucket::kL4)], 1u)
+      << "U6.16: pkt_truncated_l4[l4] must be 1";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.19 — D14 IHL=6 L4 offset uses `ihl << 2`
+//
+// IPv4 with IHL=6 (24-byte header, 4 B options). L4 offset must be
+// l3_offset + 24 = 38. Frame has a valid 4-byte TCP stub at offset 38.
+// classify_l4 must NOT truncation-drop (pkt_len >= 38 + 4 = 42).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4SkeletonTest, U6_19_Ihl6L4OffsetUsesIhlShift2) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;  // empty — no L4 tables
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_19_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  // 14 B Ethernet + 24 B IPv4 (IHL=6) + 4 B TCP ports = 42 B total.
+  // L4 offset should be 14 + 24 = 38. need = 4. 42 >= 38 + 4 = 42 → OK.
+  constexpr std::size_t kFrameLen = 14 + 24 + 4;
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+
+  // Ethernet: ethertype 0x0800 IPv4
+  pkt[12] = 0x08; pkt[13] = 0x00;
+  // IPv4 at offset 14: version=4, IHL=6 → 24-byte header with 4 B options
+  pkt[14] = 0x46;
+  // Protocol = TCP (6)
+  pkt[23] = IPPROTO_TCP;
+  // Write recognisable port values at L4 offset 38 (not 34!)
+  // to verify classify_l4 reads at the correct position.
+  // sport=0x1234 at offset 38-39, dport=0x5678 at offset 40-41
+  pkt[38] = 0x12; pkt[39] = 0x34;  // src port big-endian
+  pkt[40] = 0x56; pkt[41] = 0x78;  // dst port big-endian
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;  // 0x0800 HOST order
+  dyn->parsed_l3_proto  = IPPROTO_TCP;
+  dyn->flags            = 0;
+  dyn->l4_extra         = 0;
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  // With IHL=6 and correct L4 offset computation (l3_off + 24 = 38),
+  // the packet has exactly 4 B at the L4 position → NOT truncated.
+  // No hash tables → L4 miss → kTerminalPass.
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kTerminalPass)
+      << "U6.19: IHL=6 with valid L4 header must NOT be truncation-dropped";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L4TruncBucket::kL4)], 0u)
+      << "U6.19: no truncation counter bump";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.39 — SKIP_L4 flag → TERMINAL_PASS immediately (D21)
+//
+// Dynfield has SKIP_L4 set (e.g. non-first fragment under L3_ONLY).
+// classify_l4 must return kTerminalPass without touching the L4 header.
+// The frame is deliberately malformed at L4 (only 2 B of "TCP") to
+// prove that classify_l4 short-circuits before the truncation check.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4SkeletonTest, U6_39_SkipL4FlagReturnsTerminalPass) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_39_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  // Deliberately short: 14 + 20 + 2 = 36 B. TCP would need 4 B at l4off.
+  // If SKIP_L4 guard works, truncation check is never reached.
+  constexpr std::size_t kFrameLen = 14 + 20 + 2;
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x08; pkt[13] = 0x00;
+  pkt[14] = 0x45;
+  pkt[23] = IPPROTO_TCP;
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
+  dyn->parsed_l3_proto  = IPPROTO_TCP;
+  dyn->flags            = eal::kSkipL4;  // SKIP_L4 set!
+  dyn->l4_extra         = 0;
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kTerminalPass)
+      << "U6.39: SKIP_L4 flag must short-circuit to kTerminalPass (D21)";
+  // Truncation counter must NOT be bumped — we never reached the check.
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L4TruncBucket::kL4)], 0u)
+      << "U6.39: SKIP_L4 must not touch truncation counter";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.40 — L4 miss → TERMINAL_PASS (no hash tables populated)
+//
+// Valid IPv4/TCP frame with full L4 header. No L4 hash tables in the
+// ruleset. classify_l4 must return kTerminalPass (default pass-through).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4SkeletonTest, U6_40_L4MissReturnsTerminalPass) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;  // empty — l4_compound_hash == nullptr
+  ASSERT_EQ(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_40_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  // 14 B Ethernet + 20 B IPv4 + 8 B TCP header stub = 42 B.
+  // L4 offset = 34, need = 4, available = 42 - 34 = 8 → not truncated.
+  constexpr std::size_t kFrameLen = 14 + 20 + 8;
+  uint8_t* pkt = reinterpret_cast<uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+  pkt[12] = 0x08; pkt[13] = 0x00;
+  pkt[14] = 0x45;
+  pkt[23] = IPPROTO_TCP;
+  // sport/dport at offset 34: any values, we just prove no match.
+  pkt[34] = 0x00; pkt[35] = 0x50;  // sport 80
+  pkt[36] = 0x01; pkt[37] = 0xBB;  // dport 443
+
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
+  dyn->parsed_l3_proto  = IPPROTO_TCP;
+  dyn->flags            = 0;
+  dyn->l4_extra         = 0;
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kTerminalPass)
+      << "U6.40: L4 miss (no hash tables) must return kTerminalPass";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L4TruncBucket::kL4)], 0u)
+      << "U6.40: no truncation";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
 }
 
 }  // namespace pktgate::test

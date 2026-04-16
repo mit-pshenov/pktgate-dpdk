@@ -4,13 +4,14 @@
 // M4 C1      — classify_l2 call site wired in.
 // M4 C8      — per-rule counter bump after classify_l2 match.
 // M4 C9      — D39 guard moved into shared classify_entry helper.
+// M6 C0      — classify_l4 call site wired in (kNextL4 arm).
 //
 // The worker polls a single RX queue, drops multi-segment mbufs
 // (D39: headers-in-first-seg invariant — now handled by
 // classify_entry_ok), calls classify_l2 on each surviving mbuf, and
-// dispatches on the verdict. Classification for L3/L4
-// (classify_l3/classify_l4) arrives in M5-M6 and will share the same
-// classify_entry_ok gate.
+// dispatches on the verdict. L3 classification (classify_l3) chains
+// from the kNextL3 arm; L4 (classify_l4) chains from L3's kNextL4 arm.
+// All stages share the same classify_entry_ok gate.
 
 #include "src/dataplane/worker.h"
 
@@ -23,6 +24,7 @@
 #include "src/dataplane/classify_entry.h"
 #include "src/dataplane/classify_l2.h"
 #include "src/dataplane/classify_l3.h"
+#include "src/dataplane/classify_l4.h"
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 
@@ -152,11 +154,30 @@ int worker_main(void* arg) {
                           &ctx->l4_skipped_ipv6_extheader,
                           &ctx->l4_skipped_ipv6_fragment_nonfirst);
           switch (l3v) {
-            case ClassifyL3Verdict::kNextL4:
-              // TODO M6: call classify_l4 on kNextL4 verdict.
-              // For now, free (same as the old M4 kNextL3 free arm).
-              rte_pktmbuf_free(bufs[i]);
+            case ClassifyL3Verdict::kNextL4: {
+              // M6 C0: L3 pass → call classify_l4.
+              // D31: pass per-lcore L4 truncation counter array.
+              const ClassifyL4Verdict l4v =
+                  classify_l4(bufs[i], *ctx->ruleset,
+                              &ctx->pkt_truncated_l4);
+              switch (l4v) {
+                case ClassifyL4Verdict::kTerminalPass:
+                  // L4 miss or SKIP_L4 or ALLOW rule. TX path lands
+                  // in M7; for now, free.
+                  rte_pktmbuf_free(bufs[i]);
+                  break;
+                case ClassifyL4Verdict::kTerminalDrop:
+                  // D31 l4 truncation or L4 DROP rule. Free.
+                  rte_pktmbuf_free(bufs[i]);
+                  break;
+                case ClassifyL4Verdict::kMatch:
+                  // L4 compound entry matched. apply_action lands in
+                  // M7; for now, free.
+                  rte_pktmbuf_free(bufs[i]);
+                  break;
+              }
               break;
+            }
             case ClassifyL3Verdict::kTerminalPass:
               // Final allow at L3 (e.g. FRAG_ALLOW in C3). TX path
               // lands in a later milestone; for now, free.

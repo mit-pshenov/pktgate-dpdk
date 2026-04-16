@@ -18,6 +18,7 @@
 
 #include "src/dataplane/classify_l2.h"  // L2TruncCtrs, L2TruncBucket
 #include "src/dataplane/classify_l3.h"  // ClassifyL3Verdict (M5 C0)
+#include "src/dataplane/classify_l4.h"  // ClassifyL4Verdict, L4TruncCtrs (M6 C0)
 #include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {
@@ -42,6 +43,7 @@ struct WorkerCtx {
                                               //       C6 adds v6 slots to the same array)
   std::uint64_t l4_skipped_ipv6_extheader = 0;  // D20: IPv6 non-fragment ext-header → SKIP_L4 (M5 C5)
   std::uint64_t l4_skipped_ipv6_fragment_nonfirst = 0;  // D27: non-first v6 fragment → SKIP_L4 (M5 C6)
+  L4TruncCtrs   pkt_truncated_l4{};           // D31: l4 truncation bucket (M6 C0)
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained
