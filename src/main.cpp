@@ -503,6 +503,17 @@ int main(int argc, char* argv[]) {
                   // the full suite (X2.9 simplified form).
                   ",\"dispatch_unreachable_total\":" +
                   std::to_string(worker_ctx.dispatch_unreachable_total) +
+                  // M7 C3 (D33): surface the two remaining M7 counters
+                  // for F3 action functional tests. `tag_pcp_noop_untagged_total`
+                  // is bumped by apply_dscp_pcp when the TAG verb carries a
+                  // non-zero pcp and the packet is untagged (D19 — do NOT
+                  // insert a VLAN tag on the operator's behalf).
+                  // `redirect_dropped_total` covers both the stage-full
+                  // drop and the drain partial-send drop (D16).
+                  ",\"tag_pcp_noop_untagged_total\":" +
+                  std::to_string(worker_ctx.tag_pcp_noop_untagged_total) +
+                  ",\"redirect_dropped_total\":" +
+                  std::to_string(worker_ctx.redirect_dropped_total) +
                   "}}";
     log_json(stats_json);
   }

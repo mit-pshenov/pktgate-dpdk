@@ -102,3 +102,18 @@ set_tests_properties(functional.test_f4_l3 PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 300
 )
+
+# M7 C3 — F3.1-F3.7: ALLOW/DROP/TAG action end-to-end functional tests.
+# First functional suite that verifies egress *packet contents* (scapy
+# AsyncSniffer on dtap_f3_tx).  FIB needs --no-huge -m 512 even without
+# L3 rules.  7 sub-tests, each boots a fresh EAL instance → generous
+# timeout.
+add_test(
+  NAME functional.test_f3_action
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f3_action.py"
+)
+set_tests_properties(functional.test_f3_action PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 300
+)

@@ -50,6 +50,10 @@ _TAP_IFACES_TO_UNMANAGE = [
     "dtap_f4_rx", "dtap_f4_tx",
     # M6 C5 — F2 L4 functional tests use their own dtap pair.
     "dtap_l4_rx", "dtap_l4_tx",
+    # M7 C3 — F3 action functional tests (ALLOW/DROP/TAG). Egress tap
+    # is *sniffed* via scapy.sniff() to verify apply_action actually
+    # forwards/tags/drops packets end-to-end (not just counter deltas).
+    "dtap_f3_rx", "dtap_f3_tx",
 ]
 
 
