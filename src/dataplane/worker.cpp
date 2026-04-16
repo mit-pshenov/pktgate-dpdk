@@ -19,6 +19,7 @@
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_rcu_qsbr.h>  // M8 C4 — D12 lifecycle
 
 #include "src/action/action.h"
 #include "src/dataplane/action_dispatch.h"
@@ -115,8 +116,17 @@ int worker_main(void* arg) {
   // a worker thread.
   const unsigned lcore_id = rte_lcore_id();
 
+  // M8 C4 — D12 RCU QSBR lifecycle. When `qs == nullptr` we skip all
+  // of this and the caller is responsible for sequencing shutdown (the
+  // C1 immediate-free path). Production + integration always pass qs.
+  if (ctx->qs != nullptr) {
+    rte_rcu_qsbr_thread_register(ctx->qs, ctx->qsbr_thread_id);
+    rte_rcu_qsbr_thread_online(ctx->qs, ctx->qsbr_thread_id);
+  }
+
   // D19/Q7: worker stays "online" at all times — no offline transition
-  // on idle. Real RCU register/online/offline/unregister lands in M8.
+  // on idle. M8 C4: worker now reports quiescent between every burst
+  // so the reload manager's synchronize path drains promptly.
 
   while (ctx->running->load(std::memory_order_relaxed)) {
     const std::uint16_t nb_rx =
@@ -266,7 +276,33 @@ int worker_main(void* arg) {
     // One batched rte_eth_tx_burst per non-empty target port; unsent
     // mbufs freed and redirect_dropped_total bumped.
     redirect_drain(ctx);
+
+    // M8 C4 — D12: report quiescent at end of every burst so the
+    // reload manager's synchronize path drains promptly. The fence
+    // inside rte_rcu_qsbr_quiescent gives TSAN the happens-before
+    // edge that closes the M4-M7 baseline race (main's `delete` at
+    // shutdown must see the worker's last read as prior).
+    if (ctx->qs != nullptr) {
+      rte_rcu_qsbr_quiescent(ctx->qs, ctx->qsbr_thread_id);
+    }
   }
+
+  // M8 C4 — D12 worker exit: offline + unregister. Must happen BEFORE
+  // returning so the reload manager's shutdown-time synchronize() can
+  // conclude the grace period without stalling on us. The offline call
+  // emits a store-release fence; unregister follows so rte_rcu_qsbr_check
+  // stops waiting for our thread id.
+  if (ctx->qs != nullptr) {
+    rte_rcu_qsbr_thread_offline(ctx->qs, ctx->qsbr_thread_id);
+    rte_rcu_qsbr_thread_unregister(ctx->qs, ctx->qsbr_thread_id);
+  }
+
+  // M8 C4 — D12 TSAN-visible handshake. Release store pairs with the
+  // acquire load in main.cpp's stats_on_exit path. See worker.h's
+  // `worker_done` doc for rationale. MUST be the LAST instrumented
+  // write on this thread so every prior worker write (per-lcore
+  // counter rows + WorkerCtx scalars) is visible to the reader.
+  ctx->worker_done.store(true, std::memory_order_release);
 
   return 0;
 }

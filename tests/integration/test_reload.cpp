@@ -1032,4 +1032,390 @@ TEST_F(CmdSocketStormFixture, ThousandReloadsMutexSerialization) {
   EXPECT_NE(ctl::reload::active_ruleset(), nullptr);
 }
 
+// =========================================================================
+// C4 — D37 validator memory-budget pre-flight (X1.6, X1.7).
+//
+// The validator exposes three gates (design §9.2 / validator.cpp):
+//   * expansion_per_rule — one rule's expansion exceeds the ceiling
+//   * aggregate          — total post-expansion entries exceed sizing cap
+//   * hugepage_budget    — estimated footprint > available hugepages
+//
+// `deploy()` runs `validate_budget` under `reload_mutex`, AFTER parse +
+// validate succeed, BEFORE compile / build / populate. Reject path:
+//   * returns kValidatorBudget with budget_reason == one of the three
+//   * bumps the appropriate sub-reason counter EXACTLY ONCE
+//   * leaves `active_ruleset()` UNCHANGED
+//   * leaves `active_generation` UNCHANGED
+//
+// Happy path at the boundary (exactly at the ceiling, not over):
+//   * deploy succeeds, active_ruleset swaps, generation advances
+//   * NO sub-reason counter bump
+// =========================================================================
+
+class ReloadBudgetFixture : public ReloadManagerFixture {};
+
+namespace {
+
+// Build a JSON config with a single L4 rule carrying `n_ports`
+// distinct dst_ports. Used by the per-rule expansion gate tests.
+std::string make_config_one_l4_rule_n_ports(std::size_t n_ports,
+                                            std::uint32_t l4_entries_max) {
+  // Build the dst_ports array programmatically. Ports 1..n_ports.
+  std::string ports_csv;
+  ports_csv.reserve(n_ports * 6);
+  for (std::size_t i = 0; i < n_ports; ++i) {
+    if (i > 0) ports_csv.push_back(',');
+    ports_csv += std::to_string(i + 1);
+  }
+  std::string s;
+  s.reserve(n_ports * 7 + 512);
+  s += R"({"version":1,"interface_roles":{"upstream_port":{"pci":"0000:00:00.0"},"downstream_port":{"pci":"0000:00:00.1"}},"sizing":{"rules_per_layer_max":256,"mac_entries_max":256,"ipv4_prefixes_max":1024,"ipv6_prefixes_max":1024,"l4_entries_max":)";
+  s += std::to_string(l4_entries_max);
+  s += R"(,"vrf_entries_max":32,"rate_limit_rules_max":256,"ethertype_entries_max":32,"vlan_entries_max":256,"pcp_entries_max":8},"pipeline":{"layer_2":[],"layer_3":[],"layer_4":[{"id":4001,"proto":17,"dst_ports":[)";
+  s += ports_csv;
+  s += R"(],"action":{"type":"drop"}}]},"default_behavior":"drop"})";
+  return s;
+}
+
+// Build a JSON config with `n_rules` L4 rules, each with 1 dst_port.
+// Used by the aggregate gate tests.
+std::string make_config_many_l4_rules_one_port(std::size_t n_rules,
+                                               std::uint32_t l4_entries_max) {
+  std::string rules_json;
+  rules_json.reserve(n_rules * 96);
+  for (std::size_t i = 0; i < n_rules; ++i) {
+    if (i > 0) rules_json.push_back(',');
+    rules_json += R"({"id":)";
+    rules_json += std::to_string(5000 + i);
+    rules_json += R"(,"proto":17,"dst_port":)";
+    rules_json += std::to_string(i + 1);
+    rules_json += R"(,"action":{"type":"drop"}})";
+  }
+  std::string s;
+  s.reserve(rules_json.size() + 512);
+  s += R"({"version":1,"interface_roles":{"upstream_port":{"pci":"0000:00:00.0"},"downstream_port":{"pci":"0000:00:00.1"}},"sizing":{"rules_per_layer_max":256,"mac_entries_max":256,"ipv4_prefixes_max":1024,"ipv6_prefixes_max":1024,"l4_entries_max":)";
+  s += std::to_string(l4_entries_max);
+  s += R"(,"vrf_entries_max":32,"rate_limit_rules_max":256,"ethertype_entries_max":32,"vlan_entries_max":256,"pcp_entries_max":8},"pipeline":{"layer_2":[],"layer_3":[],"layer_4":[)";
+  s += rules_json;
+  s += R"(]},"default_behavior":"drop"})";
+  return s;
+}
+
+// Small config (one trivial L4 rule) used to drive the hugepage-budget
+// gate via an injected probe — the config itself is always tiny; the
+// probe is what flips the gate.
+std::string make_config_tiny() {
+  return R"({"version":1,"interface_roles":{"upstream_port":{"pci":"0000:00:00.0"},"downstream_port":{"pci":"0000:00:00.1"}},"pipeline":{"layer_2":[],"layer_3":[],"layer_4":[{"id":6001,"proto":17,"dst_port":5353,"action":{"type":"drop"}}]},"default_behavior":"drop"})";
+}
+
+}  // namespace
+
+// -------------------------------------------------------------------------
+// X1.6 happy path — boundary-fit configs pass ALL three gates.
+// -------------------------------------------------------------------------
+
+TEST_F(ReloadBudgetFixture, ValidatorBudgetHappyPath_ExpansionPerRule) {
+  // Per-rule ceiling is 4096. A rule with exactly 4096 dst_ports fits.
+  // Set l4_entries_max=4096 so gate 2 also passes (aggregate == ceiling).
+  const auto json = make_config_one_l4_rule_n_ports(4096, 4096);
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto r = ctl::reload::deploy(json);
+  ASSERT_TRUE(r.ok) << "boundary-fit per-rule: " << r.error;
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kOk);
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.validate_budget_expansion_per_rule,
+            c_before.validate_budget_expansion_per_rule)
+      << "no sub-reason bump on boundary-fit";
+  EXPECT_GT(c_after.active_generation, c_before.active_generation);
+  EXPECT_NE(ctl::reload::active_ruleset(), nullptr);
+}
+
+TEST_F(ReloadBudgetFixture, ValidatorBudgetHappyPath_Aggregate) {
+  // Aggregate ceiling set to 5; 5 rules each with 1 port fits exactly.
+  const auto json = make_config_many_l4_rules_one_port(5, 5);
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto r = ctl::reload::deploy(json);
+  ASSERT_TRUE(r.ok) << "boundary-fit aggregate: " << r.error;
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kOk);
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.validate_budget_aggregate,
+            c_before.validate_budget_aggregate);
+  EXPECT_GT(c_after.active_generation, c_before.active_generation);
+  EXPECT_NE(ctl::reload::active_ruleset(), nullptr);
+}
+
+TEST_F(ReloadBudgetFixture, ValidatorBudgetHappyPath_HugepageBudget) {
+  // Inject a probe reporting a comfortable 16 MiB — the tiny config's
+  // estimated footprint is <10 KB, so gate 3 passes.
+  ctl::reload::set_budget_probe_for_test([] {
+    return config::HugepageInfo{/*available_bytes=*/16u * 1024u * 1024u};
+  });
+  const auto json = make_config_tiny();
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto r = ctl::reload::deploy(json);
+  ASSERT_TRUE(r.ok) << "boundary-fit hugepage: " << r.error;
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kOk);
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.validate_budget_hugepage,
+            c_before.validate_budget_hugepage);
+  EXPECT_GT(c_after.active_generation, c_before.active_generation);
+  EXPECT_NE(ctl::reload::active_ruleset(), nullptr);
+}
+
+// -------------------------------------------------------------------------
+// X1.7 overflow path — each config overflows exactly one gate.
+// -------------------------------------------------------------------------
+
+TEST_F(ReloadBudgetFixture, ValidatorBudgetOverflow_ExpansionPerRule) {
+  // 4097 dst_ports on a single rule — above the 4096 ceiling.
+  // Aggregate ceiling is permissive so gate 2 does not preempt.
+  const auto json = make_config_one_l4_rule_n_ports(4097, 8192);
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto* rs_before = ctl::reload::active_ruleset();
+  const auto gen_before = c_before.active_generation;
+
+  auto r = ctl::reload::deploy(json);
+  EXPECT_FALSE(r.ok);
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kValidatorBudget);
+  EXPECT_EQ(r.budget_reason,
+            ctl::reload::ValidatorBudgetReason::kExpansionPerRule);
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.validate_budget_expansion_per_rule,
+            c_before.validate_budget_expansion_per_rule + 1u)
+      << "per-rule sub-reason counter bumps exactly once";
+  EXPECT_EQ(c_after.validate_budget_aggregate,
+            c_before.validate_budget_aggregate);
+  EXPECT_EQ(c_after.validate_budget_hugepage,
+            c_before.validate_budget_hugepage);
+
+  // Exchange did NOT happen — ruleset and generation unchanged.
+  EXPECT_EQ(ctl::reload::active_ruleset(), rs_before)
+      << "validator reject must not exchange g_active";
+  EXPECT_EQ(c_after.active_generation, gen_before)
+      << "active_generation unchanged on reject";
+}
+
+TEST_F(ReloadBudgetFixture, ValidatorBudgetOverflow_Aggregate) {
+  // 6 single-port L4 rules against aggregate ceiling = 5.
+  const auto json = make_config_many_l4_rules_one_port(6, 5);
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto* rs_before = ctl::reload::active_ruleset();
+  const auto gen_before = c_before.active_generation;
+
+  auto r = ctl::reload::deploy(json);
+  EXPECT_FALSE(r.ok);
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kValidatorBudget);
+  EXPECT_EQ(r.budget_reason, ctl::reload::ValidatorBudgetReason::kAggregate);
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.validate_budget_aggregate,
+            c_before.validate_budget_aggregate + 1u);
+  EXPECT_EQ(c_after.validate_budget_expansion_per_rule,
+            c_before.validate_budget_expansion_per_rule);
+  EXPECT_EQ(c_after.validate_budget_hugepage,
+            c_before.validate_budget_hugepage);
+
+  EXPECT_EQ(ctl::reload::active_ruleset(), rs_before);
+  EXPECT_EQ(c_after.active_generation, gen_before);
+}
+
+TEST_F(ReloadBudgetFixture, ValidatorBudgetOverflow_HugepageBudget) {
+  // Inject a probe reporting 1 byte — below anything the tiny config
+  // could fit (kOverheadBytes alone is 4096).
+  ctl::reload::set_budget_probe_for_test([] {
+    return config::HugepageInfo{/*available_bytes=*/1u};
+  });
+  const auto json = make_config_tiny();
+
+  auto c_before = ctl::reload::counters_snapshot();
+  auto* rs_before = ctl::reload::active_ruleset();
+  const auto gen_before = c_before.active_generation;
+
+  auto r = ctl::reload::deploy(json);
+  EXPECT_FALSE(r.ok);
+  EXPECT_EQ(r.kind, ctl::reload::DeployError::kValidatorBudget);
+  EXPECT_EQ(r.budget_reason,
+            ctl::reload::ValidatorBudgetReason::kHugepageBudget);
+
+  auto c_after = ctl::reload::counters_snapshot();
+  EXPECT_EQ(c_after.validate_budget_hugepage,
+            c_before.validate_budget_hugepage + 1u);
+  EXPECT_EQ(c_after.validate_budget_aggregate,
+            c_before.validate_budget_aggregate);
+  EXPECT_EQ(c_after.validate_budget_expansion_per_rule,
+            c_before.validate_budget_expansion_per_rule);
+
+  EXPECT_EQ(ctl::reload::active_ruleset(), rs_before);
+  EXPECT_EQ(c_after.active_generation, gen_before);
+}
+
+// =========================================================================
+// C4 — D12 shutdown sequence smoke.
+//
+// Brings up QSBR with N workers that register/online + report quiescent
+// in a tight loop. Publishes two rulesets via deploy_prebuilt() so
+// freed_total has a non-trivial baseline. Calls shutdown() WITHOUT
+// stopping the workers first (they keep running), and asserts shutdown
+// drains cleanly — the synchronize inside shutdown() must complete
+// because the workers keep reporting quiescent. Tests the TSAN-visible
+// happens-before edge between worker reads and main's delete.
+// =========================================================================
+
+namespace {
+
+struct ShutdownHarness {
+  struct rte_rcu_qsbr*  qs = nullptr;
+  std::atomic<bool>     keep_going{true};
+  std::vector<std::thread> threads;
+  std::vector<unsigned int> thread_ids;
+  void*                 qs_raw = nullptr;
+};
+
+void shutdown_worker(ShutdownHarness* h, unsigned int tid) {
+  rte_rcu_qsbr_thread_register(h->qs, tid);
+  rte_rcu_qsbr_thread_online(h->qs, tid);
+  // Pretend to read the published ruleset every tick so there's a
+  // "reader" TSAN can see. We deliberately DO NOT dereference (the
+  // ruleset type has no fields in the bare fixture) — the HB edge
+  // that matters is the one inside rte_rcu_qsbr_quiescent.
+  while (h->keep_going.load(std::memory_order_acquire)) {
+    volatile auto* rs = ctl::reload::active_ruleset();
+    (void)rs;
+    rte_rcu_qsbr_quiescent(h->qs, tid);
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  rte_rcu_qsbr_thread_offline(h->qs, tid);
+  rte_rcu_qsbr_thread_unregister(h->qs, tid);
+}
+
+}  // namespace
+
+class ReloadShutdownFixture : public IntegrationEalFixture {
+ protected:
+  static constexpr std::uint32_t kMaxThreadsSD = 4;
+  static constexpr unsigned      kSDWorkers    = 2;
+};
+
+TEST_F(ReloadShutdownFixture, ShutdownDrainsAndUnregistersCleanly) {
+  // Bring up a QSBR handle local to this test — keep it independent
+  // of the C2 fixture's qs so the two do not collide.
+  size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreadsSD);
+  ASSERT_GT(sz, 0u);
+  void* qs_raw = std::aligned_alloc(alignof(std::max_align_t), sz);
+  ASSERT_NE(qs_raw, nullptr);
+  auto* qs = static_cast<struct rte_rcu_qsbr*>(qs_raw);
+  ASSERT_EQ(rte_rcu_qsbr_init(qs, kMaxThreadsSD), 0);
+
+  ShutdownHarness h;
+  h.qs = qs;
+  h.qs_raw = qs_raw;
+  h.thread_ids = {0u, 1u};
+  for (unsigned int tid : h.thread_ids) {
+    h.threads.emplace_back(shutdown_worker, &h, tid);
+  }
+  // Let workers report quiescent at least once.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  // Init manager with the same QSBR handle.
+  ctl::reload::InitParams p;
+  p.socket_id       = 0;
+  p.num_lcores      = 1;
+  p.max_entries     = 256;
+  p.name_prefix     = "pktgate_test_c4_shutdown";
+  p.qs              = qs;
+  p.reload_timeout  = std::chrono::milliseconds(200);
+  p.poll_interval   = std::chrono::microseconds(100);
+  p.shutdown_timeout = std::chrono::milliseconds(500);
+  ctl::reload::init(p);
+
+  // Publish two rulesets — exercises the free-after-synchronize path.
+  {
+    auto rs = std::make_unique<ruleset::Ruleset>();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << r.error;
+  }
+  {
+    auto rs = std::make_unique<ruleset::Ruleset>();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << r.error;
+  }
+  EXPECT_NE(ctl::reload::active_ruleset(), nullptr);
+
+  // Call shutdown while workers are STILL running. The synchronize
+  // inside shutdown() must complete because workers keep reporting
+  // quiescent. This is the primary shutdown-race assertion.
+  ctl::reload::shutdown();
+
+  // After shutdown: active_ruleset() must be nullptr, all prior
+  // rulesets freed.
+  EXPECT_EQ(ctl::reload::active_ruleset(), nullptr)
+      << "shutdown must clear g_active";
+
+  // Tear down the harness — stop workers and join.
+  h.keep_going.store(false, std::memory_order_release);
+  for (auto& t : h.threads) t.join();
+  std::free(qs_raw);
+}
+
+// Negative shutdown scenario: the caller already joined workers (the
+// typical path in main.cpp). Workers are offline+unregistered.
+// shutdown() still runs to completion.
+TEST_F(ReloadShutdownFixture, ShutdownAfterWorkerJoinIsClean) {
+  size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreadsSD);
+  void* qs_raw = std::aligned_alloc(alignof(std::max_align_t), sz);
+  auto* qs = static_cast<struct rte_rcu_qsbr*>(qs_raw);
+  ASSERT_EQ(rte_rcu_qsbr_init(qs, kMaxThreadsSD), 0);
+
+  ShutdownHarness h;
+  h.qs = qs;
+  h.thread_ids = {0u};
+  for (unsigned int tid : h.thread_ids) {
+    h.threads.emplace_back(shutdown_worker, &h, tid);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  ctl::reload::InitParams p;
+  p.socket_id       = 0;
+  p.num_lcores      = 1;
+  p.max_entries     = 256;
+  p.name_prefix     = "pktgate_test_c4_shutdown_post_join";
+  p.qs              = qs;
+  p.reload_timeout  = std::chrono::milliseconds(200);
+  p.poll_interval   = std::chrono::microseconds(100);
+  p.shutdown_timeout = std::chrono::milliseconds(500);
+  ctl::reload::init(p);
+
+  {
+    auto rs = std::make_unique<ruleset::Ruleset>();
+    auto r = ctl::reload::deploy_prebuilt(std::move(rs));
+    ASSERT_TRUE(r.ok) << r.error;
+  }
+
+  // Stop + join workers BEFORE shutdown. They call offline+unregister
+  // at the bottom of their loop.
+  h.keep_going.store(false, std::memory_order_release);
+  for (auto& t : h.threads) t.join();
+
+  // Now shutdown. synchronize should return 1 immediately.
+  const auto t0 = std::chrono::steady_clock::now();
+  ctl::reload::shutdown();
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      t1 - t0).count();
+  EXPECT_LT(ms, 300)
+      << "shutdown after worker join should be fast, took " << ms << " ms";
+
+  EXPECT_EQ(ctl::reload::active_ruleset(), nullptr);
+  std::free(qs_raw);
+}
+
 }  // namespace pktgate::test

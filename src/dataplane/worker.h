@@ -18,6 +18,11 @@
 #include <rte_mbuf.h>
 
 #include "src/dataplane/classify_l2.h"  // L2TruncCtrs, L2TruncBucket
+
+// Forward-declare the DPDK QSBR handle — worker.cpp includes the real
+// header. Keeping this opaque in worker.h avoids pulling rte_rcu_qsbr
+// into every TU that includes WorkerCtx.
+struct rte_rcu_qsbr;
 #include "src/dataplane/classify_l3.h"  // ClassifyL3Verdict (M5 C0)
 #include "src/dataplane/classify_l4.h"  // ClassifyL4Verdict, L4TruncCtrs (M6 C0)
 #include "src/ruleset/ruleset.h"
@@ -79,6 +84,28 @@ struct WorkerCtx {
   // into the PMD.
   TxBurstFn tx_burst_fn = nullptr;
 
+  // M8 C4 — D12 RCU QSBR lifecycle.
+  //
+  // `qs` is the process-wide QSBR handle owned by the reload manager's
+  // caller (main.cpp in production, the integration fixture in tests).
+  // `qsbr_thread_id` is assigned by main.cpp from a monotonic
+  // per-worker counter (0..num_workers-1) and MUST be unique across
+  // concurrently-registered workers.
+  //
+  // Worker contract (see src/dataplane/worker.cpp):
+  //   * on entry: rte_rcu_qsbr_thread_register(qs, tid) +
+  //                rte_rcu_qsbr_thread_online(qs, tid)
+  //   * in loop: rte_rcu_qsbr_quiescent(qs, tid) between bursts so
+  //               the reload manager's synchronize path drains
+  //   * on exit: rte_rcu_qsbr_thread_offline(qs, tid) +
+  //                rte_rcu_qsbr_thread_unregister(qs, tid)
+  //
+  // When `qs == nullptr` the lifecycle is skipped — D12 falls back to
+  // "caller joins workers then immediate free" (unit tests that don't
+  // configure QSBR). Production always sets this.
+  struct rte_rcu_qsbr* qs            = nullptr;
+  unsigned int         qsbr_thread_id = 0;
+
   // Per-worker counters (D3: per-lcore, zero atomics).
   std::uint64_t pkt_multiseg_drop_total = 0;  // D39: nb_segs != 1
   std::uint64_t qinq_outer_only_total   = 0;  // D32: outer S-tag, inner is VLAN TPID
@@ -117,6 +144,28 @@ struct WorkerCtx {
   // implementation MAY use a different counter but spec allows the
   // shared counter so long as no overflow occurs).
   std::uint64_t redirect_dropped_total = 0;
+
+  // M8 C4 — D12 TSAN-visible handshake.
+  //
+  // `rte_eal_mp_wait_lcore()` pthread_join's every worker and that IS
+  // a real happens-before edge — BUT ThreadSanitizer is blind to it:
+  // librte_eal.so isn't instrumented so TSan can't observe DPDK's
+  // internal sync. All of the worker's counter bumps (per-rule
+  // counter rows, WorkerCtx scalar fields) are then read by the main
+  // thread's stats_on_exit emitter, which TSan correctly flags as a
+  // race against the worker's last write.
+  //
+  // `worker_done` closes that gap. The worker issues a release store
+  // as its last instrumented action before returning; the main
+  // thread spin-waits on an acquire load after rte_eal_mp_wait_lcore
+  // before touching any per-lcore counter. The store-release /
+  // load-acquire pair is instrumented (both sides live in this TU,
+  // not in a DPDK .so) so TSan sees the HB edge.
+  //
+  // This is NOT a hot-path atomic (grabli_tsan_hotpath_atomic_antipattern):
+  // it's ONE store per worker lifetime + ONE load per worker lifetime
+  // at shutdown. Zero atomics in the classify/dispatch path per D1.
+  std::atomic<bool> worker_done{false};
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained

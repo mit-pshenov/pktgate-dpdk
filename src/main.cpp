@@ -21,6 +21,7 @@
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_rcu_qsbr.h>  // M8 C4 — D12 process-wide QSBR handle
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
@@ -320,6 +321,38 @@ int main(int argc, char* argv[]) {
             ",\"num_lcores\":" + std::to_string(ruleset->num_lcores) +
             "}").c_str());
 
+  // M8 C4 — D12: allocate the process-wide QSBR handle BEFORE any
+  // worker starts + BEFORE reload::init so every subsequent reload
+  // (C2 bounded synchronize, C4 shutdown synchronize) shares the
+  // same QSBR variable. Workers register on this handle in their
+  // prologue; shutdown() calls rte_rcu_qsbr_check against it before
+  // deleting the current ruleset, giving TSan the happens-before
+  // edge that closes the M4-M7 baseline race.
+  //
+  // `max_threads` sizing: n_workers is the worker count; we also
+  // allow the main thread to register in case a later cycle wants to
+  // sync-from-main. +1 headroom is cheap (per-thread QSBR state is
+  // cacheline-sized).
+  const std::uint32_t qsbr_max_threads =
+      static_cast<std::uint32_t>(n_workers + 1u);
+  size_t qsbr_sz = rte_rcu_qsbr_get_memsize(qsbr_max_threads);
+  void* qsbr_raw =
+      std::aligned_alloc(alignof(std::max_align_t), qsbr_sz);
+  if (qsbr_raw == nullptr) {
+    log_json("{\"error\":\"qsbr_alloc_failed\"}");
+    rte_mempool_free(mp);
+    rte_eal_cleanup();
+    return 1;
+  }
+  auto* qs = static_cast<struct rte_rcu_qsbr*>(qsbr_raw);
+  if (rte_rcu_qsbr_init(qs, qsbr_max_threads) != 0) {
+    log_json("{\"error\":\"qsbr_init_failed\"}");
+    std::free(qsbr_raw);
+    rte_mempool_free(mp);
+    rte_eal_cleanup();
+    return 1;
+  }
+
   // D9 (M8 C1): publish via the reload manager instead of a bare
   // atomic store in main.cpp. The manager owns the single g_active
   // pointer and the reload_mutex (D35); every future publish (the
@@ -333,6 +366,7 @@ int main(int argc, char* argv[]) {
     rp.num_lcores  = num_lcores_for_counters;
     rp.max_entries = cfg.sizing.rules_per_layer_max;
     rp.name_prefix = "pktgate_boot";
+    rp.qs          = qs;  // M8 C4 — D12 shutdown synchronize
     pktgate::ctl::reload::init(rp);
 
     // Hand ownership of the built Ruleset to the manager. The
@@ -342,6 +376,7 @@ int main(int argc, char* argv[]) {
     if (!publish_res.ok) {
       log_json("{\"error\":\"reload_publish_failed\",\"reason\":\"" +
                publish_res.error + "\"}");
+      std::free(qsbr_raw);
       rte_mempool_free(mp);
       rte_eal_cleanup();
       return 1;
@@ -364,6 +399,12 @@ int main(int argc, char* argv[]) {
   // M7 C0: wire the production TX burst function. Unit tests swap
   // this for a spy; production always uses rte_eth_tx_burst.
   worker_ctx.tx_burst_fn = &rte_eth_tx_burst;
+  // M8 C4 — D12 RCU QSBR lifecycle. M3/M4 shipped a single worker,
+  // so thread_id 0 is unique for the lifetime of this process. When
+  // multi-worker launches land (later milestone) the thread_id becomes
+  // a monotonic counter over the RTE_LCORE_FOREACH_WORKER walk.
+  worker_ctx.qs = qs;
+  worker_ctx.qsbr_thread_id = 0;
 
   unsigned worker_lcore = RTE_MAX_LCORE;
   unsigned count = 0;
@@ -408,6 +449,27 @@ int main(int argc, char* argv[]) {
     // ---- Phase 9: shutdown (§6.4) ----
     log_json("{\"event\":\"workers_exit\"}");
     rte_eal_mp_wait_lcore();
+
+    // M8 C4 — D12: close the stats-on-exit race.
+    //
+    // `rte_eal_mp_wait_lcore()` pthread_join's each worker. That's a
+    // real happens-before edge, BUT ThreadSanitizer is blind to it:
+    // librte_eal.so isn't instrumented, so TSan can't observe the
+    // fences DPDK's join emits. Without the explicit acquire load
+    // below, TSan flags the main-thread reads of the per-lcore
+    // counter row (and WorkerCtx scalar fields) in the stats_on_exit
+    // emitter as races against the worker's last writes.
+    //
+    // Worker puts a `worker_done.store(true, release)` as its last
+    // instrumented action before returning; we pair with an acquire
+    // load here. Both atomics live in pktgate-owned TUs so TSan sees
+    // the HB edge directly.
+    //
+    // This is NOT a D1 hot-path atomic: one load per worker lifetime
+    // at shutdown. The classify/dispatch path stays atomic-free.
+    while (!worker_ctx.worker_done.load(std::memory_order_acquire)) {
+      usleep(1000);
+    }
   }
 
   // ---- M4 C8: emit per-rule counter summary for functional tests ---------
@@ -568,13 +630,22 @@ int main(int argc, char* argv[]) {
   }
   log_json("{\"event\":\"ports_stopped\"}");
 
-  // Free ruleset (M8 C1 STUB): shutdown() exchanges g_active → nullptr
-  // and frees the old pointer. C4 will wrap this with
-  // rte_rcu_qsbr_thread_offline / _thread_unregister per worker + a
-  // bounded rte_rcu_qsbr_synchronize to close the M4-M7 TSAN baseline
-  // race between this store and the worker's acquire-load.
+  // M8 C4 — D12: proper shutdown sequence.
+  //
+  // At this point rte_eal_mp_wait_lcore() has already joined every
+  // worker (line 410), so workers have called rte_rcu_qsbr_thread_offline
+  // + _thread_unregister for themselves. reload::shutdown() now does
+  // a bounded rte_rcu_qsbr_synchronize against the process-wide QSBR
+  // handle before deleting the currently-published ruleset. That sync
+  // introduces a happens-before edge visible to TSAN between the
+  // workers' last classify_l{2,3,4} reads and main's delete, closing
+  // the M4-M7 baseline race.
   pktgate::ctl::reload::shutdown();
   log_json("{\"event\":\"ruleset_freed\"}");
+
+  // Free the QSBR handle — after shutdown() returned, no code in the
+  // process references it.
+  std::free(qsbr_raw);
 
   // Free mempool.
   rte_mempool_free(mp);

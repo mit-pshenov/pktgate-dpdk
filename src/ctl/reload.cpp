@@ -57,6 +57,17 @@ namespace {
 // The `g_active` atomic IS the process-wide pointer (D9). It is the
 // ONE atomic the project owns (D1 exception). Never add more.
 // -------------------------------------------------------------------------
+// Default hugepage-budget probe — reports a very large availability
+// so the common case (no tests / production with real hugepages) never
+// hits the gate by accident. Tests that need the gate injected poke a
+// custom probe via `set_budget_probe_for_test`.
+config::HugepageProbe make_default_budget_probe() {
+  return [] {
+    return config::HugepageInfo{/*available_bytes=*/static_cast<std::size_t>(1)
+                                << 40};  // 1 TiB — effectively unlimited.
+  };
+}
+
 // PendingEntry — one {ruleset, token} pair on the pending_free queue.
 // The token was produced by `rte_rcu_qsbr_start(qs)` AFTER the publish
 // exchange (§9.2 D30); each drain attempt polls
@@ -80,6 +91,14 @@ struct ReloadManager {
   bool            initialised = false;
   InitParams      params{};
   std::uint64_t   generation_counter = 0;  // monotonic, feeds name_prefix
+
+  // C4 — D37 budget probe injection point. The integration tests need
+  // to drive the hugepage-budget gate deterministically (the real
+  // /proc-hugepages reader reports whatever the host has at test time,
+  // which is not controllable). Tests poke a lambda here via the
+  // internal test helper below; production and other tests fall back
+  // to the default "bottomless" probe.
+  config::HugepageProbe budget_probe{};
 
   ReloadCounters  counters{};
 
@@ -291,6 +310,68 @@ DeployResult deploy_locked(std::string_view config_json) {
     return out;
   }
 
+  // ---- 2b. D37 validator memory-budget pre-flight (C4) -----------------
+  //
+  // Runs AFTER validate() succeeds but BEFORE compile / build /
+  // populate — the whole point is to catch the "this config cannot
+  // fit" case before we touch hugepages. Three gates, literal reason
+  // strings per §9.2:
+  //
+  //   * expansion_per_rule — one rule expands past kDefaultPerRuleCeiling
+  //   * aggregate          — sum of L4 expansions exceeds sizing cap
+  //   * hugepage_budget    — estimated footprint > available hugepages
+  //
+  // A reject bumps the appropriate sub-reason counter and returns
+  // kValidatorBudget with `budget_reason` populated; `active_ruleset()`
+  // and `active_generation` are UNCHANGED.
+  {
+    // Manager-held budget probe. Defaults to "essentially unlimited"
+    // so the C1/C2/C3 tests that never configured a probe keep their
+    // happy-path semantics. Production would inject a real /proc
+    // reader (C5 / M10 scope); the tests fit everything they need via
+    // inline sizing values.
+    config::HugepageProbe probe = g_.budget_probe
+                                      ? g_.budget_probe
+                                      : make_default_budget_probe();
+
+    config::ValidateResult br = config::validate_budget(cfg, probe);
+    if (std::holds_alternative<config::ValidateError>(br)) {
+      const auto& berr = std::get<config::ValidateError>(br);
+      out.ok = false;
+      out.kind = DeployError::kValidatorBudget;
+      out.error = "validator_budget: " + berr.message;
+      switch (berr.kind) {
+        case config::ValidateError::kBudgetPerRuleExceeded:
+          out.budget_reason = ValidatorBudgetReason::kExpansionPerRule;
+          ++g_.counters.validate_budget_expansion_per_rule;
+          break;
+        case config::ValidateError::kBudgetAggregateExceeded:
+          out.budget_reason = ValidatorBudgetReason::kAggregate;
+          ++g_.counters.validate_budget_aggregate;
+          break;
+        case config::ValidateError::kBudgetHugepage:
+          out.budget_reason = ValidatorBudgetReason::kHugepageBudget;
+          ++g_.counters.validate_budget_hugepage;
+          break;
+        // validate_budget contract (src/config/validator.h §D37): only
+        // the three kBudget* kinds above are emitted. The remaining
+        // enumerators belong to validate() proper and cannot appear
+        // here. Listed explicitly for -Wswitch-enum; fall through to
+        // the safe default classification.
+        case config::ValidateError::kUnresolvedObject:
+        case config::ValidateError::kUnresolvedInterfaceRef:
+        case config::ValidateError::kDuplicateRuleId:
+        case config::ValidateError::kKeyCollision:
+        case config::ValidateError::kInvalidLayerTransition:
+        case config::ValidateError::kUnresolvedTargetPort:
+          out.budget_reason = ValidatorBudgetReason::kAggregate;
+          ++g_.counters.validate_budget_aggregate;
+          break;
+      }
+      return out;
+    }
+  }
+
   // ---- 3. Compile ------------------------------------------------------
   compiler::CompileResult cr = compiler::compile(cfg);
   if (cr.error) {
@@ -368,6 +449,7 @@ DeployResult deploy_locked(std::string_view config_json) {
 
   // ---- 9. Bookkeeping -------------------------------------------
   ++g_.counters.success;
+  g_.counters.active_generation = gen;
   out.ok = true;
   out.kind = DeployError::kOk;
   out.generation = gen;
@@ -393,26 +475,59 @@ void init(const InitParams& params) {
 
 void shutdown() {
   std::lock_guard<std::mutex> lock(g_.reload_mutex);
-  // C1 STUB: free g_active immediately. C4 will add
-  //   1. signal workers to stop
-  //   2. rte_rcu_qsbr_thread_offline + _thread_unregister per worker
-  //   3. rte_rcu_qsbr_synchronize with bounded deadline
-  //   4. then exchange g_active → nullptr and free
+  // C4 — D12 proper shutdown sequence.
   //
-  // For C2/C3 we keep the immediate free in shutdown: the fixture path
-  // either has already joined its fake workers (so QSBR is idle) or
-  // is tearing down an EAL that never had real workers. C4 owns the
-  // real shutdown-sequence fix (D12).
+  // Sequencing assumption: the CALLER has already signalled workers
+  // to stop and joined them (rte_eal_mp_wait_lcore in main.cpp, or
+  // the test fixture's worker.join()). Each worker thread must have
+  // called rte_rcu_qsbr_thread_offline + _thread_unregister for
+  // itself at the bottom of its loop (see src/dataplane/worker.cpp).
+  // Under those preconditions, rte_rcu_qsbr_check returns 1 as soon
+  // as we ask.
+  //
+  // The sync here exists to give TSAN the happens-before edge it
+  // cannot observe from rte_eal_mp_wait_lcore (DPDK's lcore join
+  // uses internal sync that TSan's interceptors don't see). After
+  // a successful rte_rcu_qsbr_check the sync fences in the DPDK
+  // primitive are sufficient for TSAN to conclude "the worker's
+  // read happened-before our delete". This closes the M4-M7
+  // parked baseline race on every functional binary-runner.
+  //
+  // If the QSBR handle is nullptr (no workers, or unit-style fixture
+  // that bypassed the lifecycle) we fall through to the C1 immediate
+  // free — there is nothing to synchronize against.
+  struct rte_rcu_qsbr* const qs = g_.params.qs;
+  const auto deadline =
+      std::chrono::steady_clock::now() + g_.params.shutdown_timeout;
+
   ruleset::Ruleset* rs_old =
       g_.g_active.exchange(nullptr, std::memory_order_acq_rel);
-  if (rs_old) {
-    do_free_ruleset_locked(rs_old);
+
+  if (rs_old != nullptr) {
+    if (qs != nullptr) {
+      const uint64_t tok = rte_rcu_qsbr_start(qs);
+      const int ok = wait_for_quiescent(qs, tok, deadline,
+                                        g_.params.poll_interval);
+      if (ok == 1) {
+        do_free_ruleset_locked(rs_old);
+      } else {
+        // Deadline expired (worker died mid-flight, or somebody forgot
+        // to offline+unregister). Retain in overflow_holder so LSAN
+        // stays clean. WARN, not ERROR — shutdown is best-effort.
+        std::fprintf(stderr,
+                     "{\"level\":\"warn\",\"event\":\"shutdown_sync_timeout\","
+                     "\"note\":\"ruleset retained in overflow_holder\"}\n");
+        g_.overflow_holder.emplace_back(rs_old);
+      }
+    } else {
+      // No QSBR — caller guarantees no concurrent readers.
+      do_free_ruleset_locked(rs_old);
+    }
   }
-  // C3 D36 — drain any pending_free entries and the overflow_holder.
-  // The fixture has already un-frozen its workers by this point, so
-  // they have reported quiescent; we can free everything directly
-  // without re-polling. (Bypassing the drain helper is fine for
-  // teardown — C4 will add the proper final-synchronize.)
+
+  // C3 D36 — drain pending_free entries. After the synchronize above
+  // every previously-queued token has necessarily expired (grace
+  // period is cumulative), so we can free unconditionally.
   for (std::size_t i = 0; i < g_.pending_depth; ++i) {
     do_free_ruleset_locked(g_.pending_free[i].rs);
     g_.pending_free[i] = PendingEntry{};
@@ -430,6 +545,7 @@ void shutdown() {
   g_.params = {};
   g_.generation_counter = 0;
   g_.counters = {};
+  g_.budget_probe = {};
 }
 
 bool is_initialised() {
@@ -493,6 +609,7 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs) {
   do_free_ruleset_locked(rs_old);
 
   ++g_.counters.success;
+  g_.counters.active_generation = gen;
   out.ok = true;
   out.kind = DeployError::kOk;
   out.generation = gen;
@@ -510,6 +627,11 @@ ReloadCounters counters_snapshot() {
 
 std::atomic<ruleset::Ruleset*>* g_active_ptr() {
   return &g_.g_active;
+}
+
+void set_budget_probe_for_test(config::HugepageProbe probe) {
+  std::lock_guard<std::mutex> lock(g_.reload_mutex);
+  g_.budget_probe = std::move(probe);
 }
 
 }  // namespace pktgate::ctl::reload

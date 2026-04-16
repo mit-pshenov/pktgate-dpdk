@@ -85,6 +85,7 @@
 #include <string>
 #include <string_view>
 
+#include "src/config/validator.h"  // HugepageProbe type for test helper
 #include "src/ruleset/ruleset.h"
 
 // Opaque forward declaration — we take a `rte_rcu_qsbr*` but do not
@@ -102,12 +103,24 @@ namespace pktgate::ctl::reload {
 // model (design.md §9.2). C5 will surface these as Prometheus labels.
 enum class DeployError {
   kOk = 0,
-  kParse,          // JSON syntax or schema mismatch
-  kValidate,       // semantic validation failed
-  kCompile,        // compiler rejected the ruleset
-  kBuildEal,       // EAL table population failed (rte_hash/fib)
-  kReloadTimeout,  // C2 — RCU synchronize deadline expired (D30/D12)
-  kInternal,       // programmer error / not-initialized
+  kParse,              // JSON syntax or schema mismatch
+  kValidate,           // semantic validation failed
+  kValidatorBudget,    // C4 — D37 memory-budget pre-flight rejected the config
+  kCompile,            // compiler rejected the ruleset
+  kBuildEal,           // EAL table population failed (rte_hash/fib)
+  kReloadTimeout,      // C2 — RCU synchronize deadline expired (D30/D12)
+  kInternal,           // programmer error / not-initialized
+};
+
+// D37 reject reasons — spec literal strings (design §9.2).
+// Carried on DeployResult when `kind == kValidatorBudget` so the caller
+// can route to the correct sub-reason telemetry counter and emit an
+// operator-visible log line.
+enum class ValidatorBudgetReason {
+  kNone = 0,
+  kExpansionPerRule,  // "expansion_per_rule" — one rule exceeds the per-rule ceiling
+  kAggregate,         // "aggregate"          — sum of expanded entries exceeds total cap
+  kHugepageBudget,    // "hugepage_budget"    — projected arena size > available hugepages
 };
 
 // DeployResult — one deploy() outcome.
@@ -120,6 +133,8 @@ struct DeployResult {
   DeployError kind = DeployError::kInternal;
   std::string error;
   std::uint64_t generation = 0;
+  // C4 — populated when kind == kValidatorBudget. `kNone` otherwise.
+  ValidatorBudgetReason budget_reason = ValidatorBudgetReason::kNone;
 };
 
 // -------------------------------------------------------------------------
@@ -157,6 +172,23 @@ struct ReloadCounters {
   std::uint64_t pending_depth = 0;
   std::uint64_t pending_full = 0;
   std::uint64_t overflow_log_total = 0;
+
+  // C4 — D37 validator budget pre-flight sub-reason counters. Each
+  // bumps exactly once per deploy() that rejects on its respective
+  // gate. On a validator-budget reject the publish exchange DOES NOT
+  // happen — `active_ruleset()` is unchanged, `active_generation`
+  // stays put.
+  std::uint64_t validate_budget_expansion_per_rule = 0;
+  std::uint64_t validate_budget_aggregate          = 0;
+  std::uint64_t validate_budget_hugepage           = 0;
+
+  // C4 — monotonic "generation of currently published ruleset". Only
+  // bumps on a SUCCESSFUL exchange; sticky across validator rejects,
+  // parse errors, timeouts (timeout still publishes, so the publish
+  // generation is the one that advances — but `success` is the
+  // contract visible in tests). X1.6/X1.7 check this as the
+  // "active_generation unchanged on reject" invariant.
+  std::uint64_t active_generation = 0;
 };
 
 // -------------------------------------------------------------------------
@@ -194,6 +226,15 @@ struct InitParams {
   struct rte_rcu_qsbr*      qs              = nullptr;
   std::chrono::milliseconds reload_timeout  = std::chrono::milliseconds(500);
   std::chrono::microseconds poll_interval   = std::chrono::microseconds(100);
+
+  // C4 — upper bound on how long shutdown() is willing to poll
+  // rte_rcu_qsbr_check after the caller has already joined its
+  // workers. Well under this in practice (workers offline +
+  // unregistered => check returns 1 immediately). A deadline exists
+  // only so we don't block indefinitely if a worker died mid-flight
+  // without cleanly un-registering.
+  std::chrono::milliseconds shutdown_timeout =
+      std::chrono::milliseconds(2000);
 };
 
 // Initialise the reload manager. Must be called once per process
@@ -203,8 +244,28 @@ struct InitParams {
 void init(const InitParams& params);
 
 // Shutdown the reload manager. Frees the current g_active (if any)
-// and resets all internal state. C1 STUB — C4 fills proper
-// RCU offline/unregister + bounded synchronize sequencing.
+// and resets all internal state.
+//
+// C4 — D12 shutdown sequence.
+//   1. CALLER responsibility: signal workers to stop and JOIN them
+//      (rte_eal_mp_wait_lcore / std::thread::join). Workers MUST
+//      have called rte_rcu_qsbr_thread_offline +
+//      rte_rcu_qsbr_thread_unregister for themselves before exit
+//      (see src/dataplane/worker.cpp).
+//   2. shutdown() takes a start-token and polls
+//      rte_rcu_qsbr_check(qs, token, wait=false) against a bounded
+//      deadline (`shutdown_timeout`, default 2 s) so any straggling
+//      grace period drains before we delete the currently-published
+//      ruleset. If the deadline expires, the ruleset is pushed onto
+//      `overflow_holder` (LSAN-clean retention) and a single WARN log
+//      is emitted. Not blocking indefinitely is a design invariant.
+//   3. atomic_exchange(g_active, nullptr) + delete if drained; push
+//      onto overflow_holder otherwise.
+//   4. Drain pending_free the same way; anything still pending after
+//      the deadline joins overflow_holder.
+//
+// After shutdown() returns, the caller may destroy the QSBR storage
+// (only the caller knows when it allocated it).
 void shutdown();
 
 // Return true if the manager has been initialised (for defensive
@@ -257,5 +318,11 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs);
 // Internal accessor for the structural U6.43b test (the test checks
 // that this symbol exists and is reachable).
 std::atomic<ruleset::Ruleset*>* g_active_ptr();
+
+// C4 — test helper: inject a deterministic HugepageProbe lambda for
+// the D37 gate-3 tests (X1.6.HugepageBudget, X1.7.HugepageBudget).
+// Passing an empty std::function resets the probe to the default
+// "bottomless" probe used in production.
+void set_budget_probe_for_test(config::HugepageProbe probe);
 
 }  // namespace pktgate::ctl::reload
