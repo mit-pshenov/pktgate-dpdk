@@ -313,12 +313,16 @@ rewriting its scope per the chosen option.
 *Origin: M5 C2 worker stop-and-report 2026-04-15 → consultant
 claim verification → P10 promotion + C2 blocking.*
 
-### C3 silent gap: `cfg.fragment_policy` → `rs.fragment_policy` never wired
+### C3 silent gap: `cfg.fragment_policy` → `rs.fragment_policy` never wired — RESOLVED by C3b `95ceea7`
 
 **Surfaced 2026-04-15 by M5 C3 worker (`559c5b3`).** Not a C3
 defect — a pre-existing compiler/builder hole exposed now that
 `classify_l3` actually consumes `rs->fragment_policy` at
-runtime.
+runtime. **Resolved 2026-04-16 by M5 C3b (`95ceea7`):**
+`CompileResult.fragment_policy` added to `compiler.h`, set in
+`object_compiler.cpp::compile()`, copied in both
+`build_ruleset()` overloads in `builder.cpp`. U6.22 test
+(FragmentPolicyWired) confirms kDrop/kAllow/kL3Only propagation.
 
 **The hole.** `config::Config.fragment_policy` is parsed
 correctly by M1, but neither `compile_ruleset` nor
