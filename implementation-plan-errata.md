@@ -498,6 +498,75 @@ until the next batch revision.*
 
 ---
 
-*Last updated: 2026-04-16 (scope trim — §M10 Prom-only, §M11
-inotify-only, §M12 deferred). Add new items with date + origin
-cycle at append time.*
+## §M7 — Action dispatch (lines 434-467)
+
+### Compiler→builder lowering gap: CompiledAction drops dscp/pcp/redirect_port
+
+**CRITICAL — same D41 silent pipeline gap class as M2 (compound builders)
+and M5 C3 (fragment_policy).**
+
+`compiler::CompiledAction` (compiler.h:83-88) only carries four fields:
+`rule_id`, `counter_slot`, `verb`, `execution_tier`. The `resolve_verb`
+visitor in `object_compiler.cpp:53-68` extracts only the verb enum from the
+`config::RuleAction` variant, discarding all action-specific payload
+(`dscp`, `pcp` from `ActionTag`; `role_name` → port_idx from
+`ActionTargetPort`; rate fields from `ActionRateLimit`).
+
+`builder.cpp` `copy_actions` (two overloads, lines 43-64 and 160-181)
+copies from `CompiledAction` to `action::RuleAction` and **hardcodes**:
+```
+d.dscp = 0; d.pcp = 0; d.redirect_port = 0xFFFF;
+d.mirror_port = 0xFFFF; d.rl_index = 0;
+```
+
+**Production impact:**
+- **TAG** actions are no-op — DSCP stays 0, PCP stays 0.
+- **REDIRECT** silently drops every packet — 0xFFFF sentinel triggers
+  the "invalid port" guard in `apply_redirect`.
+- RL stub is benign for M7 (always-allow, index not consulted).
+
+**Why unit tests passed (C1, C2):** U6.48-U6.55 construct
+`action::RuleAction` directly in the test body (`tag.dscp = 46;`
+`redir.redirect_port = 1;`), completely bypassing compiler→builder.
+Exactly the same pattern as M5 C3 (`SetUp` writes `rs.fragment_policy`
+directly).
+
+### `cfg.default_behavior` → `rs.default_action` never lowered
+
+`config::Config.default_behavior` (model.h:348, parsed in parser.cpp)
+is never read by the compiler or builder. `Ruleset.default_action`
+(ruleset.h:125) stays at its POD default `0` (= ALLOW) regardless of
+config. If operator sets `default_behavior: drop`, unmatched packets
+are silently allowed.
+
+Neither `CompileResult` nor `builder.cpp` has any reference to
+`default_behavior` or `default_action` (verified by grep). Wiring
+is needed alongside the action-field lowering.
+
+### Resolution: C2b retrofit before C3
+
+Insert a **C2b retrofit** cycle between C2 and C3 in the M7 plan:
+
+1. `CompiledAction` += `dscp` (uint8_t), `pcp` (uint8_t),
+   `redirect_port` (uint16_t).
+2. `object_compiler.cpp` `compile_layer`: `std::visit` on
+   `rule.action` variant to fill new CompiledAction fields (TAG →
+   dscp/pcp, REDIRECT → port from `ActionTargetPort.role_name`
+   resolved through interface_roles, other verbs → leave defaults).
+3. Both `copy_actions` lambdas in `builder.cpp`: copy `s.dscp`,
+   `s.pcp`, `s.redirect_port` instead of hardcoding zeros/sentinel.
+4. Wire `cfg.default_behavior` → `rs.default_action`: either via
+   `CompileResult.default_action` + builder copy (consistent with
+   fragment_policy pattern), or direct wire in main.cpp after
+   `build_ruleset` returns.
+5. Unit test: config → compile → build_ruleset → assert
+   `RuleAction.dscp/pcp/redirect_port` roundtrip per verb type +
+   `rs.default_action` matches config.
+
+*Origin: M7 C2 closure `ae926ef` 2026-04-16 → supervisor CRITICAL STOP
+→ consultant verification of full lowering path. Third D41 instance.*
+
+---
+
+*Last updated: 2026-04-16 (§M7 compiler→builder lowering gap + scope
+trim). Add new items with date + origin cycle at append time.*
