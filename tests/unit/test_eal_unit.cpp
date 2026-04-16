@@ -27,6 +27,7 @@
 #include "src/compiler/rule_compiler.h"
 #include "src/config/model.h"
 #include "src/config/sizing.h"
+#include "src/dataplane/action_dispatch.h"
 #include "src/dataplane/classify_l2.h"
 #include "src/dataplane/classify_l3.h"
 #include "src/dataplane/classify_l4.h"
@@ -8507,6 +8508,255 @@ TEST_F(ClassifyL3FragPolicyMatrixTest,
 
   rte_pktmbuf_free(ff.m);
   rte_mempool_free(ff.mp);
+}
+
+// =========================================================================
+// M7 C0 — apply_action dispatch tests (U6.44 — U6.47).
+//
+// These four tests cover the D25 default-arm backstops and the
+// TERMINAL_PASS → default_action resolution path.  The ALLOW "TX
+// path" is verified via a spy tx_burst_fn hook installed on the
+// WorkerCtx — EalFixture has no real ports, so we record the mbuf
+// instead of calling into a PMD.
+// =========================================================================
+
+namespace action_dispatch_detail {
+
+// Spy state for the TX hook.  A test installs a pointer to this
+// struct in ctx.tx_burst_fn and checks the recorded mbuf + count
+// after apply_action runs.  The hook ALWAYS claims success (returns
+// 1 for a 1-packet call), so the caller keeps ownership semantics
+// consistent with production (sent == nb_pkts → caller does not
+// free).  A "TX fails" variant returns 0 to exercise the
+// apply_action-frees-on-failure arm if ever needed.
+struct TxSpy {
+  std::uint16_t  calls       = 0;
+  std::uint16_t  last_port   = 0xFFFFu;
+  rte_mbuf*      last_mbuf   = nullptr;
+  std::uint16_t  return_sent = 1;   // success by default
+};
+
+inline TxSpy* g_tx_spy = nullptr;
+
+// Thin free function matching TxBurstFn.  Forwards to g_tx_spy.
+// Written as a plain function (no captures) so it fits the raw
+// function pointer signature.
+inline std::uint16_t spy_tx_burst(std::uint16_t port_id,
+                                  std::uint16_t /*queue_id*/,
+                                  rte_mbuf** tx_pkts,
+                                  std::uint16_t nb_pkts) {
+  if (g_tx_spy == nullptr || tx_pkts == nullptr || nb_pkts == 0) {
+    return 0;
+  }
+  g_tx_spy->calls++;
+  g_tx_spy->last_port = port_id;
+  g_tx_spy->last_mbuf = tx_pkts[0];
+  return g_tx_spy->return_sent;
+}
+
+}  // namespace action_dispatch_detail
+
+class ApplyActionTest : public EalFixture {};
+
+// -------------------------------------------------------------------------
+// U6.44 — D25 outer-switch default arm (forged Disposition).
+//
+// Build a WorkerCtx with the spy TX hook, allocate an mbuf, invoke
+// apply_action with a raw integer cast to Disposition that is outside
+// the enum range.  The outer default arm must fire:
+//   - dispatch_unreachable_total becomes 1
+//   - the mbuf is freed (mempool in_use drops back to 0)
+//   - TX hook is NOT called
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_44_OuterDefaultArmBumpsCounter) {
+  using namespace action_dispatch_detail;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_44_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  rs.default_action = 0;  // ALLOW — must NOT reach TX: outer default fires first
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  // Cast an out-of-range integer to Disposition. C++20 permits this;
+  // the switch's default arm must handle it per D25.
+  const auto bogus = static_cast<dataplane::Disposition>(99);
+  dataplane::apply_action(&ctx, rs, m, bogus, nullptr);
+
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 1u)
+      << "U6.44: D25 outer default arm must bump dispatch_unreachable_total";
+  EXPECT_EQ(spy.calls, 0u)
+      << "U6.44: TX hook must NOT be called from the default arm";
+  // Mbuf freed → mempool in_use count returns to its starting value.
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before)
+      << "U6.44: D25 outer default arm must free the mbuf";
+
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.45 — D25 inner-switch default arm (forged ActionVerb).
+//
+// Build a RuleAction with verb = 99 (out of the ActionVerb enum
+// range).  Dispatch kMatch with this action.  The inner default arm
+// must fire:
+//   - dispatch_unreachable_total becomes 1
+//   - the mbuf is freed
+//   - TX hook is NOT called
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_45_InnerDefaultArmBumpsCounter) {
+  using namespace action_dispatch_detail;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_45_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  action::RuleAction forged{};
+  forged.rule_id = 4500;
+  forged.verb    = 99;  // out of ActionVerb enum range
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kMatch,
+                          &forged);
+
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 1u)
+      << "U6.45: D25 inner default arm must bump dispatch_unreachable_total";
+  EXPECT_EQ(spy.calls, 0u)
+      << "U6.45: TX hook must NOT be called from the inner default arm";
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before)
+      << "U6.45: D25 inner default arm must free the mbuf";
+
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.46 — TERMINAL_PASS + default_action = ALLOW → stage_tx.
+//
+// Empty ruleset (default_action = 0 / ALLOW).  apply_action on
+// kTerminalPass must transmit via the spy TX hook; the mbuf must NOT
+// be freed (the spy claims sent == 1 → caller keeps ownership).
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_46_TerminalPassAllowCallsTxBurst) {
+  using namespace action_dispatch_detail;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_46_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  const unsigned in_use_after_alloc = rte_mempool_in_use_count(mp);
+  ASSERT_EQ(in_use_after_alloc, in_use_before + 1u);
+
+  TxSpy spy;
+  spy.return_sent = 1;   // success — caller does not free
+  g_tx_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  rs.default_action = 0;  // ALLOW
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 7;    // arbitrary; spy captures it
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kTerminalPass,
+                          nullptr);
+
+  EXPECT_EQ(spy.calls, 1u)
+      << "U6.46: TERMINAL_PASS + default=ALLOW must call TX hook once";
+  EXPECT_EQ(spy.last_port, 7u)
+      << "U6.46: TX hook must be called with ctx->tx_port_id";
+  EXPECT_EQ(spy.last_mbuf, m)
+      << "U6.46: TX hook must receive the passed mbuf";
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u)
+      << "U6.46: no default arm should fire on kTerminalPass";
+  // Spy returned 1 (sent) → apply_action did NOT free → mempool still
+  // shows the mbuf as in-use.  We free it here to keep the mempool clean.
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_after_alloc)
+      << "U6.46: successful TX must NOT free the mbuf";
+
+  rte_pktmbuf_free(m);
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.47 — TERMINAL_PASS + default_action = DROP → free.
+//
+// Empty ruleset with default_action = 1 (DROP).  apply_action on
+// kTerminalPass must free the mbuf and not call the TX hook.
+// -------------------------------------------------------------------------
+TEST_F(ApplyActionTest, U6_47_TerminalPassDropFreesMbuf) {
+  using namespace action_dispatch_detail;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_47_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxSpy spy;
+  g_tx_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  rs.default_action = 1;  // DROP
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst;
+
+  dataplane::apply_action(&ctx, rs, m, dataplane::Disposition::kTerminalPass,
+                          nullptr);
+
+  EXPECT_EQ(spy.calls, 0u)
+      << "U6.47: TERMINAL_PASS + default=DROP must NOT call TX hook";
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u)
+      << "U6.47: no default arm should fire on kTerminalPass + DROP";
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before)
+      << "U6.47: TERMINAL_PASS + default=DROP must free the mbuf";
+
+  g_tx_spy = nullptr;
+  rte_mempool_free(mp);
 }
 
 }  // namespace pktgate::test

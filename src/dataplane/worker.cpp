@@ -21,6 +21,7 @@
 #include <rte_mbuf.h>
 
 #include "src/action/action.h"
+#include "src/dataplane/action_dispatch.h"
 #include "src/dataplane/classify_entry.h"
 #include "src/dataplane/classify_l2.h"
 #include "src/dataplane/classify_l3.h"
@@ -201,43 +202,62 @@ int worker_main(void* arg) {
                               &ctx->pkt_truncated_l4);
               switch (l4v) {
                 case ClassifyL4Verdict::kTerminalPass:
-                  // L4 miss or SKIP_L4 or ALLOW rule. TX path lands
-                  // in M7; for now, free.
-                  rte_pktmbuf_free(bufs[i]);
+                  // L4 miss or SKIP_L4 or ALLOW rule. M7 C0: dispatch
+                  // via default_action (ALLOW → TX, DROP → free).
+                  apply_action(ctx, *ctx->ruleset, bufs[i],
+                               Disposition::kTerminalPass, nullptr);
                   break;
                 case ClassifyL4Verdict::kTerminalDrop:
-                  // D31 l4 truncation or L4 DROP rule. Free.
-                  rte_pktmbuf_free(bufs[i]);
+                  // D31 l4 truncation or L4 DROP rule.
+                  apply_action(ctx, *ctx->ruleset, bufs[i],
+                               Disposition::kTerminalDrop, nullptr);
                   break;
                 case ClassifyL4Verdict::kMatch: {
-                  // L4 compound entry matched. apply_action lands in
-                  // M7; for now, free.
-                  // M6 C5: bump L4 per-rule counter on match.
+                  // L4 compound entry matched. M6 C5: bump L4
+                  // per-rule counter. M7 C0: dispatch via apply_action
+                  // with the matched RuleAction*.
                   const std::uint16_t l4_act_idx = dyn->verdict_action_idx;
+                  const action::RuleAction* act = nullptr;
                   if (l4_act_idx != kNoMatchSentinel) {
                     bump_l4_counter(*ctx->ruleset, l4_act_idx, lcore_id);
+                    if (ctx->ruleset->l4_actions &&
+                        l4_act_idx < ctx->ruleset->n_l4_rules) {
+                      act = &ctx->ruleset->l4_actions[l4_act_idx];
+                    }
                   }
-                  rte_pktmbuf_free(bufs[i]);
+                  if (act != nullptr) {
+                    apply_action(ctx, *ctx->ruleset, bufs[i],
+                                 Disposition::kMatch, act);
+                  } else {
+                    // Defensive: kMatch without a resolvable action.
+                    apply_action(ctx, *ctx->ruleset, bufs[i],
+                                 Disposition::kTerminalDrop, nullptr);
+                  }
                   break;
                 }
               }
               break;
             }
             case ClassifyL3Verdict::kTerminalPass:
-              // Final allow at L3 (e.g. FRAG_ALLOW in C3). TX path
-              // lands in a later milestone; for now, free.
-              rte_pktmbuf_free(bufs[i]);
+              // Final allow at L3 (e.g. FRAG_ALLOW in C3, L3 allow
+              // rule with no L4 follow-up). M7 C0: dispatch via
+              // default_action (ALLOW → TX, DROP → free).
+              apply_action(ctx, *ctx->ruleset, bufs[i],
+                           Disposition::kTerminalPass, nullptr);
               break;
             case ClassifyL3Verdict::kTerminalDrop:
               // Final drop at L3 (truncation sentinel, IHL reject,
-              // fragment drop, L3 DROP rule). Free the mbuf.
-              rte_pktmbuf_free(bufs[i]);
+              // fragment drop, L3 DROP rule).
+              apply_action(ctx, *ctx->ruleset, bufs[i],
+                           Disposition::kTerminalDrop, nullptr);
               break;
           }
           break;
         }
         case ClassifyL2Verdict::kDrop:
-          rte_pktmbuf_free(bufs[i]);
+          // M7 C0: L2 DROP is a terminal drop disposition.
+          apply_action(ctx, *ctx->ruleset, bufs[i],
+                       Disposition::kTerminalDrop, nullptr);
           break;
       }
     }

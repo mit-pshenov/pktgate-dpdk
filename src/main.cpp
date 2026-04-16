@@ -318,9 +318,14 @@ int main(int argc, char* argv[]) {
   // M3: single worker on the first available worker lcore.
   pktgate::dataplane::WorkerCtx worker_ctx{};
   worker_ctx.port_id = port_ids[0];
+  // M7 C0: egress port for ALLOW / TAG / TERMINAL_PASS-allow.
+  worker_ctx.tx_port_id = port_ids[1];
   worker_ctx.queue_id = 0;
   worker_ctx.running = &pktgate::ctl::g_running;
   worker_ctx.ruleset = ruleset.get();  // M4 C1: wire active Ruleset
+  // M7 C0: wire the production TX burst function. Unit tests swap
+  // this for a spy; production always uses rte_eth_tx_burst.
+  worker_ctx.tx_burst_fn = &rte_eth_tx_burst;
 
   unsigned worker_lcore = RTE_MAX_LCORE;
   unsigned count = 0;
@@ -493,7 +498,12 @@ int main(int argc, char* argv[]) {
                   ",\"pkt_truncated_l4\":" +
                   std::to_string(worker_ctx.pkt_truncated_l4[
                       static_cast<std::size_t>(
-                          pktgate::dataplane::L4TruncBucket::kL4)]) + "}}";
+                          pktgate::dataplane::L4TruncBucket::kL4)]) +
+                  // M7 C0: D25 runtime backstop. Must stay 0 across
+                  // the full suite (X2.9 simplified form).
+                  ",\"dispatch_unreachable_total\":" +
+                  std::to_string(worker_ctx.dispatch_unreachable_total) +
+                  "}}";
     log_json(stats_json);
   }
 
