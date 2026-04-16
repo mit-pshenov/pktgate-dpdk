@@ -5913,4 +5913,705 @@ TEST_F(ClassifyL3Ipv6CornerTest, C3_21_FirstFragInnerNh253_SkipL4) {
   rte_mempool_free(ff.mp);
 }
 
+// =========================================================================
+// M5 C9 — Fragment policy matrix (C5.1–C5.16)
+//
+// 16 tests exercising the D17 fragment_policy × v4/v6 × first/nonfirst
+// combinatorial matrix against the existing classify_l3 implementation
+// (C3 v4 + C6 v6). No new src/ code — test-only cycle.
+//
+// Covers: D17, D27, D40, D21 cliff
+//
+// Key M5 adaptation: classify_l4 does NOT exist yet (M6). Tests that in
+// corner.md assert L4 behavior are adapted to assert what classify_l3
+// actually returns per the M5 C9 scope adaptation notes.
+// =========================================================================
+
+class ClassifyL3FragPolicyMatrixTest : public EalFixture {};
+
+// -------------------------------------------------------------------------
+// C5.1 — v4 first fragment, l3_only, L3 miss
+//
+// First fragment (MF=1, offset=0). Under l3_only, first fragment is NOT
+// skipped — classify_l3 treats it normally. No L3 rules → null FIB →
+// kNextL4 (L4 can still run on first fragment).
+// No frag counters bumped (first frag under l3_only is pass-through).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_1_V4FirstL3OnlyMiss) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto ff = build_ipv4_frame("c5_1_pool", 0x0A010203u);  // 10.1.2.3
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/true, /*frag_off_units=*/0);  // first frag
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C5.1: first frag under l3_only + FIB miss → kNextL4 "
+         "(first frag carries L4 header, not skipped)";
+  auto* dyn = eal::mbuf_dynfield(ff.m);
+  EXPECT_EQ(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.1: first frag must NOT set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C5.1: no skip counter on first frag";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C5.1: no drop counter on first frag under l3_only";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.2 — v4 first fragment, l3_only, L3 hit (drop rule)
+//
+// First fragment with a populated FIB containing a drop rule matching the
+// dst prefix. First frag under l3_only is NOT skipped → FIB hit → drop
+// action → kTerminalDrop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_2_V4FirstL3OnlyL3HitDrop) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+
+  // Filler rule at action_idx=0 (avoid C1b zero-packed entry ambiguity).
+  SubnetObject filler;
+  filler.name = "net_filler_c5_2";
+  filler.cidrs.push_back(Cidr4{0xAC100000, 12});  // 172.16.0.0/12
+  cfg.objects.subnets.push_back(std::move(filler));
+
+  // Target: drop rule on 10.0.0.0/8 at action_idx=1.
+  SubnetObject target;
+  target.name = "net_target_c5_2";
+  target.cidrs.push_back(Cidr4{0x0A000000, 8});   // 10.0.0.0/8
+  cfg.objects.subnets.push_back(std::move(target));
+
+  auto& r_filler = append_rule(cfg.pipeline.layer_3, 5201, ActionAllow{});
+  r_filler.dst_subnet = SubnetRef{"net_filler_c5_2"};
+  auto& r_target = append_rule(cfg.pipeline.layer_3, 5202, ActionDrop{});
+  r_target.dst_subnet = SubnetRef{"net_target_c5_2"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  rs.fragment_policy = dataplane::kFragL3Only;
+  EalPopulateParams params;
+  params.name_prefix = "c5_2";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v4_fib, nullptr);
+
+  auto ff = build_ipv4_frame("c5_2_pool", 0x0A010203u);  // matches 10/8
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/true, /*frag_off_units=*/0);  // first frag
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C5.2: first frag under l3_only + L3 drop-rule hit → kTerminalDrop";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C5.2: L3 rule drop is NOT a fragment-policy drop — no D40 frag counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.3 — v4 first fragment, l3_only, L4 rule would hit (M6 scope)
+//
+// First fragment under l3_only, no L3 rules. classify_l3 returns kNextL4
+// (first frag, no L3 match). L4 rule matching is M6.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_3_V4FirstL3OnlyL4RuleHit) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // 14 + 20 + 8 B UDP payload = 42 B
+  auto cf = build_corner_frame("c5_3_pool", 42);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;  // version=4, IHL=5
+  cf.pkt[23] = 17;    // proto=UDP
+  // First fragment: MF=1, offset=0
+  cf.pkt[20] = 0x20;  cf.pkt[21] = 0x00;
+  // UDP dport=53 at offset 36
+  cf.pkt[36] = 0x00;  cf.pkt[37] = 0x35;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C5.3: first frag under l3_only + no L3 match → kNextL4 (L4 rule is M6)";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_EQ(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.3: first frag must NOT set SKIP_L4";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.4 — v4 non-first fragment, l3_only, no rules
+//
+// SKIP_L4 + pkt_frag_skipped_total_v4 += 1, FIB miss → kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_4_V4NonFirstL3OnlyNoRules) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto ff = build_ipv4_frame("c5_4_pool", 0x0A010203u);
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/false, /*frag_off_units=*/100);  // non-first
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.4: non-first frag + l3_only + no rules → kTerminalPass (D21 cliff)";
+  auto* dyn = eal::mbuf_dynfield(ff.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.4: non-first frag must set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C5.4: pkt_frag_skipped_total_v4 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C5.4: no drop counter bleed";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.5 — v4 non-first fragment, l3_only, L3 hit (drop rule)
+//
+// SKIP_L4 + pkt_frag_skipped_total_v4 += 1. FIB hit with drop action →
+// kTerminalDrop (L3 drop wins regardless of SKIP_L4).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_5_V4NonFirstL3OnlyL3HitDrop) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+
+  SubnetObject filler;
+  filler.name = "net_filler_c5_5";
+  filler.cidrs.push_back(Cidr4{0xAC100000, 12});
+  cfg.objects.subnets.push_back(std::move(filler));
+
+  SubnetObject target;
+  target.name = "net_target_c5_5";
+  target.cidrs.push_back(Cidr4{0x0A000000, 8});
+  cfg.objects.subnets.push_back(std::move(target));
+
+  auto& r_filler = append_rule(cfg.pipeline.layer_3, 5501, ActionAllow{});
+  r_filler.dst_subnet = SubnetRef{"net_filler_c5_5"};
+  auto& r_target = append_rule(cfg.pipeline.layer_3, 5502, ActionDrop{});
+  r_target.dst_subnet = SubnetRef{"net_target_c5_5"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value());
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  rs.fragment_policy = dataplane::kFragL3Only;
+  EalPopulateParams params;
+  params.name_prefix = "c5_5";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << res.error;
+  ASSERT_NE(rs.l3_v4_fib, nullptr);
+
+  auto ff = build_ipv4_frame("c5_5_pool", 0x0A010203u);  // matches 10/8
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/false, /*frag_off_units=*/100);  // non-first
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C5.5: non-first frag + l3_only + L3 drop-rule hit → kTerminalDrop";
+  auto* dyn = eal::mbuf_dynfield(ff.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.5: non-first frag must set SKIP_L4 even on L3 drop path";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C5.5: pkt_frag_skipped_total_v4 must be 1 (set before FIB lookup)";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.6 — v4 non-first fragment, l3_only, L4 rule would hit
+//
+// L4 is skipped due to SKIP_L4. FIB miss → kTerminalPass. The L4 rule
+// does NOT fire (M6 scope anyway; SKIP_L4 guarantees skip).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_6_V4NonFirstL3OnlyL4RuleWouldHit) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto ff = build_ipv4_frame("c5_6_pool", 0x0A010203u);
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/false, /*frag_off_units=*/100);  // non-first
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.6: non-first frag + l3_only + L3 miss → kTerminalPass "
+         "(L4 rule cannot fire — SKIP_L4 latched)";
+  auto* dyn = eal::mbuf_dynfield(ff.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.6: SKIP_L4 must be set, preventing L4 dispatch";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C5.6: pkt_frag_skipped_total_v4 must be 1";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.7 — v4 first fragment, drop policy
+//
+// FRAG_DROP → pkt_frag_dropped_total_v4 += 1 + kTerminalDrop.
+// First fragment IS dropped under drop policy.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_7_V4FirstDrop) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragDrop;
+
+  auto ff = build_ipv4_frame("c5_7_pool", 0x0A010203u);
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/true, /*frag_off_units=*/0);  // first frag
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C5.7: first frag under drop → kTerminalDrop";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 1u)
+      << "C5.7: pkt_frag_dropped_total_v4 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C5.7: no skip counter bleed";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.8 — v4 non-first fragment, drop policy
+//
+// Same as C5.7 — pkt_frag_dropped_total_v4 += 1 + kTerminalDrop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_8_V4NonFirstDrop) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragDrop;
+
+  auto ff = build_ipv4_frame("c5_8_pool", 0x0A010203u);
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/false, /*frag_off_units=*/100);  // non-first
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C5.8: non-first frag under drop → kTerminalDrop";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 1u)
+      << "C5.8: pkt_frag_dropped_total_v4 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C5.8: no skip counter bleed";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.9 — v4 first fragment, allow policy
+//
+// FRAG_ALLOW → kTerminalPass. No counters bumped (allow passes silently).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_9_V4FirstAllow) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragAllow;
+
+  auto ff = build_ipv4_frame("c5_9_pool", 0x0A010203u);
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/true, /*frag_off_units=*/0);  // first frag
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.9: first frag under allow → kTerminalPass";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C5.9: allow must not bump drop counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C5.9: allow must not bump skip counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.10 — v4 non-first fragment, allow policy
+//
+// Same → kTerminalPass. No counters.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_10_V4NonFirstAllow) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragAllow;
+
+  auto ff = build_ipv4_frame("c5_10_pool", 0x0A010203u);
+  ASSERT_NE(ff.m, nullptr);
+  set_frag_word(ff.pkt, /*mf=*/false, /*frag_off_units=*/100);  // non-first
+  set_dyn_for_ipv4(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.10: non-first frag under allow → kTerminalPass";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C5.10: allow must not bump drop counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C5.10: allow must not bump skip counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.11 — v6 first fragment, l3_only, L4 rule would hit (M6 scope)
+//
+// First v6 fragment with inner TCP. L3_ONLY, no L3 rules. classify_l3 sets
+// l4_extra=8, returns kNextL4 (L4 rule is M6). No frag counters.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_11_V6FirstL3OnlyL4RuleHit) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // First fragment: frag_offset=0, MF=1. Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c5_11_pool", /*inner_nxt=*/6,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C5.11: first v6 frag + l3_only + no L3 rules → kNextL4 (L4 is M6)";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_EQ(cdyn->l4_extra, 8u)
+      << "C5.11: l4_extra must be 8 (D27 first fragment drill)";
+  EXPECT_EQ(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.11: first fragment with inner TCP must NOT set SKIP_L4";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C5.11: first fragment must NOT bump frag_nonfirst";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C5.11: first fragment must NOT bump pkt_frag_skipped_total_v6";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 0u)
+      << "C5.11: first fragment under l3_only must NOT bump drop counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.12 — v6 non-first fragment, l3_only
+//
+// l4_skipped_ipv6_fragment_nonfirst += 1, pkt_frag_skipped_total_v6 += 1
+// (D40 alias), SKIP_L4 → FIB miss → kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_12_V6NonFirstL3Only) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // Non-first fragment: frag_offset=4, MF=0.
+  // Host value = 4 << 3 = 0x0020.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(
+      static_cast<std::uint16_t>(4u << 3));
+  auto ff = build_ipv6_frag_frame("c5_12_pool", /*inner_nxt=*/17,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.12: non-first v6 frag + l3_only + no rules → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.12: non-first frag must set SKIP_L4";
+  EXPECT_EQ(frag_nonfirst_ctr, 1u)
+      << "C5.12: l4_skipped_ipv6_fragment_nonfirst must be 1 (D27)";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 1u)
+      << "C5.12: pkt_frag_skipped_total_v6 must be 1 (D40 alias)";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 0u)
+      << "C5.12: no drop counter bleed";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C5.12: non-first frag must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.13 — v6 first fragment, drop policy
+//
+// FRAG_DROP → pkt_frag_dropped_total_v6 += 1 + kTerminalDrop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_13_V6FirstDrop) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragDrop;
+
+  // First fragment: frag_offset=0, MF=1. Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c5_13_pool", /*inner_nxt=*/6,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C5.13: first v6 frag under drop → kTerminalDrop";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 1u)
+      << "C5.13: pkt_frag_dropped_total_v6 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C5.13: no skip counter bleed";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C5.13: drop path must NOT bump frag_nonfirst counter";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C5.13: drop path must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.14 — v6 non-first fragment, drop policy
+//
+// Same → pkt_frag_dropped_total_v6 += 1 + kTerminalDrop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_14_V6NonFirstDrop) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragDrop;
+
+  // Non-first fragment: frag_offset=4, MF=0.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(
+      static_cast<std::uint16_t>(4u << 3));
+  auto ff = build_ipv6_frag_frame("c5_14_pool", /*inner_nxt=*/17,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C5.14: non-first v6 frag under drop → kTerminalDrop";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 1u)
+      << "C5.14: pkt_frag_dropped_total_v6 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C5.14: no skip counter bleed";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C5.14: drop path must NOT bump frag_nonfirst counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.15 — v6 first fragment, allow policy
+//
+// FRAG_ALLOW → kTerminalPass. No counters.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_15_V6FirstAllow) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragAllow;
+
+  // First fragment: frag_offset=0, MF=1.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c5_15_pool", /*inner_nxt=*/6,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.15: first v6 frag under allow → kTerminalPass";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 0u)
+      << "C5.15: allow must not bump drop counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C5.15: allow must not bump skip counter";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C5.15: allow path must NOT bump frag_nonfirst counter";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C5.15: allow path must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C5.16 — v6 non-first fragment, allow policy
+//
+// Same → kTerminalPass. No counters.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3FragPolicyMatrixTest, C5_16_V6NonFirstAllow) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragAllow;
+
+  // Non-first fragment: frag_offset=4, MF=0.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(
+      static_cast<std::uint16_t>(4u << 3));
+  auto ff = build_ipv6_frag_frame("c5_16_pool", /*inner_nxt=*/17,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.16: non-first v6 frag under allow → kTerminalPass";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 0u)
+      << "C5.16: allow must not bump drop counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C5.16: allow must not bump skip counter";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C5.16: allow path must NOT bump frag_nonfirst counter";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C5.16: allow path must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
 }  // namespace pktgate::test
