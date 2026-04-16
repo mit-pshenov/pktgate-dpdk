@@ -8368,4 +8368,145 @@ TEST_F(ClassifyL4CornerTest, C6_Extra_IcmpCodeFilterMask) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// M6 C4 — C5.17 D21 flagship sentinel (test-only cycle).
+//
+// The exact D21 cliff regression test. Runs the FULL L3 → L4 pipeline
+// on a non-first IPv4 fragment with:
+//   1. An L3 allow rule matching the dst /8 prefix (FIB populated).
+//   2. fragment_policy = kFragL3Only.
+//   3. classify_l3 runs first → sets SKIP_L4 (non-first frag under
+//      L3_ONLY) and returns kTerminalPass (L3 allow hit collapsed
+//      by SKIP_L4).
+//   4. classify_l4 runs on the same mbuf → D21 SKIP_L4 entry guard
+//      must return kTerminalPass immediately WITHOUT reading L4
+//      header bytes.
+//
+// The packet is deliberately 34 B (14 + 20, no L4 payload). If
+// classify_l4 bypasses the SKIP_L4 guard and tries to compute the
+// L4 offset / read ports, it would:
+//   (a) hit the D31 truncation guard (no bytes at l4off) → DROP, or
+//   (b) read garbage → wrong verdict.
+// Either outcome is the D21 cliff bug. This sentinel locks it shut.
+//
+// Harness: [gtest], tag: sentinel.
+// Covers: D17, D21 (flagship), D41.
+// =========================================================================
+
+// Re-use the ClassifyL3FragPolicyMatrixTest fixture (EalFixture).
+// The build_ipv4_frame / set_frag_word / set_dyn_for_ipv4 helpers
+// are available from the anonymous namespace above.
+
+TEST_F(ClassifyL3FragPolicyMatrixTest,
+       C5_17_D21FlagshipSentinel_NonFirstFragL3HitAllowL4SkipGuard) {
+  using namespace builder_eal;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0) << "dynfield registration failed";
+
+  // ---- Build a ruleset with an L3 allow rule on 10.0.0.0/8 ----
+  Config cfg = make_config();
+
+  // Filler rule so the target allow rule lands at action_idx >= 1
+  // (avoids the C1b zero-packed FIB sentinel alias).
+  SubnetObject filler;
+  filler.name = "net_filler_c5_17";
+  filler.cidrs.push_back(Cidr4{0xAC100000, 12});  // 172.16.0.0/12
+  cfg.objects.subnets.push_back(std::move(filler));
+
+  SubnetObject target;
+  target.name = "net_target_c5_17";
+  target.cidrs.push_back(Cidr4{0x0A000000, 8});   // 10.0.0.0/8
+  cfg.objects.subnets.push_back(std::move(target));
+
+  auto& r_filler = append_rule(cfg.pipeline.layer_3, 5170, ActionDrop{});
+  r_filler.dst_subnet = SubnetRef{"net_filler_c5_17"};
+  auto& r_target = append_rule(cfg.pipeline.layer_3, 5171, ActionAllow{});
+  r_target.dst_subnet = SubnetRef{"net_target_c5_17"};
+
+  CompileResult cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile failed: "
+      << (cr.error ? cr.error->message : "");
+
+  Ruleset rs = ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  rs.fragment_policy = dataplane::kFragL3Only;
+  EalPopulateParams params;
+  params.name_prefix = "c5_17";
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = populate_ruleset_eal(rs, cr, params);
+  ASSERT_TRUE(res.ok) << "populate_ruleset_eal failed: " << res.error;
+  ASSERT_NE(rs.l3_v4_fib, nullptr) << "FIB must be populated for L3 hit";
+
+  // ---- Build a non-first IPv4 fragment addressed to 10.1.2.3 ----
+  // 34 B total (14 Ethernet + 20 IPv4). NO L4 payload — this is the
+  // whole point: if classify_l4 tries to read L4, it'll crash or drop.
+  auto ff = build_ipv4_frame("c5_17_pool", 0x0A010203u);  // 10.1.2.3
+  ASSERT_NE(ff.m, nullptr);
+
+  // Write protocol = UDP at byte 23 so the packet looks like a
+  // realistic non-first UDP fragment.
+  ff.pkt[23] = IPPROTO_UDP;
+
+  // Non-first fragment: frag offset = 185 (in 8-byte units), MF = 0.
+  set_frag_word(ff.pkt, /*mf=*/false, /*frag_off_units=*/185);
+  set_dyn_for_ipv4(ff.m);
+
+  // ---- Step 1: classify_l3 ----
+  dataplane::L3TruncCtrs l3_trunc{};
+  dataplane::L3FragCtrs  l3_frag{};
+  const auto l3_verdict =
+      dataplane::classify_l3(ff.m, rs, &l3_trunc, &l3_frag);
+
+  // L3 expectations:
+  //   - Non-first frag + L3_ONLY → SKIP_L4 set.
+  //   - L3 FIB hit on 10/8 with allow → kNextL4, but SKIP_L4 collapses
+  //     kNextL4 to kTerminalPass (§5.3 line 1201).
+  EXPECT_EQ(l3_verdict, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C5.17 sentinel: classify_l3 must return kTerminalPass "
+         "(allow hit collapsed by SKIP_L4)";
+
+  auto* dyn = eal::mbuf_dynfield(ff.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C5.17 sentinel: SKIP_L4 must be set by classify_l3 "
+         "(non-first fragment under L3_ONLY)";
+
+  EXPECT_EQ(l3_frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C5.17 sentinel: pkt_frag_skipped_total_v4 must be 1";
+
+  // ---- Pre-set remaining dynfields for classify_l4 ----
+  // classify_l3 does NOT write parsed_l3_proto (worker territory),
+  // so we write it manually. The SKIP_L4 guard fires before
+  // classify_l4 reads this, but set it for completeness.
+  dyn->parsed_l3_proto = IPPROTO_UDP;
+  dyn->l4_extra = 0;  // irrelevant — SKIP_L4 short-circuits
+
+  // ---- Step 2: classify_l4 (D21 SKIP_L4 guard) ----
+  dataplane::L4TruncCtrs l4_trunc{};
+  const auto l4_verdict = dataplane::classify_l4(ff.m, rs, &l4_trunc);
+
+  // D21 flagship assertion: classify_l4 must return kTerminalPass
+  // immediately via the SKIP_L4 entry guard. It must NOT:
+  //   - compute the L4 offset (which would read the IPv4 header)
+  //   - hit the D31 truncation guard (which would DROP the packet)
+  //   - attempt any hash lookup
+  // This is the exact cliff that D21 was created to prevent.
+  EXPECT_EQ(l4_verdict, dataplane::ClassifyL4Verdict::kTerminalPass)
+      << "C5.17 sentinel (D21): classify_l4 MUST return kTerminalPass "
+         "via the SKIP_L4 entry guard. If this fails, D21 cliff is "
+         "broken — classify_l4 is trying to read L4 header bytes from "
+         "a non-first fragment that has no L4 header.";
+
+  // Truncation counter must NOT be bumped — SKIP_L4 fires before
+  // the truncation check.
+  EXPECT_EQ(l4_trunc[static_cast<std::size_t>(
+                dataplane::L4TruncBucket::kL4)], 0u)
+      << "C5.17 sentinel (D21): L4 truncation counter must NOT fire — "
+         "SKIP_L4 guard short-circuits before the truncation check";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
 }  // namespace pktgate::test
