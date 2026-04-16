@@ -5077,4 +5077,840 @@ TEST_F(ClassifyL3Ipv4CornerTest, C2_22_VlanTaggedIpv4Ihl6) {
   rte_mempool_free(cf.mp);
 }
 
+// =========================================================================
+// M5 C8 — classify_l3 IPv6 corner tests (C3.2–C3.21)
+//
+// Twenty tests exercising edge cases of the IPv6 branch in classify_l3
+// (C4-C6 impl). All tests bypass classify_l2 and call classify_l3 directly.
+// No new impl — this is a test-only cycle.
+//
+// Key M5 adaptation: classify_l4 does NOT exist yet (M6). Tests that in
+// corner.md assert L4 behavior (L4 rule hits) are adapted to assert what
+// classify_l3 ACTUALLY returns:
+//   - A valid L3 header with no L3 match → kNextL4 (pipeline continues)
+//   - L3 truncation → kTerminalDrop + trunc counter
+//   - Fragment handling per D17/D27 → appropriate counters + verdicts
+//   - Ext-header handling per D20 → SKIP_L4 + exthdr counter
+//
+// Covers: D13, D17, D20, D22, D27, D31, D40
+//
+// C3.20 is the D13+D27 flagship SENTINEL: validates that the D13 VLAN
+// l3_offset composes with D27 IPv6 fragment ext handling.
+// =========================================================================
+
+class ClassifyL3Ipv6CornerTest : public EalFixture {};
+
+// Helper: build an IPv6 corner frame of exactly `frame_len` bytes.
+// Sets EtherType 0x86DD at [12..13] and version=6 at [14].
+namespace {
+
+inline CornerFrame build_ipv6_corner_frame(const char* pool_name,
+                                           std::size_t frame_len) {
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      pool_name, 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  EXPECT_NE(mp, nullptr) << "mempool create failed: " << pool_name;
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  EXPECT_NE(m, nullptr);
+  EXPECT_EQ(m->nb_segs, 1);
+
+  std::uint8_t* pkt = nullptr;
+  if (frame_len > 0) {
+    pkt = reinterpret_cast<std::uint8_t*>(
+        rte_pktmbuf_append(m, static_cast<std::uint16_t>(frame_len)));
+    EXPECT_NE(pkt, nullptr);
+    std::memset(pkt, 0, frame_len);
+    if (frame_len >= 14) {
+      pkt[12] = 0x86;
+      pkt[13] = 0xDD;  // EtherType 0x86DD IPv6
+    }
+    if (frame_len >= 15) {
+      pkt[14] = 0x60;  // version=6
+    }
+  }
+  return CornerFrame{mp, m, pkt};
+}
+
+// Set dyn fields for IPv6 with a given l3_offset.
+inline void set_dyn_ipv6_corner(struct rte_mbuf* m,
+                                std::uint8_t l3_off = 14) {
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = l3_off;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+  dyn->l4_extra         = 0;
+}
+
+}  // namespace
+
+// -------------------------------------------------------------------------
+// C3.2 — IPv6 truncated (39 B after L2) → D31 l3_v6 + kTerminalDrop
+//
+// corner.md: ether(14) + raw 39 B pretending to be v6 = 53 B total.
+// One byte short of the IPv6 40-byte fixed header → D31 l3_v6 guard fires.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_2_Truncated39B_L3V6Trunc) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_2_pool", 14 + 39);  // 53 B
+  ASSERT_NE(cf.m, nullptr);
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C3.2: IPv6 39B after L2 (53B total) must be dropped by D31 l3_v6 guard";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 1u)
+      << "C3.2: pkt_truncated_l3[l3_v6] must be 1";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "C3.2: must NOT bleed into l3_v4 bucket";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6FragExt)], 0u)
+      << "C3.2: must NOT bleed into l3_v6_frag_ext bucket";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C3.2: truncation path must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.3 — IPv6 40 B + no L4 bytes (54 B total) → kNextL4
+//
+// corner.md: Ether()/IPv6(nh=6) with pkt_len=54, 0 B L4.
+// M5 adaptation: L4 truncation check is M6 scope. classify_l3 sees a
+// valid 40-byte IPv6 header with nh=6 (TCP, not an ext-header), FIB null →
+// kNextL4. No L3 counters move.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_3_Ipv6NoL4Bytes_NextL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_3_pool", 14 + 40);  // 54 B
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 6;  // next_header = TCP
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C3.3: IPv6 40B header + TCP + no L3 rules → kNextL4 (L4 trunc is M6)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "C3.3: valid IPv6 header must NOT bump l3_v6 truncation";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C3.3: TCP is not an ext-header, exthdr must stay 0";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.3: non-fragment must NOT bump frag_nonfirst";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.4–C3.13: IPv6 ext-header corner tests (D20 first-proto-only)
+//
+// Each test sets IPv6 next_header to a recognized ext-header value and
+// verifies: SKIP_L4 set, l4_skipped_ipv6_extheader += 1, kTerminalPass
+// (SKIP_L4 collapses kNextL4 with null FIB).
+//
+// All use 14 B Ether + 40 B IPv6 = 54 B minimum frames.
+// -------------------------------------------------------------------------
+
+// C3.4 — next_header=0 (Hop-by-Hop Options)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_4_ExtHeader_HopByHop_Nh0) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_4_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 0;  // next_header = 0 (Hop-by-Hop)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.4: nh=0 (HopByHop) → SKIP_L4 + null FIB → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.4: SKIP_L4 must be set for nh=0";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.4: l4_skipped_ipv6_extheader must be 1 (D20)";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.4: non-fragment must NOT bump frag_nonfirst";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.5 — next_header=43 (Routing)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_5_ExtHeader_Routing_Nh43) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_5_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 43;  // next_header = 43 (Routing)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.5: nh=43 (Routing) → SKIP_L4 + null FIB → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.5: SKIP_L4 must be set for nh=43";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.5: l4_skipped_ipv6_extheader must be 1 (D20)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.6 — next_header=50 (ESP)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_6_ExtHeader_ESP_Nh50) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_6_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 50;  // next_header = 50 (ESP)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.6: nh=50 (ESP) → SKIP_L4 + null FIB → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.6: SKIP_L4 must be set for nh=50";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.6: l4_skipped_ipv6_extheader must be 1 (D20)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.7 — next_header=51 (AH)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_7_ExtHeader_AH_Nh51) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_7_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 51;  // next_header = 51 (AH)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.7: nh=51 (AH) → SKIP_L4 + null FIB → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.7: SKIP_L4 must be set for nh=51";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.7: l4_skipped_ipv6_extheader must be 1 (D20)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.8 — next_header=60 (Destination Options)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_8_ExtHeader_DestOpt_Nh60) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_8_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 60;  // next_header = 60 (Destination Options)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.8: nh=60 (DestOpt) → SKIP_L4 + null FIB → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.8: SKIP_L4 must be set for nh=60";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.8: l4_skipped_ipv6_extheader must be 1 (D20)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.9 — next_header=135 (Mobility, explicit >=64 list, D22 UB proof)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_9_ExtHeader_Mobility_Nh135) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_9_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 135;  // next_header = 135 (Mobility)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.9: nh=135 (Mobility) → SKIP_L4 via explicit OR clause (D22 UB proof)";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.9: SKIP_L4 must be set for nh=135";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.9: l4_skipped_ipv6_extheader must be 1 (D20, D22)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.10 — next_header=139 (HIP)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_10_ExtHeader_HIP_Nh139) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_10_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 139;  // next_header = 139 (HIP)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.10: nh=139 (HIP) → SKIP_L4 via explicit OR clause (D22)";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.10: SKIP_L4 must be set for nh=139";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.10: l4_skipped_ipv6_extheader must be 1 (D20, D22)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.11 — next_header=140 (shim6)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_11_ExtHeader_Shim6_Nh140) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_11_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 140;  // next_header = 140 (shim6)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.11: nh=140 (shim6) → SKIP_L4 via explicit OR clause (D22)";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.11: SKIP_L4 must be set for nh=140";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.11: l4_skipped_ipv6_extheader must be 1 (D20, D22)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.12 — next_header=253 (experimental)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_12_ExtHeader_Experimental_Nh253) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_12_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 253;  // next_header = 253 (experimental)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.12: nh=253 (experimental) → SKIP_L4 via explicit OR (D22)";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.12: SKIP_L4 must be set for nh=253";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.12: l4_skipped_ipv6_extheader must be 1 (D20, D22)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// C3.13 — next_header=254 (experimental)
+TEST_F(ClassifyL3Ipv6CornerTest, C3_13_ExtHeader_Experimental_Nh254) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_ipv6_corner_frame("c3_13_pool", 14 + 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[20] = 254;  // next_header = 254 (experimental)
+  set_dyn_ipv6_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  std::uint64_t exthdr_ctr = 0;
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, nullptr, &exthdr_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.13: nh=254 (experimental) → SKIP_L4 via explicit OR (D22)";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(cf.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.13: SKIP_L4 must be set for nh=254";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.13: l4_skipped_ipv6_extheader must be 1 (D20, D22)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.14 — IPv6 Fragment ext, first fragment (offset=0, MF=1), inner TCP
+//
+// corner.md: classify_l3 handles the fragment ext, drills one step
+// (l4_extra=8), inner nh=6 (TCP) is NOT an ext header → proceeds to FIB
+// lookup → returns kNextL4. Assert kNextL4, l4_extra=8, no skip counters.
+// M5 adaptation: L4 rule is M6, just assert kNextL4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_14_FirstFragTcpNextL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // First fragment: frag_offset=0, MF=1. Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c3_14_pool", /*inner_nxt=*/6,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C3.14: first v6 fragment with inner TCP under L3_ONLY → kNextL4 (D27)";
+
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_EQ(cdyn->l4_extra, 8u)
+      << "C3.14: l4_extra must be 8 (D27 first frag drills one step)";
+  EXPECT_EQ(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.14: first fragment with inner TCP must NOT set SKIP_L4";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.14: first fragment must NOT bump frag_nonfirst";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C3.14: inner TCP must NOT bump exthdr counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C3.14: first fragment must NOT bump pkt_frag_skipped_total_v6";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.15 — IPv6 Fragment ext, non-first (offset=185), UDP
+//
+// corner.md: l4_skipped_ipv6_fragment_nonfirst += 1 + D40 alias
+// pkt_frag_skipped_total_v6 += 1 + SKIP_L4 + kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_15_NonFirstFrag185_SkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // Non-first fragment: offset=185, MF=0.
+  // frag_data host: offset=185 in [3..15], MF=0 in bit[0]
+  // host value = 185 << 3 = 0x05C8
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(
+      static_cast<std::uint16_t>(185u << 3));
+  auto ff = build_ipv6_frag_frame("c3_15_pool", /*inner_nxt=*/17,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.15: non-first v6 fragment (offset=185) → SKIP_L4 + kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.15: SKIP_L4 must be set for non-first fragment";
+  EXPECT_EQ(frag_nonfirst_ctr, 1u)
+      << "C3.15: l4_skipped_ipv6_fragment_nonfirst must be 1 (D27)";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 1u)
+      << "C3.15: pkt_frag_skipped_total_v6 must be 1 (D40 alias)";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C3.15: non-first frag must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.16 — First frag nh=44 (nested fragment) → SKIP_L4 + exthdr += 1
+//
+// corner.md: l4_skipped_ipv6_extheader += 1 (ext-after-fragment → SKIP_L4).
+// kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_16_FirstFragNestedFrag44_SkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // First fragment: offset=0, MF=1. Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c3_16_pool", /*inner_nxt=*/44,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.16: first frag with inner nh=44 (nested) → SKIP_L4 → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.16: chain-after-fragment must set SKIP_L4";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.16: l4_skipped_ipv6_extheader must be 1 (D27 nested frag → ext path)";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.16: first fragment must NOT bump frag_nonfirst";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.17 — First frag nh=0 (HopByHop after Fragment) → SKIP_L4 + exthdr += 1
+//
+// corner.md: ext-after-fragment under first-proto-only → SKIP_L4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_17_FirstFragHopByHopAfterFrag_SkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // First fragment: offset=0, MF=1. Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c3_17_pool", /*inner_nxt=*/0,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.17: first frag with inner nh=0 (HopByHop) → SKIP_L4 → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.17: ext-after-fragment must set SKIP_L4";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.17: l4_skipped_ipv6_extheader must be 1 (D27 chain-after-frag)";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.17: first fragment must NOT bump frag_nonfirst";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.18 — Fragment ext truncated: only 4 B of 8 present (58 B total)
+//
+// corner.md: pkt_truncated_total{where="l3_v6_frag_ext"} += 1 + kTerminalDrop
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_18_FragExtTrunc4B) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // Build truncated frame: 14 + 40 + 4 = 58 bytes
+  auto ff = build_ipv6_frag_frame("c3_18_pool", /*inner_nxt=*/6,
+                                  /*frag_data_be=*/0,
+                                  /*truncate=*/58);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C3.18: frag-ext truncated (4B of 8) → D31 l3_v6_frag_ext → kTerminalDrop";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(
+                dataplane::L3TruncBucket::kL3V6FragExt)], 1u)
+      << "C3.18: pkt_truncated_l3[l3_v6_frag_ext] must be 1";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "C3.18: must NOT bleed into l3_v6 bucket";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C3.18: truncation must NOT bump exthdr counter";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.19 — Fragment ext, 0 B of it present (54 B total = Eth + IPv6 only)
+//
+// corner.md: pkt_truncated_total{where="l3_v6_frag_ext"} += 1 + kTerminalDrop
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_19_FragExtTrunc0B) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // Build truncated frame: 14 + 40 + 0 = 54 bytes (no frag ext at all)
+  auto ff = build_ipv6_frag_frame("c3_19_pool", /*inner_nxt=*/6,
+                                  /*frag_data_be=*/0,
+                                  /*truncate=*/54);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C3.19: frag-ext 0B present (54B total) → D31 l3_v6_frag_ext → kTerminalDrop";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(
+                dataplane::L3TruncBucket::kL3V6FragExt)], 1u)
+      << "C3.19: pkt_truncated_l3[l3_v6_frag_ext] must be 1";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "C3.19: must NOT bleed into l3_v6 bucket";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.20 — VLAN-tagged IPv6 first fragment with TCP (D13+D27 compound)
+//
+// **FLAGSHIP SENTINEL** — validates D13 VLAN l3_offset=18 composes with
+// D27 IPv6 fragment ext. classify_l3 reads l3_offset=18, processes fragment
+// ext, l4_extra=8, inner nh=6 (TCP) is not an ext-header → kNextL4.
+//
+// corner.md: l3_offset=18, l4_extra=8, L4 offset=18+40+8=66.
+// M5 adaptation: L4 rule is M6. Assert kNextL4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_20_Sentinel_VlanIpv6FragFirstTcp) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // Frame: 14 B Ether + 4 B VLAN + 40 B IPv6 + 8 B FragExt = 66 B
+  // l3_offset = 18 (D13 VLAN tag shifts L3 start by 4)
+  constexpr std::size_t kFrameLen = 14 + 4 + 40 + 8;  // 66 B
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "c3_20_sentinel_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  ASSERT_EQ(m->nb_segs, 1);
+
+  std::uint8_t* pkt = reinterpret_cast<std::uint8_t*>(
+      rte_pktmbuf_append(m, kFrameLen));
+  ASSERT_NE(pkt, nullptr);
+  std::memset(pkt, 0, kFrameLen);
+
+  // Ethernet header: dst(6) + src(6) + VLAN TPID 0x8100
+  pkt[12] = 0x81;  pkt[13] = 0x00;
+  // VLAN TCI at [14..15]: vlan=100
+  pkt[14] = 0x00;  pkt[15] = 0x64;
+  // Inner ethertype at [16..17]: 0x86DD (IPv6)
+  pkt[16] = 0x86;  pkt[17] = 0xDD;
+
+  // IPv6 header at offset 18 (l3_offset=18)
+  pkt[18] = 0x60;  // version=6
+  pkt[24] = 44;    // next_header = 44 (Fragment) — offset 18+6=24
+  // payload_length: 8 (fragment ext header)
+  const std::uint16_t payload_be = rte_cpu_to_be_16(8u);
+  std::memcpy(&pkt[22], &payload_be, 2);  // payload_length at offset 18+4=22
+  // dst_addr at offset 18+24 = 42 (16 bytes): 2001:db8::1
+  pkt[42] = 0x20; pkt[43] = 0x01;
+  pkt[44] = 0x0d; pkt[45] = 0xb8;
+  pkt[57] = 0x01;  // last byte of dst_addr
+
+  // Fragment ext header at offset 18+40 = 58 (8 bytes)
+  pkt[58] = 6;     // inner next_header = 6 (TCP)
+  pkt[59] = 0;     // reserved
+  // frag_data: first fragment (offset=0, MF=1). Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  std::memcpy(&pkt[60], &frag_data_be, 2);
+  // id at pkt[62..65] — leave 0
+
+  // Set dynfield as classify_l2 would for a VLAN-tagged IPv6 frame.
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 18;  // D13: VLAN shifts L3 start by 4
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_vlan      = 100;
+  dyn->flags            = 0;
+  dyn->l4_extra         = 0;
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  // D13+D27 compound: VLAN l3_offset=18 + first fragment + inner TCP → kNextL4
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C3.20 SENTINEL: VLAN-tagged IPv6 first frag with TCP, "
+         "l3_offset=18 (D13) + D27 → kNextL4 (L4 rule is M6)";
+
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(cdyn->l4_extra, 8u)
+      << "C3.20 SENTINEL: l4_extra must be 8 (D27 first frag drills one step)";
+  EXPECT_EQ(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.20 SENTINEL: first fragment with inner TCP must NOT set SKIP_L4";
+
+  // No counter bumps on this path
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.20 SENTINEL: first fragment must NOT bump frag_nonfirst";
+  EXPECT_EQ(exthdr_ctr, 0u)
+      << "C3.20 SENTINEL: inner TCP must NOT bump exthdr counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV6)], 0u)
+      << "C3.20 SENTINEL: first fragment must NOT bump skip counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV6)], 0u)
+      << "C3.20 SENTINEL: no drop counter on first frag under L3_ONLY";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6)], 0u)
+      << "C3.20 SENTINEL: valid frame must NOT bump truncation";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V6FragExt)], 0u)
+      << "C3.20 SENTINEL: valid frame must NOT bump frag-ext truncation";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// C3.21 — First frag nh=253 (experimental, >=64 explicit OR list)
+//
+// corner.md: l4_skipped_ipv6_extheader += 1 (253 in explicit >=64 list).
+// kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv6CornerTest, C3_21_FirstFragInnerNh253_SkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // First fragment: offset=0, MF=1. Host value = 0x0001.
+  const std::uint16_t frag_data_be = rte_cpu_to_be_16(0x0001u);
+  auto ff = build_ipv6_frag_frame("c3_21_pool", /*inner_nxt=*/253,
+                                  frag_data_be);
+  ASSERT_NE(ff.m, nullptr);
+  set_dyn_for_ipv6(ff.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  std::uint64_t exthdr_ctr = 0;
+  std::uint64_t frag_nonfirst_ctr = 0;
+  const auto v = dataplane::classify_l3(ff.m, rs, &trunc, &frag,
+                                        &exthdr_ctr, &frag_nonfirst_ctr);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C3.21: first frag with inner nh=253 → SKIP_L4 via explicit OR → kTerminalPass";
+  auto* cdyn = eal::mbuf_dynfield(static_cast<const struct rte_mbuf*>(ff.m));
+  EXPECT_NE(cdyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C3.21: chain-after-fragment with nh=253 must set SKIP_L4";
+  EXPECT_EQ(exthdr_ctr, 1u)
+      << "C3.21: l4_skipped_ipv6_extheader must be 1 (D22 explicit OR, D27)";
+  EXPECT_EQ(frag_nonfirst_ctr, 0u)
+      << "C3.21: first fragment must NOT bump frag_nonfirst";
+
+  rte_pktmbuf_free(ff.m);
+  rte_mempool_free(ff.mp);
+}
+
 }  // namespace pktgate::test
