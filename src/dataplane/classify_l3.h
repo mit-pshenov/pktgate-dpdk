@@ -196,6 +196,29 @@ enum class ClassifyL3Verdict : std::uint8_t {
 // -------------------------------------------------------------------------
 // Internal helpers (anonymous namespace in a header — inline-only hot path).
 
+// -------------------------------------------------------------------------
+// is_ext_proto — IPv6 extension header protocol detection (D20, D22).
+//
+// Returns true if `p` is a recognized IPv6 extension header protocol
+// number, EXCLUDING Fragment (44) which gets its own branch in D27.
+//
+// Values < 64 are packed into a 64-bit bitmask for branch-free testing:
+//   hop-by-hop=0, routing=43, ESP=50, AH=51, destination-options=60.
+// Values >= 64 are explicit OR clauses to avoid UB from `1ull << N`
+// where N >= 64: mobility=135, HIP=139, shim6=140, experimental=253/254.
+//
+// Extracted from the classify_l3 function body in M5 C10 REFACTOR so
+// both IPv6 code sites (ext-header detection and chain-after-fragment)
+// share a single definition, and the constant is available for unit tests.
+
+inline constexpr std::uint64_t kExtMaskLt64 =
+    (1ull << 0) | (1ull << 43) | (1ull << 50) | (1ull << 51) | (1ull << 60);
+
+inline constexpr bool is_ext_proto(std::uint8_t p) noexcept {
+  return (p < 64 && ((1ull << p) & kExtMaskLt64)) ||
+         p == 135 || p == 139 || p == 140 || p == 253 || p == 254;
+}
+
 namespace detail {
 
 // Dispatch a matched L3 compound entry on its action verb.
@@ -278,7 +301,7 @@ inline ClassifyL3Verdict l3_dispatch(const ruleset::Ruleset& rs,
 //   `empty_ruleset_short_circuit_hides_parse`).
 //
 // C4 body — IPv6 branch:
-//   0. If et == RTE_BE16(RTE_ETHER_TYPE_IPV6):
+//   0. If et == RTE_ETHER_TYPE_IPV6:
 //   1. D31 l3_v6 truncation guard — if pkt_len < l3_off + 40, bump
 //      trunc_ctrs[kL3V6] (if non-null) and return kTerminalDrop.
 //   2. No ext-header handling yet (C5 scope).
@@ -335,9 +358,13 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
   const std::uint16_t et     = dyn->parsed_ethertype;
 
   // --------------------------- IPv4 branch ---------------------------------
-  // parsed_ethertype is in network byte order (classify_l2 writes raw
-  // 16-bit as assembled from wire bytes). Compare via RTE_BE16.
-  if (et == RTE_BE16(RTE_ETHER_TYPE_IPV4)) {
+  // parsed_ethertype is stored in HOST byte order by classify_l2
+  // (assembled as `(raw[12] << 8) | raw[13]`). Compare directly against
+  // the host-order constant. M5 C10 fix: previous code used
+  // RTE_BE16(RTE_ETHER_TYPE_IPV4) which byte-swaps on little-endian,
+  // making the comparison always false. Unit tests that set
+  // dyn->parsed_ethertype = RTE_BE16(...) must be updated to use 0x0800.
+  if (et == RTE_ETHER_TYPE_IPV4) {
     // ---- D31 l3_v4 truncation guard (U6.12) -----------------------------
     // Must fire before any header byte read. pkt_len >= l3_off + 20 is
     // the minimum to have a well-formed IPv4 header (without options);
@@ -512,7 +539,7 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
   // C4: dst-prefix primary FIB lookup via rte_fib6_lookup_bulk(n=1),
   // D31 l3_v6 truncation guard. C5 adds ext-header handling, C6 adds
   // fragment handling. This branch mirrors the IPv4 branch above.
-  if (et == RTE_BE16(RTE_ETHER_TYPE_IPV6)) {
+  if (et == RTE_ETHER_TYPE_IPV6) {
     // ---- D31 l3_v6 truncation guard (U6.14) -----------------------------
     // IPv6 has a fixed 40-byte header. Must fire before any header byte
     // read. pkt_len >= l3_off + 40 is the minimum.
@@ -533,15 +560,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     const std::uint8_t nxt = ip6->proto;  // next_header field
 
     // ---- D20 first-protocol-only ext-header detection (U6.27) -----------
-    // D22: EXT_MASK_LT64 — only bits < 64 in the bitmask, values >= 64
-    // are explicit OR clauses. Fragment (44) excluded — D27 (C6).
-    static constexpr std::uint64_t kExtMaskLt64 =
-        (1ull << 0) | (1ull << 43) | (1ull << 50) | (1ull << 51) | (1ull << 60);
-    auto is_ext_proto = [](std::uint8_t p) noexcept -> bool {
-      return (p < 64 && ((1ull << p) & kExtMaskLt64)) ||
-             p == 135 || p == 139 || p == 140 || p == 253 || p == 254;
-    };
-
+    // D22: kExtMaskLt64 + is_ext_proto live at namespace scope (REFACTOR
+    // M5 C10). Fragment (44) excluded — D27 (C6).
     if (is_ext_proto(nxt)) {
       dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
       if (exthdr_ctr) ++(*exthdr_ctr);

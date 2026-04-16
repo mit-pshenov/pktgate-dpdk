@@ -76,3 +76,16 @@ set_tests_properties(functional.test_f8_qinq_counter PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 60
 )
+
+# M5 C10 — F4.1-F4.10: Fragment handling L3 functional tests.
+# Uses dtap_f4_* interface pair. FIB DIR24_8 needs ~128 MB heap so
+# tests use --no-huge -m 512. Longer timeout for 10 sub-tests.
+add_test(
+  NAME functional.test_f4_l3
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f4_l3.py"
+)
+set_tests_properties(functional.test_f4_l3 PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 300
+)

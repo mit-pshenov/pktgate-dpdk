@@ -1505,8 +1505,8 @@ TEST_F(ClassifyL3SkeletonTest, U6_11a_EmptyL3RulesetYieldsNextL4) {
 //            miss means fall through, and NO truncation counter is bumped.
 //
 // All four bypass classify_l2 and call classify_l3 directly, pre-setting
-// dyn->l3_offset = 14 + dyn->parsed_ethertype = RTE_BE16(0x0800) the way
-// classify_l2 would after parsing an untagged Ethernet frame. Same pattern
+// dyn->l3_offset = 14 + dyn->parsed_ethertype = 0x0800 (host byte order)
+// the way classify_l2 would after parsing an untagged Ethernet frame. Same pattern
 // as U6.11a (M5 C0 baseline).
 //
 // Covers: D14 (reject-only arm), D31 (bucket `l3_v4`), D30 (rte_fib_lookup_bulk
@@ -1547,7 +1547,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_12_Ipv4ShortPacketTruncated) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -1595,7 +1595,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_13_Ipv4IhlLessThan5Rejected) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -1701,7 +1701,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_18_Ipv4DstFibHitDispatch) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -1788,7 +1788,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_18a_Ipv4DstFibMissFallsThrough) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -1901,7 +1901,7 @@ TEST_F(ClassifyL3Ipv4Test, U6_18b_Ipv4DstFibHitAtActionIdxZero) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -2010,7 +2010,7 @@ inline void set_frag_word(std::uint8_t* pkt, bool mf,
 inline void set_dyn_for_ipv4(struct rte_mbuf* m) {
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 }
@@ -3514,7 +3514,7 @@ TEST_F(ClassifyL3Ipv6Test, U6_14_Ipv6ShortPacketTruncDrop) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -3570,7 +3570,7 @@ TEST_F(ClassifyL3Ipv6Test, U6_26_Ipv6PlainTcpNextL4) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
   dyn->l4_extra         = 0;  // pre-init to 0
@@ -3680,7 +3680,7 @@ TEST_F(ClassifyL3Ipv6Test, U6_32_Ipv6DstFibHitDispatch) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -3776,7 +3776,7 @@ TEST_F(ClassifyL3Ipv6Test, U6_32a_Ipv6DstFibMissFallsThrough) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 
@@ -3840,7 +3840,7 @@ TEST_F(ClassifyL3Ipv6Test, U6_27_Ipv6ExtHeaderHopByHopSkipL4) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
   dyn->l4_extra         = 0;
@@ -3958,7 +3958,7 @@ inline V6FragFrame build_ipv6_frag_frame(const char* pool_name,
 inline void set_dyn_for_ipv6(struct rte_mbuf* m) {
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
   dyn->l4_extra         = 0;
@@ -4214,7 +4214,7 @@ TEST_F(ClassifyL3Ipv6FragExtTest, U6_31_Proto135MobilityExtHeader) {
 
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 14;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
   dyn->l4_extra         = 0;
@@ -4358,7 +4358,7 @@ inline void set_dyn_ipv4_corner(struct rte_mbuf* m,
                                 std::uint8_t l3_off = 14) {
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = l3_off;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
 }
@@ -5061,7 +5061,7 @@ TEST_F(ClassifyL3Ipv4CornerTest, C2_22_VlanTaggedIpv4Ihl6) {
   // Set dynfield as classify_l2 would for a VLAN-tagged frame.
   auto* dyn = eal::mbuf_dynfield(cf.m);
   dyn->l3_offset        = 18;  // D13: VLAN shifts L3 start by 4
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;
   dyn->parsed_vlan      = 100;
   dyn->flags            = 0;
 
@@ -5135,7 +5135,7 @@ inline void set_dyn_ipv6_corner(struct rte_mbuf* m,
                                 std::uint8_t l3_off = 14) {
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = l3_off;
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 0xFFFF;
   dyn->flags            = 0;
   dyn->l4_extra         = 0;
@@ -5829,7 +5829,7 @@ TEST_F(ClassifyL3Ipv6CornerTest, C3_20_Sentinel_VlanIpv6FragFirstTcp) {
   // Set dynfield as classify_l2 would for a VLAN-tagged IPv6 frame.
   auto* dyn = eal::mbuf_dynfield(m);
   dyn->l3_offset        = 18;  // D13: VLAN shifts L3 start by 4
-  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV6);
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV6;
   dyn->parsed_vlan      = 100;
   dyn->flags            = 0;
   dyn->l4_extra         = 0;

@@ -446,7 +446,22 @@ int main(int argc, char* argv[]) {
                   ",\"l4_skipped_ipv6_extheader\":" +
                   std::to_string(worker_ctx.l4_skipped_ipv6_extheader) +
                   ",\"l4_skipped_ipv6_fragment_nonfirst\":" +
-                  std::to_string(worker_ctx.l4_skipped_ipv6_fragment_nonfirst) + "}}";
+                  std::to_string(worker_ctx.l4_skipped_ipv6_fragment_nonfirst) +
+                  // M5 C10: D31 L3 truncation counters (three buckets).
+                  // Data lives on WorkerCtx.pkt_truncated_l3; wired here for
+                  // F4 functional test observability.
+                  ",\"pkt_truncated_l3_v4\":" +
+                  std::to_string(worker_ctx.pkt_truncated_l3[
+                      static_cast<std::size_t>(
+                          pktgate::dataplane::L3TruncBucket::kL3V4)]) +
+                  ",\"pkt_truncated_l3_v6\":" +
+                  std::to_string(worker_ctx.pkt_truncated_l3[
+                      static_cast<std::size_t>(
+                          pktgate::dataplane::L3TruncBucket::kL3V6)]) +
+                  ",\"pkt_truncated_l3_v6_frag_ext\":" +
+                  std::to_string(worker_ctx.pkt_truncated_l3[
+                      static_cast<std::size_t>(
+                          pktgate::dataplane::L3TruncBucket::kL3V6FragExt)]) + "}}";
     log_json(stats_json);
   }
 

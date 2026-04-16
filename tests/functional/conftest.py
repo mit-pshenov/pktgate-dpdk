@@ -46,6 +46,8 @@ _TAP_IFACES_TO_UNMANAGE = [
     "dtap_f2_rx", "dtap_f2_tx",
     # M4 C9 — F8.14 QinQ counter visibility test uses its own dtap pair.
     "dtap_f8_rx", "dtap_f8_tx",
+    # M5 C10 — F4 L3 functional tests use their own dtap pair.
+    "dtap_f4_rx", "dtap_f4_tx",
 ]
 
 
