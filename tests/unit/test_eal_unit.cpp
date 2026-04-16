@@ -6850,4 +6850,316 @@ TEST_F(ClassifyL4SkeletonTest, U6_40_L4MissReturnsTerminalPass) {
   rte_mempool_free(mp);
 }
 
+// =========================================================================
+// M6 C1 — L4 port parsing + proto_dport primary + D29 ICMP packing.
+//
+// Four RED tests:
+//
+//   U6.33  — proto+dport primary hit: TCP/443 packet matched by a rule
+//            with proto=TCP, dport=443. classify_l4 returns kMatch and
+//            writes the correct verdict_action_idx.
+//   U6.34  — proto+dport with src-port wildcard: same rule (no sport
+//            constraint, filter_mask==0), any sport matches.
+//   U6.35  — proto+dport+sport exact match: rule has sport=12345
+//            (filter_mask kSrcPort). Match only when sport matches;
+//            sport mismatch → L4 miss → kTerminalPass.
+//   U6.41  — ICMP type/code packing (D29): rule matches proto=ICMP
+//            dport=8 (echo request type). ICMP packet with type=8
+//            code=0. Primary key = (1<<16)|8 hits. filter_mask
+//            SRC_PORT checks code=0. kMatch + action_idx correct.
+//
+// All tests build a full CompileResult → build_ruleset → populate_
+// ruleset_eal pipeline to get a real rte_hash table, then call
+// classify_l4 directly with pre-set dynfields.
+//
+// Covers: D14, D15, D29, D41.
+// =========================================================================
+
+class ClassifyL4PortTest : public EalFixture {};
+
+// Helper: build a minimal IPv4/TCP packet in an mbuf, pre-set dynfields.
+// Returns the mbuf pointer. Caller owns the mbuf + pool.
+namespace l4_port_detail {
+
+using namespace builder_eal;
+
+// Build a Ruleset with L4 tables populated from the given config.
+// name_prefix must be unique per test to avoid rte_hash name collisions.
+inline ruleset::Ruleset build_l4_ruleset(Config& cfg,
+                                         const std::string& name_prefix) {
+  auto cr = compile(cfg);
+  if (cr.error.has_value()) {
+    throw std::runtime_error("compile failed: " + cr.error->message);
+  }
+
+  ruleset::Ruleset rs =
+      ruleset::build_ruleset(cr, cfg.sizing, /*num_lcores=*/1);
+  EalPopulateParams params;
+  params.name_prefix = name_prefix;
+  params.socket_id = 0;
+  params.max_entries = 64;
+  auto res = ruleset::populate_ruleset_eal(rs, cr, params);
+  if (!res.ok) {
+    throw std::runtime_error("populate_ruleset_eal failed: " + res.error);
+  }
+  return rs;
+}
+
+// Create a minimal IPv4/TCP frame in an mbuf from pool `mp`.
+// sport and dport are in HOST order. proto is the IP protocol number.
+// For ICMP, the first two L4 bytes are type and code (not port numbers).
+inline rte_mbuf* make_l4_pkt(rte_mempool* mp,
+                              std::uint8_t proto,
+                              std::uint16_t sport,
+                              std::uint16_t dport,
+                              bool is_icmp = false) {
+  rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  if (!m) return nullptr;
+
+  // 14 B Ethernet + 20 B IPv4 + 8 B L4 stub = 42 B.
+  constexpr std::size_t kFrameLen = 14 + 20 + 8;
+  auto* pkt = reinterpret_cast<std::uint8_t*>(rte_pktmbuf_append(m, kFrameLen));
+  if (!pkt) { rte_pktmbuf_free(m); return nullptr; }
+  std::memset(pkt, 0, kFrameLen);
+
+  // Ethernet: ethertype 0x0800 (IPv4)
+  pkt[12] = 0x08; pkt[13] = 0x00;
+  // IPv4 at offset 14: version=4, IHL=5
+  pkt[14] = 0x45;
+  // Total length = 20 + 8 = 28
+  pkt[16] = 0x00; pkt[17] = 28;
+  // Protocol
+  pkt[23] = proto;
+
+  // L4 header at offset 34.
+  if (is_icmp) {
+    // ICMP: byte[0] = type, byte[1] = code (D29 packing).
+    pkt[34] = static_cast<std::uint8_t>(dport);  // type → dport slot
+    pkt[35] = static_cast<std::uint8_t>(sport);  // code → sport slot
+  } else {
+    // TCP/UDP/SCTP: big-endian sport at offset 34-35, dport at 36-37.
+    pkt[34] = static_cast<std::uint8_t>(sport >> 8);
+    pkt[35] = static_cast<std::uint8_t>(sport & 0xFF);
+    pkt[36] = static_cast<std::uint8_t>(dport >> 8);
+    pkt[37] = static_cast<std::uint8_t>(dport & 0xFF);
+  }
+
+  // Pre-set dynfield as if classify_l2 + classify_l3 ran.
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = 14;
+  dyn->parsed_ethertype = RTE_ETHER_TYPE_IPV4;  // HOST order
+  dyn->parsed_l3_proto  = proto;
+  dyn->flags            = 0;   // no SKIP_L4
+  dyn->l4_extra         = 0;
+  dyn->verdict_action_idx = 0xFFFF;  // sentinel
+
+  return m;
+}
+
+}  // namespace l4_port_detail
+
+// -------------------------------------------------------------------------
+// U6.33 — proto+dport primary hit (TCP/443)
+//
+// Rule: proto=TCP, dport=443, action=DROP.
+// Packet: TCP sport=80 dport=443.
+// Expected: kMatch, verdict_action_idx=0.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_33_ProtoDportPrimaryHit) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 4001, ActionDrop{});
+  r1.proto = IPPROTO_TCP;
+  r1.dst_port = 443;
+
+  auto rs = build_l4_ruleset(cfg, "u6_33");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+  ASSERT_GE(rs.l4_compound_count, 1u);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_33_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/80, /*dport=*/443);
+  ASSERT_NE(m, nullptr);
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+      << "U6.33: TCP/443 must match the proto_dport primary (D15)";
+  EXPECT_EQ(trunc[0], 0u) << "U6.33: no truncation";
+
+  // Check verdict_action_idx was written.
+  const auto* dyn = eal::mbuf_dynfield(
+      static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->verdict_action_idx, 0u)
+      << "U6.33: verdict_action_idx must be 0 (first rule)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.34 — proto+dport with src-port wildcard
+//
+// Same rule (proto=TCP, dport=443, no sport constraint → filter_mask==0).
+// Inject packets with different sport values → all must match.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_34_ProtoDportWildcardSport) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 4002, ActionDrop{});
+  r1.proto = IPPROTO_TCP;
+  r1.dst_port = 443;
+  // No src_port → filter_mask has no kSrcPort bit → wildcard.
+
+  auto rs = build_l4_ruleset(cfg, "u6_34");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_34_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  // Test with two different sport values: 1234 and 65535.
+  for (std::uint16_t sport : {std::uint16_t{1234}, std::uint16_t{65535}}) {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, sport, /*dport=*/443);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+        << "U6.34: TCP/443 with any sport (" << sport
+        << ") must match when filter_mask has no SRC_PORT bit";
+
+    rte_pktmbuf_free(m);
+  }
+
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.35 — proto+dport+sport exact match
+//
+// Rule: proto=TCP, dport=443, sport=12345.
+// Matching packet (sport=12345) → kMatch.
+// Mismatching packet (sport=9999) → miss → kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_35_ProtoDportSportExact) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 4003, ActionDrop{});
+  r1.proto = IPPROTO_TCP;
+  r1.dst_port = 443;
+  r1.src_port = 12345;
+
+  auto rs = build_l4_ruleset(cfg, "u6_35");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_35_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  // Exact sport match → kMatch.
+  {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/12345, /*dport=*/443);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+        << "U6.35: TCP/443 sport=12345 must match exactly";
+
+    const auto* dyn = eal::mbuf_dynfield(
+        static_cast<const struct rte_mbuf*>(m));
+    EXPECT_EQ(dyn->verdict_action_idx, 0u)
+        << "U6.35: verdict_action_idx must be 0 (first rule)";
+
+    rte_pktmbuf_free(m);
+  }
+
+  // Sport mismatch → filter_mask rejects → miss → kTerminalPass.
+  {
+    auto* m = make_l4_pkt(mp, IPPROTO_TCP, /*sport=*/9999, /*dport=*/443);
+    ASSERT_NE(m, nullptr);
+
+    dataplane::L4TruncCtrs trunc{};
+    const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+    EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kTerminalPass)
+        << "U6.35: TCP/443 sport=9999 must NOT match (filter_mask SRC_PORT rejects)";
+
+    rte_pktmbuf_free(m);
+  }
+
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.41 — ICMP type/code packing (D29)
+//
+// Rule: proto=ICMP (1), dport=8 (echo request type).
+// Also has src_port=0 (filter_mask kSrcPort → checks code=0).
+// Packet: ICMP type=8, code=0 → primary key = (1<<16)|8 → hit.
+// filter_mask SRC_PORT: want_src_port=0 vs pkt code=0 → pass.
+// Expected: kMatch, verdict_action_idx=0.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL4PortTest, U6_41_IcmpTypeCodePackingD29) {
+  using namespace builder_eal;
+  using namespace l4_port_detail;
+
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  Config cfg = make_config();
+  auto& r1 = append_rule(cfg.pipeline.layer_4, 4004, ActionDrop{});
+  r1.proto = IPPROTO_ICMP;   // 1
+  r1.dst_port = 8;           // ICMP type = 8 (echo request) → dport slot
+  r1.src_port = 0;           // ICMP code = 0 → sport slot (D29: want_src_port)
+
+  auto rs = build_l4_ruleset(cfg, "u6_41");
+  ASSERT_NE(rs.l4_compound_hash, nullptr);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_41_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  // Build ICMP packet: type=8 (→dport), code=0 (→sport). D29 packing.
+  auto* m = make_l4_pkt(mp, IPPROTO_ICMP,
+                         /*sport=*/0, /*dport=*/8,
+                         /*is_icmp=*/true);
+  ASSERT_NE(m, nullptr);
+
+  dataplane::L4TruncCtrs trunc{};
+  const auto verdict = dataplane::classify_l4(m, rs, &trunc);
+
+  EXPECT_EQ(verdict, dataplane::ClassifyL4Verdict::kMatch)
+      << "U6.41: ICMP echo-request (type=8, code=0) must match via D29 packing";
+
+  const auto* dyn = eal::mbuf_dynfield(
+      static_cast<const struct rte_mbuf*>(m));
+  EXPECT_EQ(dyn->verdict_action_idx, 0u)
+      << "U6.41: verdict_action_idx must be 0 (first rule, D29)";
+
+  rte_pktmbuf_free(m);
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test

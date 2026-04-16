@@ -44,9 +44,12 @@
 
 #include <rte_byteorder.h>
 #include <rte_ether.h>
+#include <rte_hash.h>
 #include <rte_ip.h>
 #include <rte_mbuf.h>
+#include <rte_udp.h>
 
+#include "src/compiler/rule_compiler.h"
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 #include "src/ruleset/types.h"
@@ -104,7 +107,7 @@ enum class ClassifyL4Verdict : std::uint8_t {
 // classify_l2 / classify_l3.
 
 inline ClassifyL4Verdict classify_l4(struct rte_mbuf* m,
-                                     const ruleset::Ruleset& /*rs*/,
+                                     const ruleset::Ruleset& rs,
                                      L4TruncCtrs* trunc_ctrs = nullptr) noexcept {
   auto* dyn = eal::mbuf_dynfield(m);
 
@@ -166,10 +169,67 @@ inline ClassifyL4Verdict classify_l4(struct rte_mbuf* m,
     return ClassifyL4Verdict::kTerminalDrop;
   }
 
-  // ---- C0 skeleton: no hash lookups yet (C1/C2 scope) -------------------
+  // ---- C1: Port parsing + D29 ICMP packing ------------------------------
   //
-  // L4 miss → TERMINAL_PASS. The packet was not matched by any L4 rule
-  // and the worker will apply the default action (M7).
+  // TCP/UDP/SCTP: read big-endian sport/dport from the first 4 bytes.
+  // ICMP/ICMPv6 (D29): type → dport slot, code → sport slot.
+  //   This unifies the compound key shape: a rule matching ICMP type=8
+  //   stores `dport=8` in the primary key, and `code` in want_src_port
+  //   with the SRC_PORT filter_mask bit.
+  // Other protos: sport=0, dport=0 (no port to key on).
+  std::uint16_t sport = 0;
+  std::uint16_t dport = 0;
+  if (proto == IPPROTO_TCP || proto == IPPROTO_UDP ||
+      proto == IPPROTO_SCTP) {
+    auto* l4 = rte_pktmbuf_mtod_offset(m, const struct rte_udp_hdr*, l4off);
+    sport = rte_be_to_cpu_16(l4->src_port);
+    dport = rte_be_to_cpu_16(l4->dst_port);
+  } else if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6) {
+    auto* icmp = rte_pktmbuf_mtod_offset(m, const std::uint8_t*, l4off);
+    dport = icmp[0];  // type → dport slot
+    sport = icmp[1];  // code → sport slot
+  }
+
+  // Write parsed ports to dynfield for observability / later stages.
+  dyn->parsed_l4_sport = sport;
+  dyn->parsed_l4_dport = dport;
+
+  // ---- C1: proto_dport primary hash probe (D15 selectivity tier 1) ------
+  //
+  // Key: (proto << 16) | dport — most-selective L4 compound primary.
+  // On hit, check filter_mask secondary constraints (SRC_PORT).
+  // On match, write verdict_action_idx and return kMatch.
+  if (rs.l4_compound_hash) {
+    const std::uint32_t key_pd =
+        (static_cast<std::uint32_t>(proto) << 16) | dport;
+    void* data = nullptr;
+    int ret = rte_hash_lookup_data(rs.l4_compound_hash, &key_pd, &data);
+    if (ret >= 0 && data) {
+      const auto* e = static_cast<const ruleset::L4CompoundEntry*>(data);
+      // Filter_mask secondary check: SRC_PORT bit (D29: also serves as
+      // ICMP code match). If the bit is set, want_src_port must match
+      // the packet's sport (or ICMP code). If not set, sport is wildcard.
+      bool filter_ok = true;
+      if (e->filter_mask & compiler::l4_mask::kSrcPort) {
+        if (e->want_src_port != sport) {
+          filter_ok = false;
+        }
+      }
+      // TODO C2: add kTcpFlags and kVrf checks here.
+
+      if (filter_ok) {
+        dyn->verdict_action_idx = e->action_idx;
+        return ClassifyL4Verdict::kMatch;
+      }
+    }
+  }
+
+  // ---- C2 scope: proto_sport + proto_only probes go here ----------------
+
+  // ---- L4 miss → TERMINAL_PASS -----------------------------------------
+  //
+  // The packet was not matched by any L4 rule. The worker will apply the
+  // default action (M7).
   return ClassifyL4Verdict::kTerminalPass;
 }
 
