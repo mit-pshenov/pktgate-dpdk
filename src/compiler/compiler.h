@@ -85,6 +85,24 @@ struct CompiledAction {
   std::uint16_t counter_slot{0};
   ActionVerb verb{ActionVerb::kDrop};
   ExecutionTier execution_tier{ExecutionTier::kSw};  // D4: default SW
+
+  // M7 C2b retrofit — action payload carried through to RuleAction.
+  //
+  // Before this cycle the compiler stored only the verb enum and the
+  // builder hardcoded dscp/pcp=0 + redirect_port=0xFFFF. Result: TAG
+  // actions were no-ops (DSCP=0, PCP=0) and REDIRECT silently dropped
+  // every packet (sentinel port → apply_redirect guard). Same D41
+  // silent-lowering class as M2 compound builders and M5 C3 fragment
+  // policy — fixed by carrying the config::RuleAction variant payload
+  // into CompiledAction and copying it in builder::copy_actions.
+  //
+  // Defaults match the "no TAG / no REDIRECT" case so non-TAG /
+  // non-REDIRECT verbs behave unchanged: dscp=0 is a no-op rewrite and
+  // redirect_port=0xFFFF matches the action::RuleAction sentinel used
+  // by apply_redirect to reject bogus port indices.
+  std::uint8_t dscp{0};
+  std::uint8_t pcp{0};
+  std::uint16_t redirect_port{0xFFFF};
 };
 
 // -------------------------------------------------------------------------
@@ -182,6 +200,13 @@ struct CompileResult {
   // this into Ruleset.fragment_policy. Numeric encoding matches
   // classify_l3.h FragmentPolicy (0=L3Only, 1=Drop, 2=Allow).
   std::uint8_t fragment_policy = 0;
+
+  // M7 C2b retrofit (D41): default_behavior propagated from Config.
+  // The builder copies this into Ruleset.default_action. Numeric
+  // encoding matches config::DefaultBehavior (0=kAllow, 1=kDrop) and
+  // the ruleset.h comment ("0 = ALLOW or DROP"). Pattern mirrors
+  // fragment_policy above — see errata §M7 C2b.
+  std::uint8_t default_action = 0;
 
   // D7: compile error (e.g., mirror not implemented in MVP).
   // When set, the result is invalid — the caller must not use the

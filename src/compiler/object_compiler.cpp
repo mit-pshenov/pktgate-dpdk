@@ -49,28 +49,82 @@ CompiledObjects compile_objects(const config::ObjectPool& pool) {
 
 // -------------------------------------------------------------------------
 // Action verb resolution from config::RuleAction variant.
+//
+// M7 C2b retrofit (D41): this helper is the single place where the
+// config::RuleAction variant is lowered into the compiler's flat
+// CompiledAction representation. Beyond the verb enum it fills the
+// action-specific payload fields (dscp/pcp for TAG, redirect_port for
+// REDIRECT) so the ruleset builder no longer has to hardcode zeros /
+// sentinels. See errata §M7 C2b.
+//
+// Role-name resolution policy (REDIRECT): we resolve `role_name` against
+// `cfg.interface_roles` in declaration order, matching the convention
+// main.cpp uses to pair ports with roles (RTE_ETH_FOREACH_DEV iterates
+// available ports in order and zips them with the interface_roles
+// vector, so interface_roles[0] → port_ids[0], interface_roles[1] →
+// port_ids[1]). Keeping resolution inside the compiler keeps the
+// CompiledAction POD and avoids threading a port-name registry through
+// the builder. Unknown role names fall back to 0xFFFF (sentinel drop),
+// which the validator is expected to catch at a higher tier — the
+// compiler does not enforce symbol resolution here.
 
-static ActionVerb resolve_verb(const config::RuleAction& action) {
-  return std::visit(
-      [](const auto& a) -> ActionVerb {
+struct ActionLowered {
+  ActionVerb verb{ActionVerb::kDrop};
+  std::uint8_t dscp{0};
+  std::uint8_t pcp{0};
+  std::uint16_t redirect_port{0xFFFF};
+};
+
+static std::uint16_t resolve_role_idx(
+    const std::vector<config::InterfaceRole>& roles,
+    const std::string& role_name) {
+  for (std::size_t i = 0; i < roles.size(); ++i) {
+    if (roles[i].name == role_name) {
+      return static_cast<std::uint16_t>(i);
+    }
+  }
+  return 0xFFFFu;  // unknown role: keep sentinel (validator territory)
+}
+
+static ActionLowered resolve_action(
+    const config::RuleAction& action,
+    const std::vector<config::InterfaceRole>& roles) {
+  ActionLowered out;
+  std::visit(
+      [&](const auto& a) {
         using T = std::decay_t<decltype(a)>;
-        if constexpr (std::is_same_v<T, config::ActionAllow>)
-          return ActionVerb::kAllow;
-        else if constexpr (std::is_same_v<T, config::ActionDrop>)
-          return ActionVerb::kDrop;
-        else if constexpr (std::is_same_v<T, config::ActionRateLimit>)
-          return ActionVerb::kRateLimit;
-        else if constexpr (std::is_same_v<T, config::ActionTag>)
-          return ActionVerb::kTag;
-        else if constexpr (std::is_same_v<T, config::ActionTargetPort>)
-          return ActionVerb::kRedirect;
-        else if constexpr (std::is_same_v<T, config::ActionMirror>)
-          return ActionVerb::kMirror;
-        else
-          return ActionVerb::kDrop;  // unreachable with exhaustive variant
+        if constexpr (std::is_same_v<T, config::ActionAllow>) {
+          out.verb = ActionVerb::kAllow;
+        } else if constexpr (std::is_same_v<T, config::ActionDrop>) {
+          out.verb = ActionVerb::kDrop;
+        } else if constexpr (std::is_same_v<T, config::ActionRateLimit>) {
+          out.verb = ActionVerb::kRateLimit;
+        } else if constexpr (std::is_same_v<T, config::ActionTag>) {
+          out.verb = ActionVerb::kTag;
+          // ActionTag stores signed fields with -1 = "unset". The
+          // parser clamps the positive branch to valid ranges
+          // (DSCP 0..63, PCP 0..7), so the cast-down is safe. When
+          // unset we keep the POD default of 0 (no-op rewrite).
+          if (a.dscp >= 0) {
+            out.dscp = static_cast<std::uint8_t>(a.dscp);
+          }
+          if (a.pcp >= 0) {
+            out.pcp = static_cast<std::uint8_t>(a.pcp);
+          }
+        } else if constexpr (std::is_same_v<T, config::ActionTargetPort>) {
+          out.verb = ActionVerb::kRedirect;
+          out.redirect_port = resolve_role_idx(roles, a.role_name);
+        } else if constexpr (std::is_same_v<T, config::ActionMirror>) {
+          out.verb = ActionVerb::kMirror;
+          // Mirror is compile-error-rejected below; no payload lowered.
+        } else {
+          out.verb = ActionVerb::kDrop;  // exhaustive variant
+        }
       },
       action);
+  return out;
 }
+
 
 // -------------------------------------------------------------------------
 // compile — full pipeline.
@@ -96,20 +150,33 @@ CompileResult compile(const config::Config& cfg,
   //   5. Otherwise, create one entry with dst_port = -1.
 
   const bool hw_enabled = opts.hw_offload_enabled;
+  const auto& roles = cfg.interface_roles;
 
   auto compile_layer =
-      [hw_enabled](const std::vector<config::Rule>& rules, Layer layer,
+      [hw_enabled, &roles](const std::vector<config::Rule>& rules, Layer layer,
          std::vector<CompiledAction>& actions,
          std::vector<CompiledRuleEntry>& entries) {
         std::uint16_t slot = 0;
 
         for (const auto& rule : rules) {
-          // Create action with dense counter_slot
+          // Create action with dense counter_slot + full payload
+          // lowering (M7 C2b retrofit, D41): the verb AND the
+          // action-specific fields (dscp/pcp for TAG,
+          // redirect_port for REDIRECT) travel through
+          // CompiledAction so the ruleset builder no longer
+          // hardcodes zeros/sentinels in copy_actions.
           CompiledAction action;
           action.rule_id = rule.id;
           action.counter_slot = slot++;
-          action.verb = rule.action ? resolve_verb(*rule.action)
-                                    : ActionVerb::kDrop;
+          if (rule.action) {
+            const auto lowered = resolve_action(*rule.action, roles);
+            action.verb = lowered.verb;
+            action.dscp = lowered.dscp;
+            action.pcp = lowered.pcp;
+            action.redirect_port = lowered.redirect_port;
+          } else {
+            action.verb = ActionVerb::kDrop;
+          }
           // D4 tiering: honor hw_offload_hint only when globally enabled.
           // MVP default: hw_enabled == false → everything stays kSw.
           action.execution_tier =
@@ -160,6 +227,12 @@ CompileResult compile(const config::Config& cfg,
 
   // D17: propagate fragment_policy from config to CompileResult.
   result.fragment_policy = static_cast<std::uint8_t>(cfg.fragment_policy);
+
+  // M7 C2b retrofit (D41): propagate default_behavior from config to
+  // CompileResult. Encoding matches config::DefaultBehavior
+  // (kAllow=0, kDrop=1). The builder copies this into
+  // Ruleset.default_action — see errata §M7 C2b.
+  result.default_action = static_cast<std::uint8_t>(cfg.default_behavior);
 
   // D7: reject mirror action in MVP. Scan all layers for kMirror.
   auto check_mirror = [](const std::vector<CompiledAction>& actions)

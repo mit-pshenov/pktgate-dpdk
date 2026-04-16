@@ -40,6 +40,13 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
 
   // Copy compiled actions into arenas. The compiler produces a dense
   // vector per layer; we copy into the pre-allocated arena.
+  //
+  // M7 C2b retrofit (D41): dscp / pcp / redirect_port come from
+  // CompiledAction (filled by object_compiler::resolve_action), not
+  // hardcoded. Before the retrofit these three fields stayed at
+  // zero / 0xFFFF regardless of config — making TAG a no-op and
+  // REDIRECT a silent drop. mirror_port stays 0xFFFF (mirror is
+  // compile-rejected in MVP, D7) and rl_index stays 0 (RL is M9).
   auto copy_actions = [](action::RuleAction* dst, std::uint32_t dst_cap,
                          const std::vector<compiler::CompiledAction>& src)
       -> std::uint32_t {
@@ -54,10 +61,10 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       d.next_layer = 0;
       d.execution_tier = static_cast<std::uint8_t>(s.execution_tier);
       d.flags = 0;
-      d.redirect_port = 0xFFFF;
+      d.redirect_port = s.redirect_port;
       d.mirror_port = 0xFFFF;
-      d.dscp = 0;
-      d.pcp = 0;
+      d.dscp = s.dscp;
+      d.pcp = s.pcp;
       d.rl_index = 0;
     }
     return n;
@@ -88,6 +95,9 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
 
   // ---- D17: fragment_policy from CompileResult ----
   rs.fragment_policy = cr.fragment_policy;
+
+  // ---- M7 C2b (D41): default_action from CompileResult ----
+  rs.default_action = cr.default_action;
 
   // ---- Generation (D12) ----
   rs.generation =
@@ -157,6 +167,9 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       alloc.allocate(action_bytes, action_align, socket_id, alloc.ctx));
 
   // Copy compiled actions into arenas.
+  //
+  // M7 C2b retrofit (D41): see copy_actions in the zero-arg overload
+  // above — dscp / pcp / redirect_port now come from CompiledAction.
   auto copy_actions = [](action::RuleAction* dst, std::uint32_t dst_cap,
                          const std::vector<compiler::CompiledAction>& src)
       -> std::uint32_t {
@@ -171,10 +184,10 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       d.next_layer = 0;
       d.execution_tier = static_cast<std::uint8_t>(s.execution_tier);
       d.flags = 0;
-      d.redirect_port = 0xFFFF;
+      d.redirect_port = s.redirect_port;
       d.mirror_port = 0xFFFF;
-      d.dscp = 0;
-      d.pcp = 0;
+      d.dscp = s.dscp;
+      d.pcp = s.pcp;
       d.rl_index = 0;
     }
     return n;
@@ -204,6 +217,9 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
 
   // ---- D17: fragment_policy from CompileResult ----
   rs.fragment_policy = cr.fragment_policy;
+
+  // ---- M7 C2b (D41): default_action from CompileResult ----
+  rs.default_action = cr.default_action;
 
   // ---- Generation (D12) ----
   rs.generation =

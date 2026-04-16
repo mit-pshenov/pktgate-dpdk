@@ -513,4 +513,137 @@ TEST(RulesetBuilder, FragmentPolicyWired_U6_22) {
       << "fragment_policy kL3Only (0) must propagate (default)";
 }
 
+// =========================================================================
+// U3.Smoke2 — TAG action lowering: dscp/pcp propagate to RuleAction
+//
+// Config with a TAG rule (dscp=46, pcp=5) goes through compile() →
+// build_ruleset(). The resulting action::RuleAction slot must carry the
+// same dscp/pcp and verb=kTag. Before C2b retrofit, the compiler's
+// CompiledAction carries only the verb enum — dscp/pcp are silently
+// dropped and builder::copy_actions hardcodes zeros. Covers D41 retrofit,
+// D19 TAG payload. Errata §M7 C2b.
+// =========================================================================
+TEST(RulesetBuilder, TagActionLowered_U3_Smoke2) {
+  Config cfg = make_config();
+
+  // Single L2 rule carrying a TAG action with non-zero DSCP and PCP.
+  ActionTag tag;
+  tag.dscp = 46;  // EF (expedited forwarding)
+  tag.pcp = 5;    // voice class
+  auto& r = append_rule(cfg.pipeline.layer_2, 1001, tag);
+  r.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}};
+
+  auto cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile must succeed";
+  ASSERT_EQ(cr.l2_actions.size(), 1u);
+
+  // CompiledAction must carry the dscp/pcp payload — this is the
+  // compiler-side half of the retrofit.
+  EXPECT_EQ(cr.l2_actions[0].verb, ActionVerb::kTag)
+      << "CompiledAction.verb must reflect the tag action";
+  EXPECT_EQ(cr.l2_actions[0].dscp, 46u)
+      << "CompiledAction.dscp must carry config::ActionTag.dscp (D41 retrofit)";
+  EXPECT_EQ(cr.l2_actions[0].pcp, 5u)
+      << "CompiledAction.pcp must carry config::ActionTag.pcp (D41 retrofit)";
+
+  constexpr unsigned kNumLcores = 2;
+  auto rs = build_ruleset(cr, cfg.sizing, kNumLcores);
+
+  ASSERT_GE(rs.n_l2_rules, 1u);
+  ASSERT_NE(rs.l2_actions, nullptr);
+
+  const auto& ra = rs.l2_actions[0];
+  EXPECT_EQ(static_cast<unsigned>(ra.verb),
+            static_cast<unsigned>(ActionVerb::kTag))
+      << "RuleAction.verb must equal kTag after lowering";
+  EXPECT_EQ(static_cast<unsigned>(ra.dscp), 46u)
+      << "RuleAction.dscp must equal config dscp=46 after builder copy "
+         "(hardcoded 0 before retrofit)";
+  EXPECT_EQ(static_cast<unsigned>(ra.pcp), 5u)
+      << "RuleAction.pcp must equal config pcp=5 after builder copy";
+}
+
+// =========================================================================
+// U3.Smoke3 — REDIRECT action lowering: role_name resolves to port_idx
+//
+// Config with a REDIRECT rule targeting "downstream_port" (second role in
+// interface_roles) goes through compile() → build_ruleset(). The
+// RuleAction slot must carry redirect_port = 1 (index of the matching
+// role) and verb = kRedirect. Before C2b retrofit, builder hardcodes
+// redirect_port = 0xFFFF, which apply_redirect treats as a drop.
+// Covers D41 retrofit, D16 REDIRECT port. Errata §M7 C2b.
+// =========================================================================
+TEST(RulesetBuilder, RedirectActionLowered_U3_Smoke3) {
+  Config cfg = make_config();
+  // make_config() pre-populates two roles: upstream_port (idx 0),
+  // downstream_port (idx 1). Target downstream_port so the expected
+  // index is 1 (distinct from the 0xFFFF sentinel and 0).
+
+  ActionTargetPort redir;
+  redir.role_name = "downstream_port";
+  auto& r = append_rule(cfg.pipeline.layer_2, 2001, redir);
+  r.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
+
+  auto cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile must succeed";
+  ASSERT_EQ(cr.l2_actions.size(), 1u);
+
+  EXPECT_EQ(cr.l2_actions[0].verb, ActionVerb::kRedirect)
+      << "CompiledAction.verb must reflect the redirect action";
+  EXPECT_EQ(cr.l2_actions[0].redirect_port, 1u)
+      << "CompiledAction.redirect_port must carry resolved role idx "
+         "(downstream_port = 1)";
+
+  constexpr unsigned kNumLcores = 2;
+  auto rs = build_ruleset(cr, cfg.sizing, kNumLcores);
+
+  ASSERT_GE(rs.n_l2_rules, 1u);
+  ASSERT_NE(rs.l2_actions, nullptr);
+
+  const auto& ra = rs.l2_actions[0];
+  EXPECT_EQ(static_cast<unsigned>(ra.verb),
+            static_cast<unsigned>(ActionVerb::kRedirect))
+      << "RuleAction.verb must equal kRedirect after lowering";
+  EXPECT_EQ(ra.redirect_port, 1u)
+      << "RuleAction.redirect_port must equal resolved port_idx = 1 "
+         "(hardcoded 0xFFFF before retrofit)";
+}
+
+// =========================================================================
+// U3.Smoke4 — default_behavior lowering: Config → Ruleset.default_action
+//
+// Config with default_behavior=kDrop must produce Ruleset.default_action=1;
+// default_behavior=kAllow must produce 0. Before C2b retrofit, neither
+// the compiler nor the builder read cfg.default_behavior and
+// rs.default_action stays at its POD-default 0 regardless of config.
+// Covers D7 (default arm), D41 retrofit. Errata §M7 C2b.
+// =========================================================================
+TEST(RulesetBuilder, DefaultActionLowered_U3_Smoke4) {
+  // Case 1: default_behavior = kDrop → rs.default_action == 1.
+  Config cfg_drop = make_config();
+  cfg_drop.default_behavior = DefaultBehavior::kDrop;
+  append_rule(cfg_drop.pipeline.layer_4, 3001, ActionAllow{});
+
+  auto cr_drop = compile(cfg_drop);
+  ASSERT_FALSE(cr_drop.error.has_value());
+
+  constexpr unsigned kNumLcores = 2;
+  auto rs_drop = build_ruleset(cr_drop, cfg_drop.sizing, kNumLcores);
+  EXPECT_EQ(static_cast<unsigned>(rs_drop.default_action), 1u)
+      << "default_behavior=kDrop must lower to rs.default_action=1 "
+         "(stays 0 before retrofit)";
+
+  // Case 2: default_behavior = kAllow → rs.default_action == 0.
+  Config cfg_allow = make_config();
+  cfg_allow.default_behavior = DefaultBehavior::kAllow;
+  append_rule(cfg_allow.pipeline.layer_4, 3002, ActionAllow{});
+
+  auto cr_allow = compile(cfg_allow);
+  ASSERT_FALSE(cr_allow.error.has_value());
+
+  auto rs_allow = build_ruleset(cr_allow, cfg_allow.sizing, kNumLcores);
+  EXPECT_EQ(static_cast<unsigned>(rs_allow.default_action), 0u)
+      << "default_behavior=kAllow must lower to rs.default_action=0";
+}
+
 }  // namespace
