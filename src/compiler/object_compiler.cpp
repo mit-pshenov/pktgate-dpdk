@@ -158,6 +158,9 @@ CompileResult compile(const config::Config& cfg,
   compile_layer(cfg.pipeline.layer_4, Layer::kL4, result.l4_actions,
                 result.l4_entries);
 
+  // D17: propagate fragment_policy from config to CompileResult.
+  result.fragment_policy = static_cast<std::uint8_t>(cfg.fragment_policy);
+
   // D7: reject mirror action in MVP. Scan all layers for kMirror.
   auto check_mirror = [](const std::vector<CompiledAction>& actions)
       -> bool {

@@ -460,4 +460,57 @@ TEST(RulesetBuilder, TxQueueSymmetry_U4_16) {
   EXPECT_EQ(errors3[0].max_tx_queues, 0u);
 }
 
+// =========================================================================
+// U6.22 Config fragment_policy → Ruleset.fragment_policy wiring
+//
+// Config with fragment_policy = kDrop (value 1) goes through compile() →
+// build_ruleset(). The resulting Ruleset.fragment_policy must be 1
+// (kFragDrop). Today nothing copies the value, so rs.fragment_policy
+// stays 0 (kFragL3Only by POD-init luck) → FAIL. Covers D17, errata
+// §M5 C3 silent gap.
+// =========================================================================
+TEST(RulesetBuilder, FragmentPolicyWired_U6_22) {
+  Config cfg = make_config();
+  cfg.fragment_policy = FragmentPolicy::kDrop;  // value 1
+
+  // Need at least one L3 rule so compile is non-trivial.
+  append_rule(cfg.pipeline.layer_3, 900, ActionDrop{});
+
+  auto cr = compile(cfg);
+  ASSERT_FALSE(cr.error.has_value()) << "compile must succeed";
+
+  constexpr unsigned kNumLcores = 2;
+  auto rs = build_ruleset(cr, cfg.sizing, kNumLcores);
+
+  // fragment_policy must be 1 (kFragDrop), NOT 0 (kFragL3Only).
+  EXPECT_EQ(rs.fragment_policy, 1u)
+      << "fragment_policy must propagate from Config through CompileResult "
+         "to Ruleset; got " << static_cast<unsigned>(rs.fragment_policy)
+      << " (expected 1 = kFragDrop)";
+
+  // Also verify the kAllow path.
+  Config cfg2 = make_config();
+  cfg2.fragment_policy = FragmentPolicy::kAllow;  // value 2
+  append_rule(cfg2.pipeline.layer_3, 901, ActionAllow{});
+
+  auto cr2 = compile(cfg2);
+  ASSERT_FALSE(cr2.error.has_value());
+
+  auto rs2 = build_ruleset(cr2, cfg2.sizing, kNumLcores);
+  EXPECT_EQ(rs2.fragment_policy, 2u)
+      << "fragment_policy kAllow (2) must propagate; got "
+      << static_cast<unsigned>(rs2.fragment_policy);
+
+  // And the default kL3Only — this one passes today by luck (POD=0).
+  Config cfg3 = make_config();
+  append_rule(cfg3.pipeline.layer_3, 902, ActionDrop{});
+
+  auto cr3 = compile(cfg3);
+  ASSERT_FALSE(cr3.error.has_value());
+
+  auto rs3 = build_ruleset(cr3, cfg3.sizing, kNumLcores);
+  EXPECT_EQ(rs3.fragment_policy, 0u)
+      << "fragment_policy kL3Only (0) must propagate (default)";
+}
+
 }  // namespace

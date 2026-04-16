@@ -980,9 +980,13 @@ built in-process via U3/U4 helpers.
 - Covers: D21 (the exact cliff), D17.
 
 ### U6.22 L3 IPv4 — non-first fragment, FRAG_L3_ONLY, L3
-  hit → TERMINAL_L3
+  hit → kTerminalPass (SKIP_L4 collapses kNextL4)
 - Goal: non-first fragment but an L3 rule matches anyway;
-  L3 rule's action is applied, L4 never runs.
+  L3 rule's action is applied, L4 never runs (SKIP_L4 flag
+  set on non-first, so kNextL4 collapses to kTerminalPass).
+  Also covers cfg→rs wiring: compile(Config) → CompileResult
+  → build_ruleset() must propagate fragment_policy (D17,
+  errata §M5 C3 silent gap).
 - Covers: D17.
 
 ### U6.23 L3 IPv4 — fragment, FRAG_DROP → TERMINAL_DROP

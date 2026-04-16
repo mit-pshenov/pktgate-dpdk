@@ -178,6 +178,11 @@ struct CompileResult {
   std::vector<L3CompiledRule> l3_compound;
   std::vector<L4CompiledRule> l4_compound;
 
+  // D17: fragment_policy propagated from Config. The builder copies
+  // this into Ruleset.fragment_policy. Numeric encoding matches
+  // classify_l3.h FragmentPolicy (0=L3Only, 1=Drop, 2=Allow).
+  std::uint8_t fragment_policy = 0;
+
   // D7: compile error (e.g., mirror not implemented in MVP).
   // When set, the result is invalid — the caller must not use the
   // compiled structures.

@@ -86,6 +86,9 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
     rs.counters = static_cast<RuleCounter*>(mem);
   }
 
+  // ---- D17: fragment_policy from CompileResult ----
+  rs.fragment_policy = cr.fragment_policy;
+
   // ---- Generation (D12) ----
   rs.generation =
       g_generation.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -198,6 +201,9 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   // ---- Allocator bookkeeping (D23) ----
   rs.free_fn = alloc.deallocate;
   rs.free_ctx = alloc.ctx;
+
+  // ---- D17: fragment_policy from CompileResult ----
+  rs.fragment_policy = cr.fragment_policy;
 
   // ---- Generation (D12) ----
   rs.generation =
