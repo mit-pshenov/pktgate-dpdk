@@ -7,7 +7,6 @@
 // Design anchors: §6.1 (init sequence), §6.4 (shutdown),
 // D9 (g_active scaffold), D23 (NUMA-aware mempool).
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rte_eal.h>
@@ -29,6 +29,7 @@
 #include "src/config/sizing.h"
 #include "src/config/validator.h"
 #include "src/ctl/bootstrap.h"
+#include "src/ctl/reload.h"
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
@@ -64,8 +65,13 @@ std::string read_file(const std::string& path) {
   return ss.str();
 }
 
-// D9 scaffold: global active ruleset pointer. Real QSBR arrives in M8.
-std::atomic<pktgate::ruleset::Ruleset*> g_active{nullptr};
+// D9 (M8 C1): g_active now lives inside the reload manager
+// (src/ctl/reload.{h,cpp}). The main binary uses the accessor
+// pktgate::ctl::reload::active_ruleset() to read it — no local atomic
+// needed. The old `std::atomic<Ruleset*> g_active` that lived here
+// moved to the manager so reload_mutex (D35) can serialise every
+// publish and the single-owner invariant (D9) is enforced by
+// construction.
 
 }  // namespace
 
@@ -314,8 +320,33 @@ int main(int argc, char* argv[]) {
             ",\"num_lcores\":" + std::to_string(ruleset->num_lcores) +
             "}").c_str());
 
-  // D9 scaffold: publish ruleset via atomic store.
-  g_active.store(ruleset.get(), std::memory_order_release);
+  // D9 (M8 C1): publish via the reload manager instead of a bare
+  // atomic store in main.cpp. The manager owns the single g_active
+  // pointer and the reload_mutex (D35); every future publish (the
+  // UDS cmd_socket in later cycles, inotify in M11) funnels through
+  // deploy(). For the initial boot-time publish we use
+  // `deploy_prebuilt` because main.cpp already drove the
+  // parse/validate/compile/build/populate pipeline above.
+  {
+    pktgate::ctl::reload::InitParams rp;
+    rp.socket_id   = static_cast<int>(socket_id);
+    rp.num_lcores  = num_lcores_for_counters;
+    rp.max_entries = cfg.sizing.rules_per_layer_max;
+    rp.name_prefix = "pktgate_boot";
+    pktgate::ctl::reload::init(rp);
+
+    // Hand ownership of the built Ruleset to the manager. The
+    // unique_ptr above is released; the manager becomes the owner.
+    auto publish_res =
+        pktgate::ctl::reload::deploy_prebuilt(std::move(ruleset));
+    if (!publish_res.ok) {
+      log_json("{\"error\":\"reload_publish_failed\",\"reason\":\"" +
+               publish_res.error + "\"}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+  }
 
   // ---- Phase 7: launch worker(s) ----
   //
@@ -326,7 +357,10 @@ int main(int argc, char* argv[]) {
   worker_ctx.tx_port_id = port_ids[1];
   worker_ctx.queue_id = 0;
   worker_ctx.running = &pktgate::ctl::g_running;
-  worker_ctx.ruleset = ruleset.get();  // M4 C1: wire active Ruleset
+  // M8 C1: the reload manager now owns the Ruleset; fetch the live
+  // pointer via active_ruleset() (acquire-load). `ruleset` above was
+  // moved into deploy_prebuilt(), so `ruleset.get()` is nullptr here.
+  worker_ctx.ruleset = pktgate::ctl::reload::active_ruleset();
   // M7 C0: wire the production TX burst function. Unit tests swap
   // this for a spy; production always uses rte_eth_tx_burst.
   worker_ctx.tx_burst_fn = &rte_eth_tx_burst;
@@ -384,7 +418,13 @@ int main(int argc, char* argv[]) {
   // telemetry (M10) replaces this with a proper scrape endpoint; for M4
   // the log line is the functional observable F2 tests assert on.
   {
-    const auto& rs = *ruleset;
+    // M8 C1: fetch the live ruleset via the reload manager. Under
+    // the shutdown guarantees the manager owns the single pointer;
+    // `active_ruleset()` returns non-null for the whole lifetime of
+    // the worker and for this stats emission (shutdown comes later).
+    const pktgate::ruleset::Ruleset* rs_ptr =
+        pktgate::ctl::reload::active_ruleset();
+    const auto& rs = *rs_ptr;
     std::string stats_json =
         "{\"event\":\"stats_on_exit\",\"rules\":[";
     bool first_entry = true;
@@ -528,9 +568,12 @@ int main(int argc, char* argv[]) {
   }
   log_json("{\"event\":\"ports_stopped\"}");
 
-  // Free ruleset.
-  g_active.store(nullptr, std::memory_order_release);
-  ruleset.reset();
+  // Free ruleset (M8 C1 STUB): shutdown() exchanges g_active → nullptr
+  // and frees the old pointer. C4 will wrap this with
+  // rte_rcu_qsbr_thread_offline / _thread_unregister per worker + a
+  // bounded rte_rcu_qsbr_synchronize to close the M4-M7 TSAN baseline
+  // race between this store and the worker's acquire-load.
+  pktgate::ctl::reload::shutdown();
   log_json("{\"event\":\"ruleset_freed\"}");
 
   // Free mempool.

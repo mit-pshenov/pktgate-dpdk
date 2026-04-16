@@ -149,6 +149,8 @@ if(NOT PKTGATE_FUZZ)
     src/eal/dynfield.cpp
     src/dataplane/worker.cpp
     src/ctl/bootstrap.cpp
+    src/ctl/cmd_socket.cpp
+    src/ctl/reload.cpp
     src/ruleset/builder_eal.cpp
   )
   target_include_directories(pktgate_dp PUBLIC ${CMAKE_SOURCE_DIR})

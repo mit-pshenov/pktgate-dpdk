@@ -61,3 +61,8 @@ pktgate_add_test(
   LABELS  "unit;needs-eal"
   LINK    pktgate_dp
 )
+# M8 C1: flip U6.43b — g_active now lives in the reload manager
+# (src/ctl/reload.{h,cpp}), not in main.cpp. Defined as a compile-time
+# flag so the test body at tests/unit/test_eal_unit.cpp U6.43b can
+# include the reload header and assert the owning symbol exists.
+target_compile_definitions(unit_test_eal_unit PRIVATE M8_C1_DONE=1)

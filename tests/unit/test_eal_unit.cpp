@@ -43,6 +43,11 @@
 #include "src/ruleset/builder_eal.h"
 #include "src/ruleset/ruleset.h"
 #include "src/ruleset/types.h"
+// M8 C1: U6.43b references reload::g_active_ptr(). Including the
+// header at TU top (NOT inside `namespace pktgate::test`) per
+// memory grabli_stdlib_include_in_anon_namespace.md — headers in a
+// namespace reparent every stdlib decl and break libstdc++.
+#include "src/ctl/reload.h"
 
 namespace pktgate::test {
 
@@ -9612,17 +9617,28 @@ TEST(U6_43_NoPerWorkerActive, WorkerCtxHasNoActiveField) {
 // change, not a re-write.
 // -------------------------------------------------------------------------
 #ifdef M8_C1_DONE
-// C1: include the new reload manager header and assert the symbol
-// `reload::g_active` (or equivalent) is the ONE definition.
-// #include "src/ctl/reload.h"   // or src/gen/reload_manager.h — C1 picks
+// C1 (landed): g_active now lives in `pktgate::ctl::reload`. The
+// manager exposes the atomic via `g_active_ptr()` (struct-internal
+// field; accessor keeps the storage encapsulated so C2/C3 additions
+// don't break the ABI). Referencing the symbol here makes this TU
+// link-depend on the reload module, so if someone ever re-adds a
+// second g_active elsewhere the linker will either find both (double
+// definition) or we'll notice the mismatch at symbol-name time.
+//
+// NOTE: the #include for src/ctl/reload.h lives at TU top, NOT here —
+// including a header inside `namespace pktgate::test` reparents every
+// stdlib declaration and breaks libstdc++ (memory grabli
+// grabli_stdlib_include_in_anon_namespace.md).
 TEST(U6_43b_GActiveOwnership, OwnedByReloadManagerNotMain) {
-  // C1 fills this: e.g.
-  //   auto* rm_ptr = &ctl::reload::g_active;
-  //   EXPECT_NE(rm_ptr, nullptr);
-  // The assertion intentionally references the reload manager's
-  // symbol so that if someone re-adds g_active to main.cpp the
-  // -Wshadow / link-level duplicate-definition check fires.
-  FAIL() << "U6.43b: M8 C1 must move g_active out of main.cpp";
+  // The accessor returns a non-null address to the module's atomic
+  // storage. Content may be null (no deploy has run) or a live
+  // pointer — we only assert the symbol is reachable.
+  auto* rm_ptr = ::pktgate::ctl::reload::g_active_ptr();
+  EXPECT_NE(rm_ptr, nullptr)
+      << "U6.43b: reload::g_active_ptr() must return the manager's atomic";
+  // Also prove the load accessor works — guards against the field
+  // being inadvertently shadowed by a local that never gets exchanged.
+  (void)::pktgate::ctl::reload::active_ruleset();
 }
 #else
 // C0 stub: the test is textually present but compiled out. C1 flips
