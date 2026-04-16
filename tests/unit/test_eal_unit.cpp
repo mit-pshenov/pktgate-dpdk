@@ -4301,4 +4301,780 @@ TEST_F(ClassifyL3Ipv6FragExtTest, U6_26c_D27D40AliasInvariant) {
   rte_mempool_free(ff.mp);
 }
 
+// =========================================================================
+// M5 C7 — classify_l3 IPv4 corner tests (C2.2–C2.22)
+//
+// Twenty-one tests exercising edge cases of the IPv4 branch in classify_l3
+// (C1-C3 impl). All tests bypass classify_l2 and call classify_l3 directly.
+// No new impl — this is a test-only cycle.
+//
+// Key M5 adaptation: classify_l4 does NOT exist yet (M6). Tests that in
+// corner.md assert L4 behavior (L4 truncation, L4 rule hits) are adapted
+// to assert what classify_l3 ACTUALLY returns:
+//   - A valid L3 header with no L3 match → kNextL4 (pipeline continues)
+//   - L3 truncation / IHL reject → kTerminalDrop + trunc counter
+//   - Fragment handling per D17 fragment_policy
+//
+// Covers: D14, D17, D31, D40, D13
+// =========================================================================
+
+class ClassifyL3Ipv4CornerTest : public EalFixture {};
+
+// Helper: build_ipv4_corner_frame — allocates an mbuf of exactly `frame_len`
+// bytes, writes EtherType 0x0800 at [12..13]. Caller fills the rest.
+namespace {
+
+struct CornerFrame {
+  struct rte_mempool* mp;
+  struct rte_mbuf*    m;
+  std::uint8_t*       pkt;
+};
+
+inline CornerFrame build_corner_frame(const char* pool_name,
+                                      std::size_t frame_len) {
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      pool_name, 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  EXPECT_NE(mp, nullptr) << "mempool create failed: " << pool_name;
+  struct rte_mbuf* m = rte_pktmbuf_alloc(mp);
+  EXPECT_NE(m, nullptr);
+  EXPECT_EQ(m->nb_segs, 1);
+
+  std::uint8_t* pkt = nullptr;
+  if (frame_len > 0) {
+    pkt = reinterpret_cast<std::uint8_t*>(
+        rte_pktmbuf_append(m, static_cast<std::uint16_t>(frame_len)));
+    EXPECT_NE(pkt, nullptr);
+    std::memset(pkt, 0, frame_len);
+    if (frame_len >= 14) {
+      pkt[12] = 0x08;
+      pkt[13] = 0x00;  // EtherType 0x0800 IPv4
+    }
+  }
+  return CornerFrame{mp, m, pkt};
+}
+
+// Set dyn fields for IPv4 with a given l3_offset.
+inline void set_dyn_ipv4_corner(struct rte_mbuf* m,
+                                std::uint8_t l3_off = 14) {
+  auto* dyn = eal::mbuf_dynfield(m);
+  dyn->l3_offset        = l3_off;
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_vlan      = 0xFFFF;
+  dyn->flags            = 0;
+}
+
+}  // namespace
+
+// -------------------------------------------------------------------------
+// C2.2 — IPv4 full header but no L4 bytes (34 B frame)
+//
+// corner.md: Ether(14) + IP(20) + proto=17, no UDP payload. 34 B total.
+// M5 adaptation: L3 header is well-formed (IHL=5, 20 B present), so
+// classify_l3 passes all guards and falls through. FIB is null → kNextL4.
+// L4 truncation check is M6 scope.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_2_FullIpv4HeaderNoL4Bytes) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_corner_frame("c2_2_pool", 34);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;  // version=4, IHL=5
+  cf.pkt[23] = 17;    // proto=UDP
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.2: valid L3 header + no L3 rules → kNextL4 (L4 trunc is M6)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "C2.2: no l3_v4 truncation counter expected";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.3 — IPv4 IHL=5, frame cut at 19 B of L3 (33 B total, 1 byte short)
+//
+// pkt_len=33 < l3_off(14) + 20 = 34. D31 l3_v4 guard fires.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_3_FrameCutAt19B_L3V4Trunc) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_corner_frame("c2_3_pool", 33);
+  ASSERT_NE(cf.m, nullptr);
+  // Don't bother with version_ihl — guard fires before reading it.
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C2.3: 33 B frame (19 B L3) must be dropped by D31 l3_v4 guard";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 1u)
+      << "C2.3: pkt_truncated[l3_v4] must be 1";
+}
+
+// -------------------------------------------------------------------------
+// C2.4 — IPv4 IHL=5, frame cut at 15 B of L3 (29 B total, 5 bytes short)
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_4_FrameCutAt15B_L3V4Trunc) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_corner_frame("c2_4_pool", 29);
+  ASSERT_NE(cf.m, nullptr);
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C2.4: 29 B frame (15 B L3) must be dropped by D31 l3_v4 guard";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 1u)
+      << "C2.4: pkt_truncated[l3_v4] must be 1";
+}
+
+// -------------------------------------------------------------------------
+// C2.5 — IPv4 IHL=15 (60 B claimed) in a 40 B packet (34 B after l3_off=14)
+//
+// corner.md: IHL=15 → 60 B options-inclusive header. But only 20 B of L3
+// are present. classify_l3 passes the D31 guard (pkt_len=40 >= 14+20=34)
+// and passes the D14 IHL check (15 >= 5). FIB lookup runs. No L3 match
+// → kNextL4.
+// M5 adaptation: L4 truncation (L4 offset=14+60=74 > pkt_len=40) is M6.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_5_Ihl15In40BytePacket) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_corner_frame("c2_5_pool", 40);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x4F;  // version=4, IHL=15
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.5: IHL=15 passes IHL≥5 check, L3 guard passes (26 B ≥ 20 B), "
+         "FIB miss → kNextL4 (L4 truncation is M6 scope)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "C2.5: no l3_v4 truncation counter expected";
+}
+
+// -------------------------------------------------------------------------
+// C2.6 — IPv4 IHL=4 (bad, smaller than minimum)
+//
+// version_ihl=0x44 → IHL=4 < 5 → D14 reject at l3_v4 bucket.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_6_Ihl4Rejected) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // Full-length frame so D31 guard passes but D14 reject fires.
+  auto cf = build_corner_frame("c2_6_pool", 34);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x44;  // version=4, IHL=4 (bad)
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C2.6: IHL=4 must be rejected by D14 (IHL<5 → l3_v4 drop)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 1u)
+      << "C2.6: pkt_truncated[l3_v4] must be 1 (D14 shares l3_v4 bucket)";
+}
+
+// -------------------------------------------------------------------------
+// C2.7 — IPv4 IHL=0
+//
+// version_ihl=0x40 → IHL=0 < 5 → D14 reject.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_7_Ihl0Rejected) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_corner_frame("c2_7_pool", 34);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x40;  // version=4, IHL=0
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C2.7: IHL=0 must be rejected by D14 (IHL<5 → l3_v4 drop)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 1u)
+      << "C2.7: pkt_truncated[l3_v4] must be 1";
+}
+
+// -------------------------------------------------------------------------
+// C2.8 — IPv4 version≠4 but ethertype=0x0800 (spoof)
+//
+// version_ihl=0x65 → version=6, IHL=5. classify_l3 does NOT verify the
+// version nibble. IHL=5 ≥ 5 passes. FIB miss → kNextL4. Documents that
+// version verification is NOT in classify_l3 scope.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_8_VersionSpoofPassesIhlCheck) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  auto cf = build_corner_frame("c2_8_pool", 34);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x65;  // version=6 (spoofed), IHL=5
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.8: version≠4 under EtherType 0x0800 still passes IHL check "
+         "(classify_l3 does not verify version nibble; D14 scope)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "C2.8: no truncation expected";
+}
+
+// -------------------------------------------------------------------------
+// C2.9 — IPv4 IHL=6, valid 4-byte option (record-route stub) + TCP
+//
+// IHL=6 → 24 B header. classify_l3 passes (IHL≥5). FIB runs.
+// M5 adaptation: L4 rule is M6 scope. Assert kNextL4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_9_Ihl6WithOptionsPassesL3) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // 14 B Ether + 24 B IPv4 (IHL=6) + 20 B TCP = 58 B
+  auto cf = build_corner_frame("c2_9_pool", 58);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x46;  // version=4, IHL=6
+  cf.pkt[23] = 6;     // proto=TCP
+  // 4 bytes of IP options at [34..37]: NOP padding
+  cf.pkt[34] = 0x01;  cf.pkt[35] = 0x01;
+  cf.pkt[36] = 0x01;  cf.pkt[37] = 0x01;
+  // TCP header at [38..57]: dport=80 at offset [40..41]
+  cf.pkt[40] = 0x00;  cf.pkt[41] = 0x50;  // dport=80
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.9: IHL=6 with 4 B options passes IHL≥5 check → kNextL4 "
+         "(L4 rule matching is M6 scope)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u);
+}
+
+// -------------------------------------------------------------------------
+// C2.10 — IPv4 IHL=15, 40 B of options, TCP dport=443
+//
+// IHL=15 → 60 B header. classify_l3 passes (IHL≥5). FIB runs.
+// M5 adaptation: L4 rule is M6. Assert kNextL4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_10_Ihl15WithMaxOptionsPassesL3) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // 14 B Ether + 60 B IPv4 (IHL=15) + 20 B TCP = 94 B
+  auto cf = build_corner_frame("c2_10_pool", 94);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x4F;  // version=4, IHL=15
+  cf.pkt[23] = 6;     // proto=TCP
+  // 40 bytes of IP options at [34..73]: NOP padding
+  for (int i = 34; i < 74; ++i) cf.pkt[i] = 0x01;
+  // TCP header at [74..93]: dport=443 at offset [76..77]
+  cf.pkt[76] = 0x01;  cf.pkt[77] = 0xBB;  // dport=443
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.10: IHL=15 passes IHL≥5 check → kNextL4 (L4 rule is M6)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u);
+}
+
+// -------------------------------------------------------------------------
+// C2.11 — IPv4 non-first fragment under fragment_policy=l3_only
+//
+// Non-first fragment (offset=185, MF=0). SKIP_L4 + FIB miss →
+// kTerminalPass. pkt_frag_skipped_total_v4 += 1. No L4 dispatch.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_11_NonFirstFragL3OnlySkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto cf = build_corner_frame("c2_11_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;  // version=4, IHL=5
+  cf.pkt[23] = 17;    // proto=UDP
+  // fragment_offset=185 (units of 8), MF=0: big-endian frag word
+  // offset=185 → lower 13 bits, MF=0 → bit 13 unset.
+  const std::uint16_t frag_word = 185;  // offset in units of 8
+  cf.pkt[20] = static_cast<std::uint8_t>((frag_word >> 8) & 0xFF);
+  cf.pkt[21] = static_cast<std::uint8_t>(frag_word & 0xFF);
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C2.11: non-first frag under l3_only + FIB miss → kTerminalPass";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.11: SKIP_L4 must be set for non-first fragment";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C2.11: pkt_frag_skipped_total_v4 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C2.11: no drop counter bleed";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.12 — IPv4 non-first fragment under fragment_policy=drop
+//
+// pkt_frag_dropped_total_v4 += 1, kTerminalDrop.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_12_NonFirstFragDropPolicy) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragDrop;
+
+  auto cf = build_corner_frame("c2_12_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;
+  // Non-first: offset=185, MF=0
+  cf.pkt[20] = 0x00;  cf.pkt[21] = 0xB9;  // 185
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalDrop)
+      << "C2.12: non-first frag under drop policy → kTerminalDrop";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 1u)
+      << "C2.12: pkt_frag_dropped_total_v4 must be 1";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C2.12: no skip counter bleed";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.13 — IPv4 non-first fragment under fragment_policy=allow
+//
+// FRAG_ALLOW → kTerminalPass immediately. No counters bumped.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_13_NonFirstFragAllowPolicy) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragAllow;
+
+  auto cf = build_corner_frame("c2_13_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;
+  // Non-first: offset=185, MF=0
+  cf.pkt[20] = 0x00;  cf.pkt[21] = 0xB9;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C2.13: non-first frag under allow policy → kTerminalPass";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C2.13: FRAG_ALLOW must not bump drop counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C2.13: FRAG_ALLOW must not bump skip counter";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.14 — IPv4 first fragment (MF=1, offset=0) under l3_only
+//
+// First fragment is NOT a non-first: treated as normal packet. No SKIP_L4,
+// no frag counter. FIB miss → kNextL4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_14_FirstFragL3OnlyNotSkipped) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto cf = build_corner_frame("c2_14_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;
+  // First fragment: MF=1 (bit 13 set), offset=0.
+  // BE word: 0x2000
+  cf.pkt[20] = 0x20;  cf.pkt[21] = 0x00;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.14: first frag (MF=1, offset=0) under l3_only → kNextL4 "
+         "(first fragment carries L4 header, classify_l4 can run)";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_EQ(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.14: first frag must NOT set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u)
+      << "C2.14: first frag must NOT bump skip counter";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u)
+      << "C2.14: first frag under l3_only must NOT bump drop counter";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.15 — IPv4 first fragment (MF=1, offset=0) with L4 rule
+//
+// First fragment under l3_only is NOT skipped. classify_l3 returns kNextL4.
+// L4 rule matching is M6 scope.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_15_FirstFragWithL4Rule) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  // 14 + 20 + 8 B UDP payload = 42 B
+  auto cf = build_corner_frame("c2_15_pool", 42);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;    // proto=UDP
+  // First fragment: MF=1, offset=0
+  cf.pkt[20] = 0x20;  cf.pkt[21] = 0x00;
+  // UDP dport=53 at offset 36 (14+20+2)
+  cf.pkt[36] = 0x00;  cf.pkt[37] = 0x35;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.15: first fragment under l3_only → kNextL4 (L4 rule is M6)";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_EQ(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.15: first frag must NOT set SKIP_L4";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.16 — IPv4 single fragment (DF=1, MF=0, offset=0) — not a fragment
+//
+// DF=1 is bit 14 of the BE16 frag word → 0x4000. This packet has neither
+// MF set nor a non-zero offset, so is_frag = false. Not a fragment at all.
+// classify_l3 returns kNextL4 (no L3 rules, no fragment handling).
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_16_DfBitNotFragment) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // 14 + 20 + 20 TCP = 54 B
+  auto cf = build_corner_frame("c2_16_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 6;     // proto=TCP
+  // DF=1, MF=0, offset=0: BE word = 0x4000
+  cf.pkt[20] = 0x40;  cf.pkt[21] = 0x00;
+  // TCP dport=80 at [36..37]
+  cf.pkt[36] = 0x00;  cf.pkt[37] = 0x50;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.16: DF=1 packet is NOT a fragment → kNextL4";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_EQ(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.16: non-fragment must NOT set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 0u);
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragDroppedV4)], 0u);
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.17 — IPv4 MF=0, offset≠0 (last fragment) → SKIP_L4
+//
+// offset=100 (units of 8), MF=0. Non-first → SKIP_L4 path.
+// Under l3_only with empty FIB → kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_17_LastFragSkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto cf = build_corner_frame("c2_17_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;
+  // Last fragment: MF=0, offset=100 → BE word = 0x0064
+  cf.pkt[20] = 0x00;  cf.pkt[21] = 0x64;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C2.17: last frag (MF=0, offset≠0) under l3_only → kTerminalPass";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.17: non-first fragment must set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C2.17: pkt_frag_skipped_total_v4 must be 1";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.18 — IPv4 MF=1, offset≠0 (middle fragment) → SKIP_L4
+//
+// offset=64, MF=1. Non-first → SKIP_L4 path.
+// Under l3_only with empty FIB → kTerminalPass.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_18_MiddleFragSkipL4) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto cf = build_corner_frame("c2_18_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;
+  // Middle fragment: MF=1, offset=64 → BE word = 0x2040
+  cf.pkt[20] = 0x20;  cf.pkt[21] = 0x40;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C2.18: middle frag (MF=1, offset≠0) under l3_only → kTerminalPass";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.18: non-first fragment must set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u)
+      << "C2.18: pkt_frag_skipped_total_v4 must be 1";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.19 — IPv4 pathological frag_offset > datagram size
+//
+// offset=8100 (units of 8 = 64800 B into datagram), MF=0. Non-first →
+// SKIP_L4. No crash, no special handling. pktgate-dpdk does NOT attempt
+// reassembly sanity on fragment offsets.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_19_PathologicalOffsetNoCrash) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+  rs.fragment_policy = dataplane::kFragL3Only;
+
+  auto cf = build_corner_frame("c2_19_pool", 54);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 17;
+  // Pathological offset: 8100 (0x1FA4) in the 13-bit field, MF=0.
+  // BE word: 0x1FA4
+  cf.pkt[20] = 0x1F;  cf.pkt[21] = 0xA4;
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  dataplane::L3FragCtrs  frag{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc, &frag);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kTerminalPass)
+      << "C2.19: pathological offset behaves as non-first frag → kTerminalPass";
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  EXPECT_NE(dyn->flags & static_cast<std::uint8_t>(eal::kSkipL4), 0)
+      << "C2.19: non-first fragment must set SKIP_L4";
+  EXPECT_EQ(frag[static_cast<std::size_t>(
+                dataplane::L3FragBucket::kL3FragSkippedV4)], 1u);
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
+// -------------------------------------------------------------------------
+// C2.20 — IPv4 + TCP with only 2 B of transport header (36 B total)
+//
+// L3 header is complete (IHL=5, 20 B present). classify_l3 returns
+// kNextL4. L4 truncation (need=4, only 2 B present) is M6 scope.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_20_TcpOnly2BytesL4TruncIsM6) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // 14 + 20 + 2 = 36 B
+  auto cf = build_corner_frame("c2_20_pool", 36);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 6;  // proto=TCP
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.20: L3 header complete → kNextL4 (L4 truncation is M6 scope)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u);
+}
+
+// -------------------------------------------------------------------------
+// C2.21 — IPv4 + ICMP with only 1 B (type but no code), 35 B total
+//
+// L3 header is complete → kNextL4. L4 truncation (need=2, only 1 B) M6.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_21_IcmpOnly1ByteL4TruncIsM6) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // 14 + 20 + 1 = 35 B
+  auto cf = build_corner_frame("c2_21_pool", 35);
+  ASSERT_NE(cf.m, nullptr);
+  cf.pkt[14] = 0x45;
+  cf.pkt[23] = 1;  // proto=ICMP
+  set_dyn_ipv4_corner(cf.m);
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.21: L3 header complete → kNextL4 (L4 truncation is M6 scope)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u);
+}
+
+// -------------------------------------------------------------------------
+// C2.22 — VLAN-tagged IPv4 with IHL=6 (D13 + D14 compound)
+//
+// l3_offset=18 (written by classify_l2 for single VLAN). IHL=6 → 24 B
+// IPv4 header. classify_l3 reads at offset 18, passes guards. FIB runs.
+// M5 adaptation: L4 rule is M6. Assert kNextL4.
+// -------------------------------------------------------------------------
+TEST_F(ClassifyL3Ipv4CornerTest, C2_22_VlanTaggedIpv4Ihl6) {
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  ruleset::Ruleset rs;
+
+  // 14 B Ether + 4 B VLAN (0x8100) + 24 B IPv4 (IHL=6) + 8 B UDP = 50 B
+  auto cf = build_corner_frame("c2_22_pool", 50);
+  ASSERT_NE(cf.m, nullptr);
+  // Ethernet header: dst(6) + src(6) + VLAN TPID 0x8100
+  cf.pkt[12] = 0x81;  cf.pkt[13] = 0x00;
+  // VLAN TCI at [14..15]: vlan=100
+  cf.pkt[14] = 0x00;  cf.pkt[15] = 0x64;
+  // Inner ethertype at [16..17]: 0x0800 (IPv4)
+  cf.pkt[16] = 0x08;  cf.pkt[17] = 0x00;
+  // IPv4 header starts at offset 18 (l3_offset=18 per D13 VLAN)
+  cf.pkt[18] = 0x46;  // version=4, IHL=6
+  cf.pkt[27] = 17;    // proto=UDP (offset 18+9=27)
+  // 4 bytes of IP options at [38..41]: NOP padding
+  cf.pkt[38] = 0x01;  cf.pkt[39] = 0x01;
+  cf.pkt[40] = 0x01;  cf.pkt[41] = 0x01;
+  // UDP dport=53 at [44..45] (l3_offset(18) + IHL*4(24) + 2 = 44)
+  cf.pkt[44] = 0x00;  cf.pkt[45] = 0x35;
+
+  // Set dynfield as classify_l2 would for a VLAN-tagged frame.
+  auto* dyn = eal::mbuf_dynfield(cf.m);
+  dyn->l3_offset        = 18;  // D13: VLAN shifts L3 start by 4
+  dyn->parsed_ethertype = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+  dyn->parsed_vlan      = 100;
+  dyn->flags            = 0;
+
+  dataplane::L3TruncCtrs trunc{};
+  const auto v = dataplane::classify_l3(cf.m, rs, &trunc);
+
+  EXPECT_EQ(v, dataplane::ClassifyL3Verdict::kNextL4)
+      << "C2.22: VLAN-tagged IPv4 IHL=6, l3_offset=18 → kNextL4 (L4 rule M6)";
+  EXPECT_EQ(trunc[static_cast<std::size_t>(dataplane::L3TruncBucket::kL3V4)], 0u)
+      << "C2.22: no truncation expected (D13 compound with D14)";
+
+  rte_pktmbuf_free(cf.m);
+  rte_mempool_free(cf.mp);
+}
+
 }  // namespace pktgate::test
