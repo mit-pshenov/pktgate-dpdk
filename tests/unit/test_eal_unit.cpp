@@ -11,6 +11,8 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <map>
+#include <vector>
 
 #include <rte_byteorder.h>
 #include <rte_ether.h>
@@ -9125,6 +9127,361 @@ TEST_F(ApplyActionTest, U6_51_TagPcpOnUntaggedIsNoop) {
 
   rte_pktmbuf_free(m);
   g_tx_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// =========================================================================
+// M7 C2 — REDIRECT staging + burst-end drain (U6.52–U6.55, D16).
+//
+// REDIRECT stages packets into a per-target-port buffer on the WorkerCtx;
+// actual TX happens at end of burst via `redirect_drain(ctx)`.  These
+// tests exercise the four behaviours listed in `unit.md`:
+//
+//   U6.52 — stage_redirect enqueues into redirect_tx[port] (no inline TX).
+//   U6.53 — redirect_drain calls the spy tx_burst_fn once per non-empty
+//           staged port with qid == ctx->queue_id (D28 TX-queue symmetry).
+//   U6.54 — partial send frees unsent mbufs, bumps redirect_dropped_total.
+//   U6.55 — buffer full → drop the new mbuf at stage time (no OOB write).
+//
+// A new spy (TxRedirectSpy) records EVERY tx_burst_fn call, not just the
+// last one, so U6.53/U6.54 can assert per-port invocation counts and
+// returned-sent values under partial drains.  It's kept separate from
+// the existing TxSpy to avoid perturbing U6.44–U6.51.
+// =========================================================================
+
+namespace redirect_test_helpers {
+
+struct TxRedirectCall {
+  std::uint16_t port_id;
+  std::uint16_t queue_id;
+  std::uint16_t nb_pkts;
+  std::uint16_t returned_sent;
+};
+
+struct TxRedirectSpy {
+  std::vector<TxRedirectCall>   calls;
+  std::vector<rte_mbuf*>        seen_mbufs;
+  // Map of port_id -> sent count to return.  Default behaviour (if not
+  // present in the map) is "send all" (return nb_pkts).
+  std::map<std::uint16_t, std::uint16_t> per_port_return_sent;
+};
+
+inline TxRedirectSpy* g_redirect_spy = nullptr;
+
+inline std::uint16_t spy_tx_burst_redirect(std::uint16_t port_id,
+                                           std::uint16_t queue_id,
+                                           rte_mbuf** tx_pkts,
+                                           std::uint16_t nb_pkts) {
+  if (g_redirect_spy == nullptr || tx_pkts == nullptr || nb_pkts == 0) {
+    return 0;
+  }
+  std::uint16_t sent = nb_pkts;
+  auto it = g_redirect_spy->per_port_return_sent.find(port_id);
+  if (it != g_redirect_spy->per_port_return_sent.end()) {
+    sent = it->second;
+  }
+  g_redirect_spy->calls.push_back(
+      TxRedirectCall{port_id, queue_id, nb_pkts, sent});
+  for (std::uint16_t i = 0; i < nb_pkts; ++i) {
+    g_redirect_spy->seen_mbufs.push_back(tx_pkts[i]);
+  }
+  return sent;
+}
+
+// Build a redirect RuleAction targeting `port`.
+inline action::RuleAction make_redirect_action(std::uint16_t port) {
+  action::RuleAction a{};
+  a.verb = static_cast<std::uint8_t>(compiler::ActionVerb::kRedirect);
+  a.redirect_port = port;
+  return a;
+}
+
+}  // namespace redirect_test_helpers
+
+class RedirectDispatchTest : public EalFixture {};
+
+// -------------------------------------------------------------------------
+// U6.52 — REDIRECT stages to per-port buffer (no inline TX).
+//
+// A single mbuf dispatched with a REDIRECT action must land in
+// ctx.redirect_tx[port].pkts[0], bump count to 1, and the spy TX hook
+// must NOT have been called (staging only — drain is a separate step).
+// -------------------------------------------------------------------------
+TEST_F(RedirectDispatchTest, U6_52_StageRedirectBuffersMbuf) {
+  using namespace redirect_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_52_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+
+  TxRedirectSpy spy;
+  g_redirect_spy = &spy;
+
+  constexpr std::uint16_t kTargetPort = 3;
+  auto redir = make_redirect_action(kTargetPort);
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_redirect;
+
+  dataplane::apply_action(&ctx, rs, m,
+                          dataplane::Disposition::kMatch, &redir);
+
+  EXPECT_EQ(ctx.redirect_tx[kTargetPort].count, 1u)
+      << "U6.52: stage_redirect must bump redirect_tx[port].count to 1";
+  EXPECT_EQ(ctx.redirect_tx[kTargetPort].pkts[0], m)
+      << "U6.52: staged mbuf must be stored at pkts[0]";
+  EXPECT_EQ(spy.calls.size(), 0u)
+      << "U6.52: staging must NOT call tx_burst_fn inline";
+  EXPECT_EQ(ctx.redirect_dropped_total, 0u);
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+
+  // Clean up: drain to release the mbuf via the spy (which "succeeds").
+  dataplane::redirect_drain(&ctx);
+  g_redirect_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.53 — redirect_drain emits one TX call per non-empty port.
+//
+// Stage 2 packets to port 3 and 1 packet to port 7; leave port 5 empty.
+// After redirect_drain(), the spy must have seen exactly 2 calls — one
+// per non-empty port — each carrying queue_id == ctx.queue_id and the
+// correct nb_pkts.  All buffer counts reset to 0; no frees required
+// (spy reports full success on each call).
+// -------------------------------------------------------------------------
+TEST_F(RedirectDispatchTest, U6_53_DrainSucceeds) {
+  using namespace redirect_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_53_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  rte_mbuf* m_a0 = rte_pktmbuf_alloc(mp);
+  rte_mbuf* m_a1 = rte_pktmbuf_alloc(mp);
+  rte_mbuf* m_b  = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m_a0, nullptr);
+  ASSERT_NE(m_a1, nullptr);
+  ASSERT_NE(m_b,  nullptr);
+
+  TxRedirectSpy spy;
+  g_redirect_spy = &spy;
+
+  constexpr std::uint16_t kPortA = 3;
+  constexpr std::uint16_t kPortB = 7;
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 2;          // asserted on each drain call (D28)
+  ctx.tx_burst_fn = &spy_tx_burst_redirect;
+
+  auto redir_a = make_redirect_action(kPortA);
+  auto redir_b = make_redirect_action(kPortB);
+
+  dataplane::apply_action(&ctx, rs, m_a0,
+                          dataplane::Disposition::kMatch, &redir_a);
+  dataplane::apply_action(&ctx, rs, m_a1,
+                          dataplane::Disposition::kMatch, &redir_a);
+  dataplane::apply_action(&ctx, rs, m_b,
+                          dataplane::Disposition::kMatch, &redir_b);
+
+  EXPECT_EQ(ctx.redirect_tx[kPortA].count, 2u);
+  EXPECT_EQ(ctx.redirect_tx[kPortB].count, 1u);
+  EXPECT_EQ(spy.calls.size(), 0u)
+      << "U6.53: staging must not yet have called TX";
+
+  dataplane::redirect_drain(&ctx);
+
+  ASSERT_EQ(spy.calls.size(), 2u)
+      << "U6.53: one TX burst per non-empty staged port";
+
+  // Find each port's call (map iteration order in redirect_drain is by
+  // port index, but we don't depend on that — look up by port).
+  const TxRedirectCall* call_a = nullptr;
+  const TxRedirectCall* call_b = nullptr;
+  for (const auto& c : spy.calls) {
+    if (c.port_id == kPortA) call_a = &c;
+    if (c.port_id == kPortB) call_b = &c;
+  }
+  ASSERT_NE(call_a, nullptr);
+  ASSERT_NE(call_b, nullptr);
+  EXPECT_EQ(call_a->nb_pkts, 2u);
+  EXPECT_EQ(call_a->queue_id, ctx.queue_id)
+      << "U6.53 (D28): TX-queue symmetry — use ctx->queue_id";
+  EXPECT_EQ(call_b->nb_pkts, 1u);
+  EXPECT_EQ(call_b->queue_id, ctx.queue_id);
+
+  EXPECT_EQ(ctx.redirect_tx[kPortA].count, 0u);
+  EXPECT_EQ(ctx.redirect_tx[kPortB].count, 0u);
+  EXPECT_EQ(ctx.redirect_dropped_total, 0u);
+
+  // All mbufs considered "sent" by the spy, no frees happened — they
+  // stay allocated to keep mempool in_use stable.  Free here to
+  // balance.
+  rte_pktmbuf_free(m_a0);
+  rte_pktmbuf_free(m_a1);
+  rte_pktmbuf_free(m_b);
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before);
+
+  g_redirect_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.54 — drain with partial send frees unsent, bumps counter.
+//
+// Stage N=3 packets to port 3, configure spy to return sent=2 for
+// port 3.  After drain, spy sees the full N-packet call; the 1
+// unsent mbuf is freed (mempool in_use drops by 1); buffer reset to
+// 0; redirect_dropped_total == 1.
+// -------------------------------------------------------------------------
+TEST_F(RedirectDispatchTest, U6_54_DrainPartialFreesUnsent) {
+  using namespace redirect_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_54_pool", 63, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  constexpr std::uint16_t kPort = 3;
+  constexpr std::uint16_t kN    = 3;
+  rte_mbuf* pkts[kN]{};
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    pkts[i] = rte_pktmbuf_alloc(mp);
+    ASSERT_NE(pkts[i], nullptr);
+  }
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before + kN);
+
+  TxRedirectSpy spy;
+  spy.per_port_return_sent[kPort] = 2;  // 3 offered, only 2 accepted
+  g_redirect_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_redirect;
+
+  auto redir = make_redirect_action(kPort);
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    dataplane::apply_action(&ctx, rs, pkts[i],
+                            dataplane::Disposition::kMatch, &redir);
+  }
+  EXPECT_EQ(ctx.redirect_tx[kPort].count, kN);
+
+  dataplane::redirect_drain(&ctx);
+
+  ASSERT_EQ(spy.calls.size(), 1u);
+  EXPECT_EQ(spy.calls[0].port_id, kPort);
+  EXPECT_EQ(spy.calls[0].nb_pkts, kN);
+  EXPECT_EQ(spy.calls[0].returned_sent, 2u);
+
+  EXPECT_EQ(ctx.redirect_tx[kPort].count, 0u);
+  EXPECT_EQ(ctx.redirect_dropped_total, 1u)
+      << "U6.54: partial send must bump redirect_dropped_total by (n - sent)";
+
+  // 2 sent mbufs stay alive (spy holds pointers but does not free),
+  // 1 unsent mbuf freed by redirect_drain.  Net: in_use == before + 2.
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before + 2u)
+      << "U6.54: exactly 1 unsent mbuf must be freed";
+
+  // Balance the 2 "sent" mbufs so the mempool returns clean.
+  rte_pktmbuf_free(pkts[0]);
+  rte_pktmbuf_free(pkts[1]);
+  // pkts[2] already freed by redirect_drain — don't double-free.
+
+  g_redirect_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U6.55 — staging buffer full → drop new mbuf at stage time.
+//
+// Fill redirect_tx[port] to kRedirectBurstMax, then attempt to stage one
+// more.  The new mbuf must be freed (no OOB write), buffer count must
+// still equal kRedirectBurstMax, and redirect_dropped_total must be 1.
+// Spy untouched (no drain happened).
+// -------------------------------------------------------------------------
+TEST_F(RedirectDispatchTest, U6_55_StagingFullDropsNewMbuf) {
+  using namespace redirect_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  constexpr std::uint16_t kPort = 3;
+  constexpr std::uint16_t kCap  = dataplane::kRedirectBurstMax;
+  // Alloc kCap + 1 mbufs so the final stage call finds the buffer full.
+  const unsigned alloc_n = kCap + 1u;
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u6_55_pool", alloc_n + 16u, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  std::vector<rte_mbuf*> pkts;
+  pkts.reserve(alloc_n);
+  for (unsigned i = 0; i < alloc_n; ++i) {
+    auto* m = rte_pktmbuf_alloc(mp);
+    ASSERT_NE(m, nullptr);
+    pkts.push_back(m);
+  }
+
+  TxRedirectSpy spy;
+  g_redirect_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = 0;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_redirect;
+
+  auto redir = make_redirect_action(kPort);
+
+  // Stage kCap first — all must fit, no drops.
+  for (std::uint16_t i = 0; i < kCap; ++i) {
+    dataplane::apply_action(&ctx, rs, pkts[i],
+                            dataplane::Disposition::kMatch, &redir);
+  }
+  EXPECT_EQ(ctx.redirect_tx[kPort].count, kCap);
+  EXPECT_EQ(ctx.redirect_dropped_total, 0u);
+
+  // The (kCap + 1)-th must be dropped at stage time.
+  dataplane::apply_action(&ctx, rs, pkts[kCap],
+                          dataplane::Disposition::kMatch, &redir);
+
+  EXPECT_EQ(ctx.redirect_tx[kPort].count, kCap)
+      << "U6.55: buffer count must NOT exceed kRedirectBurstMax";
+  EXPECT_EQ(ctx.redirect_dropped_total, 1u)
+      << "U6.55: stage-full must bump redirect_dropped_total";
+  EXPECT_EQ(spy.calls.size(), 0u)
+      << "U6.55: stage-full must NOT call tx_burst_fn";
+
+  // pkts[kCap] was freed by stage_redirect on full.  The other kCap
+  // mbufs are still in the buffer — drain them via a spy that claims
+  // success to clean up.
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before + kCap);
+
+  dataplane::redirect_drain(&ctx);
+  // Spy "sent" everything; free the mbufs we still hold pointers to.
+  for (std::uint16_t i = 0; i < kCap; ++i) {
+    rte_pktmbuf_free(pkts[i]);
+  }
+
+  g_redirect_spy = nullptr;
   rte_mempool_free(mp);
 }
 

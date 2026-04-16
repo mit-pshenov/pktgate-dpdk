@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <atomic>
 
+#include <rte_config.h>                   // RTE_MAX_ETHPORTS
 #include <rte_mbuf.h>
 
 #include "src/dataplane/classify_l2.h"  // L2TruncCtrs, L2TruncBucket
@@ -31,6 +32,31 @@ using TxBurstFn = std::uint16_t (*)(std::uint16_t port_id,
                                     std::uint16_t queue_id,
                                     rte_mbuf** tx_pkts,
                                     std::uint16_t nb_pkts);
+
+// M7 C2 — D16 REDIRECT staging buffer.
+//
+// REDIRECT stages packets into a per-target-port buffer; actual TX
+// happens at end of burst in redirect_drain().  This fixes the mbuf
+// leak on TX-full in the naive inline-TX design (review-notes D16):
+// unsent mbufs are explicitly freed + counted at drain time.
+//
+// Buffer size: kRedirectBurstMax = 32.  Matches the RX burst size so
+// even a full burst of REDIRECT hits fits; small constant keeps the
+// per-worker memory footprint bounded (32 * RTE_MAX_ETHPORTS * 8 B ~
+// 8 KB of staging pointers per worker for RTE_MAX_ETHPORTS = 32).
+//
+// Buffer-full policy: drop the NEW incoming packet at stage time
+// (bump redirect_dropped_total, free the mbuf).  Rationale: the
+// packets already staged are closer to being drained; dropping the
+// new arrival keeps head-of-line semantics and avoids an O(N) shift.
+// This is a defensive guard — the buffer should never fill in
+// practice because drain runs at end of every RX burst.
+constexpr std::uint16_t kRedirectBurstMax = 32;
+
+struct RedirectBuf {
+  std::uint16_t count = 0;
+  rte_mbuf*     pkts[kRedirectBurstMax] = {};
+};
 
 // Worker context passed to each lcore via rte_eal_remote_launch.
 struct WorkerCtx {
@@ -73,6 +99,24 @@ struct WorkerCtx {
   // on behalf of the operator). stats_on_exit surfacing in C3 per
   // handoff plan.
   std::uint64_t tag_pcp_noop_untagged_total = 0;
+
+  // M7 C2 — D16 REDIRECT staging.
+  //
+  // One per-target-port staging buffer.  Indexed by the action's
+  // redirect_port field; sized RTE_MAX_ETHPORTS for MVP (the array is
+  // sparse — only ports actually targeted by REDIRECT rules ever see
+  // non-zero counts).  Drained at end of every RX burst via
+  // redirect_drain() in worker.cpp; unsent mbufs freed + counted.
+  RedirectBuf redirect_tx[RTE_MAX_ETHPORTS] = {};
+
+  // M7 C2: D16 REDIRECT drop counter.  Bumped on:
+  //   (a) drain partial send — (s.count - sent) unsent mbufs freed;
+  //   (b) stage-time buffer full — new mbuf dropped, one increment.
+  // Single counter covers both cases per unit.md U6.54/U6.55 wording
+  // ("redirect_dropped_total += (s.n - sent)" for drain; U6.55 notes
+  // implementation MAY use a different counter but spec allows the
+  // shared counter so long as no overflow occurs).
+  std::uint64_t redirect_dropped_total = 0;
 };
 
 // D39: check if an mbuf is single-segment.  M3 C5 primitive retained

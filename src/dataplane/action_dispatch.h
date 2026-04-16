@@ -43,6 +43,7 @@
 
 #include <cstdint>
 
+#include <rte_config.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 
@@ -52,6 +53,58 @@
 #include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {
+
+// -------------------------------------------------------------------------
+// M7 C2 — D16 REDIRECT staging + burst-end drain.
+//
+// stage_redirect enqueues the mbuf into ctx->redirect_tx[port].pkts; the
+// actual TX is deferred until end-of-burst in redirect_drain(), which
+// calls tx_burst_fn once per non-empty staged port.  Unsent mbufs are
+// freed and redirect_dropped_total bumped (D16 fix for the naive-inline
+// TX mbuf leak described in review-notes).
+//
+// Buffer-full policy: drop the new mbuf (free + counter bump).  See
+// worker.h kRedirectBurstMax comment for rationale.
+
+inline void stage_redirect(WorkerCtx* ctx, std::uint16_t port,
+                           rte_mbuf* m) {
+  // Defensive: unknown port index — count as drop.  RTE_MAX_ETHPORTS
+  // is the array size; port_id == 0xFFFF (RuleAction "no port" sentinel)
+  // and any forged oversized index lands here.
+  if (port >= RTE_MAX_ETHPORTS) {
+    ctx->redirect_dropped_total++;
+    rte_pktmbuf_free(m);
+    return;
+  }
+  auto& s = ctx->redirect_tx[port];
+  if (s.count >= kRedirectBurstMax) {
+    // Buffer full — drop the new arrival, keep the staged packets
+    // (they are closer to being drained).  No OOB write.
+    ctx->redirect_dropped_total++;
+    rte_pktmbuf_free(m);
+    return;
+  }
+  s.pkts[s.count++] = m;
+}
+
+inline void redirect_drain(WorkerCtx* ctx) {
+  for (std::uint16_t p = 0; p < RTE_MAX_ETHPORTS; ++p) {
+    auto& s = ctx->redirect_tx[p];
+    if (s.count == 0) continue;
+    std::uint16_t sent = 0;
+    if (ctx->tx_burst_fn != nullptr) {
+      sent = ctx->tx_burst_fn(p, ctx->queue_id, s.pkts, s.count);
+    }
+    if (sent < s.count) {
+      // Free unsent mbufs and bump the drop counter (D16).
+      for (std::uint16_t i = sent; i < s.count; ++i) {
+        rte_pktmbuf_free(s.pkts[i]);
+      }
+      ctx->redirect_dropped_total += (s.count - sent);
+    }
+    s.count = 0;
+  }
+}
 
 // -------------------------------------------------------------------------
 // apply_dscp_pcp — D19 TAG semantics (M7 C1).
@@ -337,12 +390,10 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       return;
 
     case compiler::ActionVerb::kRedirect:
-      // C2 fills the REDIRECT body (D16 staging + burst-end flush).
-      // For C0: free. The compiler does NOT currently reject
-      // REDIRECT, so a config with REDIRECT would hit this branch.
-      // This matches the pre-C2 behaviour of the worker (which was
-      // freeing everything); C2 replaces it with staging.
-      rte_pktmbuf_free(m);
+      // M7 C2 — D16: stage into per-port buffer, drained at burst end
+      // via redirect_drain(ctx).  stage_redirect handles the buffer-
+      // full drop + counter internally.
+      stage_redirect(ctx, action->redirect_port, m);
       return;
 
     case compiler::ActionVerb::kMirror:

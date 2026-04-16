@@ -261,6 +261,11 @@ int worker_main(void* arg) {
           break;
       }
     }
+
+    // M7 C2 — D16: drain any REDIRECT-staged mbufs at end of burst.
+    // One batched rte_eth_tx_burst per non-empty target port; unsent
+    // mbufs freed and redirect_dropped_total bumped.
+    redirect_drain(ctx);
   }
 
   return 0;
