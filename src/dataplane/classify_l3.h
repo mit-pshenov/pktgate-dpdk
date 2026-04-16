@@ -383,6 +383,13 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     const auto* ip4 = reinterpret_cast<const struct rte_ipv4_hdr*>(
         raw + l3_off);
 
+    // M6 C5: Write parsed_l3_proto (IPv4 next_proto_id) to dynfield so
+    // classify_l4 can key the L4 compound hash on the correct protocol.
+    // This was planned for M5 C5/C6 per the comment at the top of the
+    // function, but was never actually wired. Without it, classify_l4
+    // always sees proto=0 (HOPOPT) and every hash probe misses.
+    dyn->parsed_l3_proto = ip4->next_proto_id;
+
     // ---- D14 IHL reject (U6.13) -----------------------------------------
     // In MVP, M5's D14 contribution is reject-only: IHL < 5 cannot
     // describe a valid IPv4 header, drop at the same l3_v4 bucket per
@@ -559,6 +566,11 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
 
     const std::uint8_t nxt = ip6->proto;  // next_header field
 
+    // M6 C5: Write parsed_l3_proto to dynfield so classify_l4 can key the
+    // L4 compound hash on the correct protocol. Default to the base
+    // next_header; overridden below for first-fragment (inner protocol).
+    dyn->parsed_l3_proto = nxt;
+
     // ---- D20 first-protocol-only ext-header detection (U6.27) -----------
     // D22: kExtMaskLt64 + is_ext_proto live at namespace scope (REFACTOR
     // M5 C10). Fragment (44) excluded — D27 (C6).
@@ -618,6 +630,10 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
             // Check if inner next_header is itself an ext-header (or
             // nested fragment=44). Chain-after-fragment → SKIP_L4 (D27).
             const std::uint8_t inner_nxt = fh->next_header;
+            // M6 C5: Override parsed_l3_proto with the inner protocol
+            // from the fragment ext header — this is the actual L4 proto
+            // for first-fragments (e.g. TCP=6 after a Fragment ext).
+            dyn->parsed_l3_proto = inner_nxt;
             if (is_ext_proto(inner_nxt) || inner_nxt == 44) {
               dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
               if (exthdr_ctr) ++(*exthdr_ctr);

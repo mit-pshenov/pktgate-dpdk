@@ -444,11 +444,13 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   // stores them verbatim; L2CompoundEntry filter_mask derivation
   // (design §4.1) happens at M2 compile time, NOT here — there is
   // deliberately no `filter_mask` JSON field.
-  constexpr std::array<std::string_view, 14> kAllowedRuleKeys = {
+  // M6 C5: added "proto" and "src_port" — M2 C4 model fields that
+  // were never wired into the parser whitelist (silent gap).
+  constexpr std::array<std::string_view, 16> kAllowedRuleKeys = {
       "id",         "dst_port",        "dst_ports",  "vlan_id",
       "pcp",        "hw_offload_hint", "tcp_flags",  "action",
       "dst_subnet", "interface",       "src_mac",    "dst_mac",
-      "ethertype",  "next_layer"};
+      "ethertype",  "next_layer",      "proto",      "src_port"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     const std::string& key = it.key();
     bool allowed = false;
@@ -497,6 +499,18 @@ std::optional<ParseError> parse_rule(const json& j, Rule& out) {
   if (j.contains("dst_ports")) {
     if (auto err = parse_bounded_int_array(j, "dst_ports", 0, 65535,
                                            out.dst_ports)) {
+      return *err;
+    }
+  }
+  // M6 C5: proto and src_port — M2 C4 model fields, parser wiring gap.
+  if (j.contains("src_port")) {
+    if (auto err =
+            parse_bounded_int(j, "src_port", 0, 65535, out.src_port)) {
+      return *err;
+    }
+  }
+  if (j.contains("proto")) {
+    if (auto err = parse_bounded_int(j, "proto", 0, 255, out.proto)) {
       return *err;
     }
   }

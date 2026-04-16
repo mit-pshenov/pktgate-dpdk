@@ -44,6 +44,36 @@ constexpr std::uint16_t kBurstSize = 32;
 // well below 65535 by sizing), so it cannot collide with a real match.
 constexpr std::uint16_t kNoMatchSentinel = 0xFFFFu;
 
+// bump_l4_counter — M6 C5: post-classify_l4 per-rule counter increment.
+//
+// Symmetric to bump_l2_counter but applies the L4 layer_base offset
+// to avoid aliasing with L2/L3 counter slots in the same flat row.
+// counter_slot is dense [0..N) per layer; the flat row layout is
+// [L2: 0..cap) [L3: cap..2*cap) [L4: 2*cap..3*cap) where cap =
+// l2_actions_capacity (= rules_per_layer_max).
+inline void bump_l4_counter(const ruleset::Ruleset& rs,
+                            std::uint16_t action_idx,
+                            unsigned lcore_id) {
+  if (action_idx >= rs.n_l4_rules || !rs.l4_actions || !rs.counters) return;
+
+  const auto& act = rs.l4_actions[action_idx];
+  // Apply L4 layer_base offset: 2 * rules_per_layer_max.
+  const auto slot = static_cast<std::uint32_t>(act.counter_slot) +
+                    2u * rs.l2_actions_capacity;
+
+  ruleset::RuleCounter* row = rs.counter_row(lcore_id);
+  if (!row || slot >= rs.counter_slots_per_lcore) return;
+
+  ruleset::RuleCounter& ctr = row[slot];
+  ++ctr.matched_packets;
+  // classify_l4 returns kMatch for all matched rules regardless of
+  // action verb. Check the action verb directly to bump drops.
+  if (static_cast<compiler::ActionVerb>(act.verb) ==
+      compiler::ActionVerb::kDrop) {
+    ++ctr.drops;
+  }
+}
+
 // bump_l2_counter — M4 C8: post-classify_l2 per-rule counter increment.
 //
 // Reads the matched action slot from the ruleset action arena and
@@ -114,6 +144,15 @@ int worker_main(void* arg) {
       // on hit; a miss leaves this sentinel in place.
       auto* dyn = eal::mbuf_dynfield(bufs[i]);
       dyn->verdict_action_idx = kNoMatchSentinel;
+      // M6 C5: zero the flags field so stale SKIP_L4 bits from a
+      // previous mbuf reuse cycle don't leak into classify_l4.
+      // classify_l3 writes SKIP_L4 on the non-first fragment / ext-header
+      // path; without this reset, a recycled mbuf that previously carried
+      // a fragmented or ext-header packet would skip L4 on its next life.
+      dyn->flags = 0;
+      // M6 C5: zero l4_extra so IPv6 first-fragment's +8 offset from a
+      // previous mbuf does not bleed into a plain IPv4/IPv6 packet.
+      dyn->l4_extra = 0;
 
       // M4 C1: L2 classification. classify_l2 returns kNextL3 on
       // empty ruleset or hash miss, kDrop on L2 rule drop action.
@@ -170,11 +209,17 @@ int worker_main(void* arg) {
                   // D31 l4 truncation or L4 DROP rule. Free.
                   rte_pktmbuf_free(bufs[i]);
                   break;
-                case ClassifyL4Verdict::kMatch:
+                case ClassifyL4Verdict::kMatch: {
                   // L4 compound entry matched. apply_action lands in
                   // M7; for now, free.
+                  // M6 C5: bump L4 per-rule counter on match.
+                  const std::uint16_t l4_act_idx = dyn->verdict_action_idx;
+                  if (l4_act_idx != kNoMatchSentinel) {
+                    bump_l4_counter(*ctx->ruleset, l4_act_idx, lcore_id);
+                  }
                   rte_pktmbuf_free(bufs[i]);
                   break;
+                }
               }
               break;
             }

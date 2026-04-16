@@ -48,6 +48,8 @@ _TAP_IFACES_TO_UNMANAGE = [
     "dtap_f8_rx", "dtap_f8_tx",
     # M5 C10 — F4 L3 functional tests use their own dtap pair.
     "dtap_f4_rx", "dtap_f4_tx",
+    # M6 C5 — F2 L4 functional tests use their own dtap pair.
+    "dtap_l4_rx", "dtap_l4_tx",
 ]
 
 

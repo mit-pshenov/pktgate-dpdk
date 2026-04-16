@@ -404,6 +404,33 @@ int main(int argc, char* argv[]) {
                     ",\"drops\":" + std::to_string(total_drops) + "}";
     }
 
+    // M6 C5: L4 per-rule counter summary (symmetric to L2 above).
+    // L4 layer_base offset: 2 * rules_per_layer_max (same as in bump_l4_counter).
+    for (std::uint32_t idx = 0; idx < rs.n_l4_rules; ++idx) {
+      if (!rs.l4_actions) break;
+      const auto& act = rs.l4_actions[idx];
+      const auto slot = static_cast<std::uint32_t>(act.counter_slot) +
+                        2u * rs.l2_actions_capacity;
+
+      std::uint64_t total_matched = 0;
+      std::uint64_t total_drops   = 0;
+      for (std::uint32_t lc = 0; lc < rs.num_lcores; ++lc) {
+        const auto* row = rs.counter_row(lc);
+        if (!row || slot >= rs.counter_slots_per_lcore) continue;
+        total_matched += row[slot].matched_packets;
+        total_drops   += row[slot].drops;
+      }
+
+      if (total_matched == 0 && total_drops == 0) continue;
+
+      if (!first_entry) stats_json += ',';
+      first_entry = false;
+      stats_json += "{\"rule_id\":" + std::to_string(act.rule_id) +
+                    ",\"layer\":\"l4\""
+                    ",\"matched_packets\":" + std::to_string(total_matched) +
+                    ",\"drops\":" + std::to_string(total_drops) + "}";
+    }
+
     // M4 C9 — F8.14: expose per-lcore dataplane counters that are NOT
     // per-rule through a sibling `counters` object.  M4 shipped only
     // `qinq_outer_only_total` (D32); M5 C3 adds the first D40 fragment
@@ -461,7 +488,12 @@ int main(int argc, char* argv[]) {
                   ",\"pkt_truncated_l3_v6_frag_ext\":" +
                   std::to_string(worker_ctx.pkt_truncated_l3[
                       static_cast<std::size_t>(
-                          pktgate::dataplane::L3TruncBucket::kL3V6FragExt)]) + "}}";
+                          pktgate::dataplane::L3TruncBucket::kL3V6FragExt)]) +
+                  // M6 C5: D31 L4 truncation counter.
+                  ",\"pkt_truncated_l4\":" +
+                  std::to_string(worker_ctx.pkt_truncated_l4[
+                      static_cast<std::size_t>(
+                          pktgate::dataplane::L4TruncBucket::kL4)]) + "}}";
     log_json(stats_json);
   }
 

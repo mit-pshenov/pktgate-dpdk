@@ -380,6 +380,124 @@ template fixed same day.*
 
 ---
 
-*Last updated: 2026-04-15 (M5 C1 RED-prep drift — §M5 C1 RED list
-entry + handoff patch). Add new items with date + origin cycle at
-append time.*
+## §Scope trim — Phase 1 MVP reduction (2026-04-16)
+
+User-approved scope trim to reduce remaining cycle count (~65 →
+~45) and cut operational features that are not load-bearing for
+Phase 1 acceptance criteria.
+
+**Motivation:** M0–M5 consumed ~59 TDD cycles. Remaining M6–M15
+at original scope is ~65 more. Ratio of ceremony to code output
+is too high; trimming non-core milestones restores momentum.
+
+### M10 — Telemetry: Prometheus-only
+
+**Original scope**: four export channels (Prom HTTP, sFlow UDP v5,
+`rte_tel` DPDK endpoints, per-lcore SPSC log ring), snapshot ring
+buffer N=4, D33 living CI gate.
+
+**Trimmed scope**: **Prometheus `/metrics` endpoint only.** Drop
+sFlow encoder, `rte_tel` endpoints, per-lcore log ring. Snapshot
+publisher thread stays (single consumer for Prom). D33 counter
+consistency grep (U7.5 + C7.27) stays — it validates counter
+names in the doc tree, not export channels. The counter layout
+in `WorkerCtx` / `stats.h` is already wired from M4/M5 and does
+not change.
+
+**What moves out**: sFlow (F8.6–F8.9), rte_tel (F8.10–F8.13),
+log ring (U10.5–U10.11). These become Phase 2 features if a
+customer asks.
+
+**Estimated reduction**: ~10-12 cycles → ~5-6 cycles.
+
+### M11 — Control: inotify-only
+
+**Original scope**: UDS command socket (`/run/pktgate/ctl.sock`)
+with SO_PEERCRED (D38) + verb router + allow-list, AND inotify
+file-watch with debounce (D38 `IN_CLOSE_WRITE`-only). Both funnel
+into M8 `deploy()` under `reload_mutex` (D35).
+
+**Trimmed scope**: **inotify file-watch reload only.** Drop UDS
+cmd_socket entirely. Reload triggered by writing a new config
+file; no runtime command interface. `activate` verb (HA park →
+live) also drops — ties to M12 which is deferred.
+
+**What moves out**: SO_PEERCRED (X3.1–X3.9), UDS verb router
+(U9.11–U9.17, F6.11–F6.14, F7.1–F7.4), `activate` verb
+(X3.11). These become Phase 2 if UDS control is needed.
+
+**Estimated reduction**: ~6-8 cycles → ~3-4 cycles.
+
+### M12 — Watchdog / bypass / HA: DEFERRED
+
+**Original scope**: systemd `WatchdogSec` integration, heartbeat
+publish, `--standby` park/activate lifecycle, K-crash bypass
+policy, D5 HA anti-pattern reject in validator.
+
+**Trimmed scope**: **entire milestone deferred to post-Phase-1.**
+Binary runs as a foreground process without watchdog. No standby
+mode. No crash-count bypass. D5 anti-pattern validator rules
+stay in M1 config validator (they already exist and are
+zero-cost) but the runtime HA machinery is not built.
+
+**What moves out**: all of F1.2–F1.8, F5.17, X4.1–X4.6, X2.1,
+X2.2. These become Phase 2 when the operator requests HA.
+
+**Estimated reduction**: ~5-7 cycles → 0 cycles.
+
+### M14 — rte_flow: confirmed minimal stubs
+
+No change from plan — M14 already ships disabled with only
+compiler tier-marking stubs and `static_assert`'d-off publish
+path. Confirming this remains the intent: no real `rte_flow`
+work in Phase 1. Lab-only gating via `perf.md` P-L8 stays
+parked.
+
+### Impact on M8 (RCU + reload)
+
+M8 is **not trimmed** — reload path is load-bearing for Phase 1
+(operator must be able to update rules without restarting the
+binary). However, with M11 trimmed to inotify-only, M8's reload
+entry points simplify: only one source (inotify) instead of
+three (inotify + cmd_socket + telemetry). `reload_mutex` (D35)
+still needed but the multi-source funnel in
+`src/ctl/reload_sources.h` collapses to a single caller.
+
+### Impact on M13 (dev VM smoke)
+
+M13 umbrella run shrinks proportionally — fewer tests to run,
+fewer channels to validate. Estimate stays ~2-3 cycles (it's
+just a test pass).
+
+### Impact on M15 (lab perf gate)
+
+No change. Lab bring-up is orthogonal to feature trim — it
+validates N1/N2/N3/N5 on real hardware regardless of telemetry
+channel count or HA features.
+
+### Summary table
+
+| Milestone | Original cycles | Trimmed cycles | Delta |
+|---|---|---|---|
+| M6 | 8–10 | 8–10 | 0 |
+| M7 | 8–10 | 8–10 | 0 |
+| M8 | 12–15 | 10–13 | −2 (simpler reload sources) |
+| M9 | 6–8 | 6–8 | 0 |
+| M10 | 10–12 | 5–6 | **−5–6** |
+| M11 | 6–8 | 3–4 | **−3–4** |
+| M12 | 5–7 | 0 | **−5–7** |
+| M13 | 2–3 | 2–3 | 0 |
+| M14 | 3–4 | 3–4 | 0 |
+| M15 | lab | lab | 0 |
+| **Total** | **~65** | **~48** | **~−17** |
+
+*Origin: user decision 2026-04-16, consultant-recommended trim
+after M5 exit gate. Not a plan revision — a scope override that
+takes precedence over `implementation-plan.md` §M10/§M11/§M12
+until the next batch revision.*
+
+---
+
+*Last updated: 2026-04-16 (scope trim — §M10 Prom-only, §M11
+inotify-only, §M12 deferred). Add new items with date + origin
+cycle at append time.*
