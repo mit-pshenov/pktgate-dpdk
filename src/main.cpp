@@ -152,7 +152,24 @@ int main(int argc, char* argv[]) {
   }
 
   // Compile the config into runtime structures.
-  auto compile_result = pktgate::compiler::compile(cfg);
+  //
+  // M9 C5 boot-path fix: wire the rate-limit slot allocator into the
+  // first compile() call (reload.cpp already does this for live
+  // reloads).  Without this the boot-time CompiledAction.rl_slot stays
+  // at kInvalidSlot for every kRateLimit verb, the builder skips the
+  // D41 lockstep populate of rs.rl_actions[slot], n_rl_actions stays
+  // zero, and the hot-path RL dispatch never fires. The integration
+  // test for the compile → build roundtrip (test_rl_compile_build.cpp)
+  // wires an allocator explicitly, which is how the stage-1 / stage-2
+  // / stage-3 invariants stayed green while the boot path silently
+  // dropped them — a textbook D41 silent pipeline gap, symmetric to
+  // the three already catalogued (M2 compile(), M5 fragment_policy,
+  // M7 dscp/pcp/redirect_port).
+  pktgate::compiler::RlSlotAllocator rl_alloc =
+      [](std::uint64_t rule_id) {
+        return pktgate::rl_arena::rl_arena_global().alloc_slot(rule_id);
+      };
+  auto compile_result = pktgate::compiler::compile(cfg, /*opts=*/{}, rl_alloc);
   if (compile_result.error) {
     log_json(("{\"error\":\"compile_err\",\"message\":\"" +
               compile_result.error->message + "\"}").c_str());
@@ -605,6 +622,47 @@ int main(int argc, char* argv[]) {
                     ",\"drops\":" + std::to_string(total_drops) + "}";
     }
 
+    // M9 C5 — per-RL-rule aggregate drops from the arena (D10 per-lcore
+    // row → sum across kMaxLcores). Emits a dedicated list `rl` in the
+    // stats_on_exit envelope so functional F3 tests (and future
+    // operator telemetry) can observe:
+    //   * F3.13 — drops-above-limit, ±20% Variant A tolerance
+    //   * F3.14 — slot stability across reload (rule_id persists with
+    //             non-zero drops if bucket state survived)
+    //   * F3.15 — slot recycling (rule_id disappears from `rl` after
+    //             removal; reappears with drops reset to 0 on re-add).
+    //
+    // Note: the arena outlives the Ruleset (D10), but we enumerate
+    // through the currently-live rs.rl_actions — that is the operator-
+    // visible set of RL rules for this generation. Removed rules were
+    // already GC'd by rl_arena_gc (C4) and their slots zeroed (§9.4
+    // step 5b).
+    std::uint64_t rl_dropped_total = 0;
+    std::string rl_json = ",\"rl\":[";
+    bool first_rl = true;
+    if (rs.rl_actions != nullptr) {
+      auto& arena = pktgate::rl_arena::rl_arena_global();
+      for (std::uint32_t i = 0; i < rs.n_rl_actions; ++i) {
+        const auto& rl = rs.rl_actions[i];
+        if (rl.rule_id == 0) continue;   // defensive, see arena_gc.cpp
+        const auto slot_opt = arena.lookup_slot(rl.rule_id);
+        if (!slot_opt) continue;
+        const auto& row = arena.get_row(*slot_opt);
+        std::uint64_t rule_dropped = 0;
+        for (std::size_t lc = 0; lc < pktgate::rl_arena::kMaxLcores; ++lc) {
+          rule_dropped += row.per_lcore[lc].dropped;
+        }
+        rl_dropped_total += rule_dropped;
+
+        if (!first_rl) rl_json += ',';
+        first_rl = false;
+        rl_json += "{\"rule_id\":" + std::to_string(rl.rule_id) +
+                   ",\"slot\":" + std::to_string(*slot_opt) +
+                   ",\"rl_dropped\":" + std::to_string(rule_dropped) + "}";
+      }
+    }
+    rl_json += "]";
+
     // M4 C9 — F8.14: expose per-lcore dataplane counters that are NOT
     // per-rule through a sibling `counters` object.  M4 shipped only
     // `qinq_outer_only_total` (D32); M5 C3 adds the first D40 fragment
@@ -718,9 +776,14 @@ int main(int argc, char* argv[]) {
                   ",\"reload_validate_budget_hugepage_total\":" +
                   std::to_string(rc.validate_budget_hugepage) +
                   ",\"reload_active_generation\":" +
-                  std::to_string(rc.active_generation);
+                  std::to_string(rc.active_generation) +
+                  // M9 C5 — aggregate across every live RL rule.
+                  ",\"rl_dropped_total\":" +
+                  std::to_string(rl_dropped_total);
 
-    stats_json += "}}";
+    stats_json += "}";
+    stats_json += rl_json;  // ",\"rl\":[...]"
+    stats_json += "}";
     log_json(stats_json);
   }
 

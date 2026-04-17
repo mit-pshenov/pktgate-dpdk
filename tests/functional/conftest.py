@@ -58,6 +58,11 @@ _TAP_IFACES_TO_UNMANAGE = [
     # target port resolves to something different from the default
     # egress (dtap_f3_tx). Sniffed independently.
     "dtap_f3_redir",
+    # M9 C5 — F3.12-F3.16 rate-limit tests use their own dtap pair so
+    # they don't collide with F3.1-F3.10 harnesses run in the same
+    # session. Separate pair keeps the NM keyfile session-scoped and
+    # lets the ctest entries run in any order.
+    "dtap_f3rl_rx", "dtap_f3rl_tx",
 ]
 
 

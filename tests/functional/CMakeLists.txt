@@ -134,3 +134,18 @@ set_tests_properties(functional.test_f5_reload PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 180
 )
+
+# M9 C5 — F3.12..F3.16: rate-limit end-to-end functional tests.
+# Uses dedicated dtap_f3rl_* interface pair. FIB DIR24_8 needs ~128 MB
+# heap so tests use --no-huge -m 512. F3.16 alone sleeps 5 s, F3.13
+# hammers 200 packets; 5 sub-tests each boot a fresh EAL instance →
+# long timeout.
+add_test(
+  NAME functional.test_f3_ratelimit
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f3_ratelimit.py"
+)
+set_tests_properties(functional.test_f3_ratelimit PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 300
+)

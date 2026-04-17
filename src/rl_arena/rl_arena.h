@@ -50,6 +50,12 @@ namespace pktgate::rl_arena {
 // RTE_MAX_LCORE` via static_assert when it lands.
 inline constexpr std::size_t kMaxLcores = 128;
 
+// M9 C5 REFACTOR — explicit cache-line constant (plan §M9 REFACTOR cell).
+// The static_asserts below pin this to 64 on the one architecture we
+// target (x86-64); when aarch64 enters the picture they'll fire and
+// force us to thread an arch-aware value through the data model.
+inline constexpr std::size_t kCacheLineBytes = 64;
+
 // Per-lcore bucket state. One cache line per bucket — the explicit
 // `_pad` array guarantees `sizeof(TokenBucket) == 64` under every
 // supported compiler without relying on trailing padding rules.
@@ -62,9 +68,26 @@ struct alignas(64) TokenBucket {
   std::uint64_t _pad[5];          // pad to exactly 64 B (D1)
 };
 
-static_assert(sizeof(TokenBucket) == 64,
+// M9 C5 REFACTOR — cache-line invariant for the per-lcore bucket row.
+// Spec: plan §M9 REFACTOR cell + design.md §4.4. D1 relies on each
+// lcore owning exactly one cache line so false sharing is structurally
+// impossible. Four equivalent assertions:
+//   1. Whole multiple of kCacheLineBytes (weakest form).
+//   2. Exactly one cache line (strongest, current layout).
+//   3. Alignment >= kCacheLineBytes.
+//   4. Alignment == kCacheLineBytes (pins the alignas(64) to the
+//      architecture constant — if kCacheLineBytes grows, the alignas
+//      grows too).
+// Keep the strict `== 64` form: the _pad[5] array is sized to land
+// exactly on the cache line, and a size drift deserves a compile
+// error, not a silently doubled row footprint.
+static_assert(sizeof(TokenBucket) % kCacheLineBytes == 0,
+              "TokenBucket must be a whole multiple of cache line (D1)");
+static_assert(sizeof(TokenBucket) == kCacheLineBytes,
               "TokenBucket must be exactly one 64-byte cache line (D1)");
-static_assert(alignof(TokenBucket) == 64,
+static_assert(alignof(TokenBucket) >= kCacheLineBytes,
+              "TokenBucket must be at least cache-line aligned (D1)");
+static_assert(alignof(TokenBucket) == kCacheLineBytes,
               "TokenBucket must be cache-line aligned (D1)");
 
 // One row = per-lcore bucket array for a single rate-limit rule
@@ -73,7 +96,7 @@ struct RlRow {
   TokenBucket per_lcore[kMaxLcores];
 };
 
-static_assert(sizeof(RlRow) == 64 * kMaxLcores,
+static_assert(sizeof(RlRow) == kCacheLineBytes * kMaxLcores,
               "RlRow sizing drift — buckets must be contiguous 64-B rows");
 
 // Consume `pkt_len` bytes from `b` after a lazy refill.
