@@ -172,3 +172,26 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_telemetry
 )
+
+# M11 C0: inotify event-mask filter (Ud.3a / Ud.3b / Ud.3c / Ud.4).
+# Pure function, header-only lib surface — no kernel, no thread, no
+# DPDK. Links pktgate_inotify_ctl so the archive is exercised by the
+# build; the filter itself is inline constexpr so the link is a no-op
+# for this TU specifically.
+pktgate_add_test(
+  NAME    unit.test_inotify_event_filter
+  SOURCES test_inotify_event_filter.cpp
+  LABELS  unit
+  LINK    pktgate_inotify_ctl
+)
+
+# M11 C0: inotify debouncer (Ud.1 / Ud.2 / Ud.X1 / Ud.X2 / Ud.X3).
+# Clock-injected for deterministic fake-time tests + one real-clock
+# fallback test (Ud.X3) to pin the production path. No thread lifecycle
+# yet — that lands in C1 with the watcher.
+pktgate_add_test(
+  NAME    unit.test_inotify_debounce
+  SOURCES test_inotify_debounce.cpp
+  LABELS  unit
+  LINK    pktgate_inotify_ctl
+)

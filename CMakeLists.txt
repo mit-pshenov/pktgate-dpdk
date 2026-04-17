@@ -192,6 +192,18 @@ pktgate_apply_sanitizer(pktgate_rl_ctl)
 # heap + STL containers lives here.
 add_subdirectory(src/telemetry)
 
+# ---- libpktgate_inotify_ctl (M11 C0) — DPDK-free inotify control ---------
+#
+# Debounce timer + event-mask filter (C0) and watcher thread (C1) for
+# D38 inotify-triggered reload. Control-plane, DPDK-free; consumed by
+# the product binary (main.cpp) in C1+ when the watcher thread is
+# wired alongside SnapshotPublisher. The library calls into the
+# M8-frozen `ctl::reload::deploy()` through the single `reload_mutex`
+# funnel (D35) — no new synchronisation surface added.
+#
+# C0 is pure unit surface: no thread, no kernel syscall, no DPDK.
+add_subdirectory(src/ctl/inotify)
+
 # ---- libpktgate_runtime (M9 C4) — DPDK-free runtime helpers --------------
 #
 # Home for TUs that participate in the reload/runtime lifecycle but do
