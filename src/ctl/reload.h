@@ -325,4 +325,27 @@ std::atomic<ruleset::Ruleset*>* g_active_ptr();
 // "bottomless" probe used in production.
 void set_budget_probe_for_test(config::HugepageProbe probe);
 
+// C5 — test helpers for the F5.12/F5.13/F5.14 functional tests.
+//
+// These bypass the worker hot path entirely: instead of freezing a
+// real QSBR thread (which requires test-only worker state and would
+// add a D1-class branch), we directly drive the post-synchronize
+// accounting paths under reload_mutex. The functional tests assert
+// only that the reload-counter family in stats-on-exit reflects the
+// simulated events; the INTEGRATION tier (X1.4/X1.5) covers the
+// real-QSBR behaviour end-to-end.
+//
+// simulate_timeout_for_test — push a dummy {ruleset, token} pair onto
+// pending_free (or overflow if already full), bump `timeout`, and
+// possibly emit the throttled ERROR log. The "dummy ruleset" is a
+// default-constructed Ruleset (deleted by the drain path, or retained
+// in overflow_holder on overflow — LSAN-clean either way).
+void simulate_timeout_for_test();
+
+// simulate_drain_for_test — run drain_pending_free_locked() with
+// qs==nullptr (immediate-drain semantics) so every entry on
+// pending_free is freed and `freed_total` bumps accordingly.
+// Resets the overflow-log throttle on any successful drain.
+void simulate_drain_for_test();
+
 }  // namespace pktgate::ctl::reload

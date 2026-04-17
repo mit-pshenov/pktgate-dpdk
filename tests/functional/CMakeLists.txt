@@ -119,3 +119,18 @@ set_tests_properties(functional.test_f3_action PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 420
 )
+
+# M8 C5 — F5.11..F5.14: reload functional tests (UDS cmd_socket +
+# telemetry two-way + simulate-verb observable counters). No packet
+# injection; each test brings up the binary with --ctl-sock and
+# drives it over a Python AF_UNIX socket, then parses stats_on_exit
+# for the reload counter family.
+add_test(
+  NAME functional.test_f5_reload
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f5_reload.py"
+)
+set_tests_properties(functional.test_f5_reload PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 180
+)

@@ -584,6 +584,82 @@ Insert a **C2b retrofit** cycle between C2 and C3 in the M7 plan:
 
 ---
 
-*Last updated: 2026-04-16 (§M7 lowering gap marked RESOLVED by C2b
-`79bbf9a`; scope trim). Add new items with date + origin cycle at
-append time.*
+## §M8 — Hot reload + RCU polish (lines 470-509)
+
+### Pre-M3 RCU reader gap: worker cached ruleset at launch, never re-read `g_active` — RESOLVED by C5
+
+**CRITICAL — fourth D41 silent pipeline gap class.**
+
+Before M8 C5, `worker_main` (`src/dataplane/worker.cpp`) stored
+`ctx->ruleset` once at lcore launch and dereferenced it for every
+packet burst thereafter. `g_active` was never acquire-loaded on the
+hot path. This meant:
+
+- **Every RCU publish machinery from M3 onwards was structurally
+  useless.** `atomic_exchange` on `g_active` in `deploy()` updated a
+  pointer nobody was reading.
+- The first real `deploy()` against a running worker would cause
+  `classify_l{2,3,4}` to dereference the *freed* old ruleset once
+  the reload manager's `synchronize` completed + `free_ruleset`
+  ran — heap-use-after-free, not a hypothetical.
+
+**Why nothing surfaced before M8 C5:**
+- Unit tests (M4-M7) constructed `Ruleset` directly in test bodies;
+  they never went through `worker_main`.
+- Integration X1.2/X1.4/X1.5 storm tests (M8 C1-C3) used *fake*
+  QSBR fixture workers in `tests/integration/test_reload.cpp`
+  (register / report-quiescent loop), NOT the real `worker_main`.
+  Fake workers never dereferenced a ruleset pointer.
+- Functional F1-F4 tests launch the real binary but never issue a
+  second `deploy()` mid-run — the cached pointer stayed valid
+  because no reload ever happened.
+- **Only F5.11-F5.14 exercise real binary + real workers + real
+  reload** — which is where F5.11 materialised the bug in C5.
+
+**Resolution 2026-04-17 by M8 C5:**
+Textbook RCU reader pattern in `worker_main`:
+```cpp
+while (ctx->running->load(std::memory_order_relaxed)) {
+    ctx->ruleset = ctl::reload::active_ruleset();  // acquire-load g_active
+    if (ctx->ruleset == nullptr) {
+        rte_rcu_qsbr_quiescent(ctx->qs, ctx->qsbr_thread_id);
+        continue;
+    }
+    const uint16_t nb_rx = rte_eth_rx_burst(...);
+    if (nb_rx == 0) {
+        rte_rcu_qsbr_quiescent(ctx->qs, ctx->qsbr_thread_id);  // idle too
+        continue;
+    }
+    // classify / dispatch using the stable local pointer
+    rte_rcu_qsbr_quiescent(ctx->qs, ctx->qsbr_thread_id);  // end of burst
+}
+```
+
+Per-burst acquire-load is the RCU reader canonical form — single
+`mov` with ordering on x86-64, zero contention, NOT a D1 violation.
+The D1 amendment in review-notes.md was clarified the same day:
+D1 forbids atomic RMW / CAS / fetch_add on the hot path, not
+acquire-loads (the whole point of D9 is that workers acquire-load
+`g_active` per burst). Idle-path quiescent report is a D19
+clarification: a zero-RX worker would otherwise starve the
+reload manager's synchronize deadline.
+
+**Why the bug was specifically D41 (silent pipeline gap):**
+All the RCU machinery (M8 C1 `atomic_exchange`, C2 `token+deadline`,
+C3 `pending_free`, C4 offline/unregister) existed and passed all
+its unit/integration tests. The **reader side** was never wired.
+The pattern matches §M7 lowering gap exactly: intermediate struct
+(here, `ctx->ruleset` cached raw pointer) drops the contract;
+tests at each end construct the runtime struct directly and never
+notice the gap. Only an end-to-end pipeline smoke (F5 functional,
+real worker + real reload) surfaces it.
+
+*Origin: M8 C5 `TBD-commit` 2026-04-17 → worker fixed in-cycle
+rather than STOP+report; fix is correct (textbook RCU reader) but
+the D41-class find warrants erratum for future milestones'
+pipeline-smoke guardrails.*
+
+---
+
+*Last updated: 2026-04-17 (§M8 pre-M3 RCU reader gap RESOLVED by
+M8 C5). Add new items with date + origin cycle at append time.*

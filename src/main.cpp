@@ -30,7 +30,9 @@
 #include "src/config/sizing.h"
 #include "src/config/validator.h"
 #include "src/ctl/bootstrap.h"
+#include "src/ctl/cmd_socket.h"
 #include "src/ctl/reload.h"
+#include "src/ctl/telemetry_reload.h"
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
@@ -83,6 +85,7 @@ int main(int argc, char* argv[]) {
   // to extract --config before that happens. Everything after -- is
   // passed to EAL.
   std::string config_path;
+  std::string ctl_sock_path;  // M8 C5: UDS reload endpoint (two-way X1.3).
   unsigned requested_workers = 0;  // 0 = auto-detect from available lcores
   unsigned mbuf_data_size = 0;     // 0 = RTE_MBUF_DEFAULT_BUF_SIZE
   int eal_argc = 0;
@@ -102,6 +105,14 @@ int main(int argc, char* argv[]) {
     }
     if (std::strcmp(argv[i], "--mbuf-size") == 0 && i + 1 < argc) {
       mbuf_data_size = static_cast<unsigned>(std::atoi(argv[i + 1]));
+      ++i;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--ctl-sock") == 0 && i + 1 < argc) {
+      // M8 C5: path for the AF_UNIX reload socket (two-way X1.3).
+      // Empty / unset means the cmd_socket thread is NOT started; the
+      // telemetry endpoint remains available regardless.
+      ctl_sock_path = argv[i + 1];
       ++i;
       continue;
     }
@@ -383,6 +394,39 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // M8 C5 — X1.3 two-way reload entry points.
+  //
+  // Register the DPDK telemetry `/pktgate/reload` command regardless
+  // of whether --ctl-sock is provided — the telemetry UDS is always
+  // exposed by rte_eal_init(). Optional UDS cmd_socket is started
+  // only when --ctl-sock provides a path; both paths funnel through
+  // reload::deploy() under reload_mutex (D35).
+  {
+    const int tele_ret = pktgate::ctl::telemetry_reload::register_endpoint();
+    if (tele_ret != 0) {
+      // Non-fatal: process continues without the telemetry endpoint.
+      log_json("{\"event\":\"telemetry_reload_register_failed\",\"errno\":" +
+               std::to_string(-tele_ret) + "}");
+    } else {
+      log_json("{\"event\":\"telemetry_reload_registered\"}");
+    }
+  }
+
+  pktgate::ctl::CmdSocketServer cmd_sock{};
+  if (!ctl_sock_path.empty()) {
+    if (!pktgate::ctl::cmd_socket_start(cmd_sock, ctl_sock_path)) {
+      log_json("{\"error\":\"cmd_socket_start_failed\",\"path\":\"" +
+               ctl_sock_path + "\"}");
+      pktgate::ctl::reload::shutdown();
+      std::free(qsbr_raw);
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+    log_json("{\"event\":\"cmd_socket_ready\",\"path\":\"" +
+             ctl_sock_path + "\"}");
+  }
+
   // ---- Phase 7: launch worker(s) ----
   //
   // M3: single worker on the first available worker lcore.
@@ -448,6 +492,17 @@ int main(int argc, char* argv[]) {
 
     // ---- Phase 9: shutdown (§6.4) ----
     log_json("{\"event\":\"workers_exit\"}");
+
+    // Stop the cmd_socket accept loop BEFORE waiting on workers so
+    // no late reload attempt can race the shutdown synchronize. The
+    // telemetry endpoint cannot be unregistered via the DPDK API; a
+    // late /pktgate/reload arriving during shutdown still funnels
+    // through reload::deploy() which will see `initialised == false`
+    // after reload::shutdown() below and reject with kInternal.
+    if (!ctl_sock_path.empty()) {
+      pktgate::ctl::cmd_socket_stop(cmd_sock);
+    }
+
     rte_eal_mp_wait_lcore();
 
     // M8 C4 — D12: close the stats-on-exit race.
@@ -619,8 +674,45 @@ int main(int argc, char* argv[]) {
                   ",\"tag_pcp_noop_untagged_total\":" +
                   std::to_string(worker_ctx.tag_pcp_noop_untagged_total) +
                   ",\"redirect_dropped_total\":" +
-                  std::to_string(worker_ctx.redirect_dropped_total) +
-                  "}}";
+                  std::to_string(worker_ctx.redirect_dropped_total);
+
+    // M8 C5 — reload counter family. The F5 functional tests assert
+    // on these flat keys; later M10 replaces this with Prometheus.
+    // All values are read under reload_mutex via counters_snapshot().
+    const pktgate::ctl::reload::ReloadCounters rc =
+        pktgate::ctl::reload::counters_snapshot();
+    stats_json += ",\"reload_success_total\":" +
+                  std::to_string(rc.success) +
+                  ",\"reload_parse_error_total\":" +
+                  std::to_string(rc.parse_error) +
+                  ",\"reload_validate_error_total\":" +
+                  std::to_string(rc.validate_error) +
+                  ",\"reload_compile_error_total\":" +
+                  std::to_string(rc.compile_error) +
+                  ",\"reload_build_eal_error_total\":" +
+                  std::to_string(rc.build_eal_error) +
+                  ",\"reload_timeout_total\":" +
+                  std::to_string(rc.timeout) +
+                  ",\"reload_internal_error_total\":" +
+                  std::to_string(rc.internal_error) +
+                  ",\"reload_freed_total\":" +
+                  std::to_string(rc.freed_total) +
+                  ",\"reload_pending_depth\":" +
+                  std::to_string(rc.pending_depth) +
+                  ",\"reload_pending_full_total\":" +
+                  std::to_string(rc.pending_full) +
+                  ",\"reload_overflow_log_total\":" +
+                  std::to_string(rc.overflow_log_total) +
+                  ",\"reload_validate_budget_expansion_per_rule_total\":" +
+                  std::to_string(rc.validate_budget_expansion_per_rule) +
+                  ",\"reload_validate_budget_aggregate_total\":" +
+                  std::to_string(rc.validate_budget_aggregate) +
+                  ",\"reload_validate_budget_hugepage_total\":" +
+                  std::to_string(rc.validate_budget_hugepage) +
+                  ",\"reload_active_generation\":" +
+                  std::to_string(rc.active_generation);
+
+    stats_json += "}}";
     log_json(stats_json);
   }
 

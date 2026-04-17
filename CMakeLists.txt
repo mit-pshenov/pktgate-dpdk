@@ -151,6 +151,8 @@ if(NOT PKTGATE_FUZZ)
     src/ctl/bootstrap.cpp
     src/ctl/cmd_socket.cpp
     src/ctl/reload.cpp
+    src/ctl/telemetry_reload.cpp
+    src/runtime/arena_gc.cpp
     src/ruleset/builder_eal.cpp
   )
   target_include_directories(pktgate_dp PUBLIC ${CMAKE_SOURCE_DIR})

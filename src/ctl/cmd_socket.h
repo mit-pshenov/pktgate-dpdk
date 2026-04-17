@@ -42,7 +42,10 @@ namespace pktgate::ctl {
 // thread. `path` is `unlink()`-ed on stop().
 struct CmdSocketServer {
   std::string       path;
-  int               listen_fd = -1;
+  // Atomic so stop() can null it out while accept_loop races to
+  // re-read it between accept() returns and the next iteration.
+  // TSAN flags a plain int access here (M8 C5).
+  std::atomic<int>  listen_fd{-1};
   std::thread       server_thread;
   std::atomic<bool> running{false};
   // Counters for tests. C5 elevates these to the Prometheus surface.

@@ -22,6 +22,7 @@
 #include <rte_rcu_qsbr.h>  // M8 C4 — D12 lifecycle
 
 #include "src/action/action.h"
+#include "src/ctl/reload.h"  // M8 C5 — acquire-load g_active per burst
 #include "src/dataplane/action_dispatch.h"
 #include "src/dataplane/classify_entry.h"
 #include "src/dataplane/classify_l2.h"
@@ -129,11 +130,39 @@ int worker_main(void* arg) {
   // so the reload manager's synchronize path drains promptly.
 
   while (ctx->running->load(std::memory_order_relaxed)) {
+    // M8 C5 — D9/RCU acquire-load per burst.
+    //
+    // The previous ruleset pointer in ctx->ruleset is a cached
+    // pointer that MUST be refreshed from g_active on every burst.
+    // Between the refresh here and the rte_rcu_qsbr_quiescent call
+    // below, the worker holds a local stable pointer; any concurrent
+    // reload that exchanges g_active waits for this thread's
+    // quiescent report before the reload manager frees the old
+    // pointer (D11 + D30 + D36 pending_free queue). Without this
+    // per-burst refresh, the worker pins the initial pointer for
+    // its lifetime and a reload's free_ruleset races the worker's
+    // classify_l{2,3,4} dereferences.
+    ctx->ruleset = ctl::reload::active_ruleset();
+    if (ctx->ruleset == nullptr) {
+      // No active ruleset (pre-publish or mid-shutdown). Skip the
+      // burst and report quiescent so any pending reload/shutdown
+      // synchronize unblocks.
+      if (ctx->qs != nullptr) {
+        rte_rcu_qsbr_quiescent(ctx->qs, ctx->qsbr_thread_id);
+      }
+      continue;
+    }
+
     const std::uint16_t nb_rx =
         rte_eth_rx_burst(ctx->port_id, ctx->queue_id, bufs, kBurstSize);
 
     if (nb_rx == 0) {
       // D19: idle path — no offline transition.
+      // M8 C5: report quiescent even on idle so RCU synchronize
+      // is not starved by a worker that happens to see zero RX.
+      if (ctx->qs != nullptr) {
+        rte_rcu_qsbr_quiescent(ctx->qs, ctx->qsbr_thread_id);
+      }
       continue;
     }
 

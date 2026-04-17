@@ -153,6 +153,36 @@ synchronization primitive. Hot path unchanged.
 | §15 (risks) | Remove rate-limit contention risk entirely |
 | §17 (transformation table) | Flip `PERCPU_HASH` row from "BPF artifact, replaced" to "**KEPT as universal fast-path pattern**, per-lcore instead of per-CPU" |
 
+**D1 amendment (M8 C4-C5, 2026-04-17)** — "zero atomics" is about
+**atomic RMW / CAS / fetch_add on the packet-rate hot path**
+(contention on hot cache lines at Mpps). It does NOT forbid:
+(a) plain acquire-loads of a pointer on the hot path — the RCU
+reader pattern is load-acquire of `g_active` per burst, which on
+x86-64 is a single `mov` with ordering and zero contention; this is
+the whole point of D9; (b) lifecycle/shutdown handshake atomics
+where a TSan-visible happens-before edge is required
+(`rte_eal_mp_wait_lcore` and `rte_rcu_qsbr_synchronize` live in
+librte_eal.so, which is NOT TSan-instrumented, so DPDK's real HB
+fences are invisible to the sanitizer; a pktgate-owned atomic on
+the path surfaces the edge). Currently permitted atomics:
+- `g_running` — lcore poll loop exit flag (read per burst, written
+  once per lifetime). Acquire-load on hot path, release-store on
+  shutdown.
+- `g_active` — D9 RCU publish of the current ruleset pointer.
+  Acquire-load per burst on the hot path (reader); release-exchange
+  on reload (writer, serialised under `reload_mutex`).
+- `WorkerCtx::worker_done` — M8 C4 shutdown handshake. One
+  release-store per worker lifetime + one acquire-load per
+  shutdown.
+- `CmdSocketServer::listen_fd` — M8 C5 accept-loop vs stop
+  coordination. Two reads + two writes per lifetime.
+- `CmdSocketServer::running` — pre-existing, same lifecycle scope.
+
+Any NEW atomic MUST carry the scope argument in its commit body:
+hot path acquire-load only (reader) vs lifecycle handshake.
+Atomic RMW / CAS / fetch_add on the packet-rate path remains
+forbidden.
+
 ---
 
 ### D2 — Language: C++20 baseline, newer welcome; compiler at implementer discretion

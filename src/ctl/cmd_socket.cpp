@@ -83,6 +83,24 @@ void handle_connection(int cfd) {
     req.pop_back();
   }
 
+  // C5 — test-only simulate verbs. These take no payload and just
+  // invoke the named reload-manager hook. Used by the F5.12/F5.13/F5.14
+  // functional tests so Python can drive timeout/drain/overflow
+  // without owning QSBR state. The production reload path is
+  // completely untouched.
+  constexpr std::string_view kVerbSimTimeout = "simulate-timeout";
+  constexpr std::string_view kVerbSimDrain   = "simulate-drain";
+  if (std::string_view(req) == kVerbSimTimeout) {
+    reload::simulate_timeout_for_test();
+    write_all(cfd, std::string_view("ok simulate-timeout\n"));
+    return;
+  }
+  if (std::string_view(req) == kVerbSimDrain) {
+    reload::simulate_drain_for_test();
+    write_all(cfd, std::string_view("ok simulate-drain\n"));
+    return;
+  }
+
   constexpr std::string_view kVerb = "reload";
   if (req.size() < kVerb.size() ||
       std::string_view(req).substr(0, kVerb.size()) != kVerb) {
@@ -114,7 +132,9 @@ void handle_connection(int cfd) {
 
 void accept_loop(CmdSocketServer* srv) {
   while (srv->running.load(std::memory_order_acquire)) {
-    int cfd = ::accept(srv->listen_fd, nullptr, nullptr);
+    const int lfd = srv->listen_fd.load(std::memory_order_acquire);
+    if (lfd < 0) break;
+    int cfd = ::accept(lfd, nullptr, nullptr);
     if (cfd < 0) {
       if (errno == EINTR) continue;
       // Listen fd was closed from under us — shutdown path.
@@ -162,7 +182,7 @@ bool cmd_socket_start(CmdSocketServer& srv, const std::string& path) {
     return false;
   }
 
-  srv.listen_fd = fd;
+  srv.listen_fd.store(fd, std::memory_order_release);
   srv.running.store(true, std::memory_order_release);
   srv.server_thread = std::thread(accept_loop, &srv);
   return true;
@@ -176,8 +196,7 @@ void cmd_socket_stop(CmdSocketServer& srv) {
 
   // Wake the accept loop by closing the listen fd. Any in-flight
   // accept() returns EBADF / EINVAL and the loop exits.
-  int fd = srv.listen_fd;
-  srv.listen_fd = -1;
+  int fd = srv.listen_fd.exchange(-1, std::memory_order_acq_rel);
   if (fd >= 0) {
     ::shutdown(fd, SHUT_RDWR);
     ::close(fd);

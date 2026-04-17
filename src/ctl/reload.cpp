@@ -37,6 +37,7 @@
 #include "src/config/parser.h"
 #include "src/config/sizing.h"
 #include "src/config/validator.h"
+#include "src/runtime/arena_gc.h"
 #include "src/ruleset/builder.h"
 #include "src/ruleset/builder_eal.h"
 #include "src/ruleset/ruleset.h"
@@ -175,6 +176,11 @@ void drain_pending_free_locked() {
                        ? 1
                        : rte_rcu_qsbr_check(qs, e.token, /*wait=*/false);
     if (ok == 1) {
+      // D11 arena GC fires after the grace period has elapsed for
+      // THIS entry — the whole point of the pending_free queue is
+      // that we arrive here AFTER rte_rcu_qsbr_check confirms the
+      // readers have all reported quiescent.
+      if (e.rs != nullptr) pktgate::runtime::rl_arena_gc(e.rs);
       do_free_ruleset_locked(e.rs);
       freed_any = true;
       // drop the slot (do not copy forward)
@@ -444,7 +450,16 @@ DeployResult deploy_locked(std::string_view config_json) {
     return out;
   }
 
-  // ---- 8. Free previous (quiescent) -----------------------------
+  // ---- 8. Arena GC (D11) + free previous (quiescent) -----------
+  //
+  // D11 ordering invariant: synchronize has confirmed every worker
+  // that observed rs_old has reported quiescent, so it is now safe
+  // to walk rs_old's arena slots / zero counter rows / push slot
+  // indices back on the free list. M8 body is a no-op stub; M9 C5
+  // fills it. See src/runtime/arena_gc.h.
+  //
+  // Null-guard: first-ever deploy has no predecessor; nothing to GC.
+  if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
   do_free_ruleset_locked(rs_old);
 
   // ---- 9. Bookkeeping -------------------------------------------
@@ -509,6 +524,8 @@ void shutdown() {
       const int ok = wait_for_quiescent(qs, tok, deadline,
                                         g_.params.poll_interval);
       if (ok == 1) {
+        // D11 arena GC (stub; M9 fills). See deploy_locked step 8.
+        if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
         do_free_ruleset_locked(rs_old);
       } else {
         // Deadline expired (worker died mid-flight, or somebody forgot
@@ -521,6 +538,8 @@ void shutdown() {
       }
     } else {
       // No QSBR — caller guarantees no concurrent readers.
+      // D11 arena GC fires regardless of the synchronize path.
+      if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
       do_free_ruleset_locked(rs_old);
     }
   }
@@ -529,7 +548,9 @@ void shutdown() {
   // every previously-queued token has necessarily expired (grace
   // period is cumulative), so we can free unconditionally.
   for (std::size_t i = 0; i < g_.pending_depth; ++i) {
-    do_free_ruleset_locked(g_.pending_free[i].rs);
+    auto* p = g_.pending_free[i].rs;
+    if (p != nullptr) pktgate::runtime::rl_arena_gc(p);
+    do_free_ruleset_locked(p);
     g_.pending_free[i] = PendingEntry{};
   }
   g_.pending_depth = 0;
@@ -606,6 +627,10 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs) {
     return out;
   }
 
+  // D11 arena GC (stub; M9 fills). See deploy_locked step 8.
+  // Null-guard: first-ever deploy has no predecessor and there is
+  // nothing to GC; do_free_ruleset_locked tolerates nullptr too.
+  if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
   do_free_ruleset_locked(rs_old);
 
   ++g_.counters.success;
@@ -632,6 +657,31 @@ std::atomic<ruleset::Ruleset*>* g_active_ptr() {
 void set_budget_probe_for_test(config::HugepageProbe probe) {
   std::lock_guard<std::mutex> lock(g_.reload_mutex);
   g_.budget_probe = std::move(probe);
+}
+
+// -------------------------------------------------------------------------
+// C5 — functional-test simulate helpers.
+
+void simulate_timeout_for_test() {
+  std::lock_guard<std::mutex> lock(g_.reload_mutex);
+  // Fabricate a "stuck" old ruleset: the real pending_free contract
+  // only cares that the pointer is delete-safe. A default-constructed
+  // Ruleset satisfies that (no EAL handles owned). We use dummy token
+  // 0 because simulate_drain will run with qs==nullptr which treats
+  // every entry as quiescent.
+  auto* rs_dummy = new ruleset::Ruleset{};
+  handle_timeout_locked(rs_dummy, /*token=*/0u);
+  ++g_.counters.timeout;
+}
+
+void simulate_drain_for_test() {
+  std::lock_guard<std::mutex> lock(g_.reload_mutex);
+  // Temporarily neutralise the QSBR handle so drain_pending_free_locked
+  // treats every entry as quiescent and frees it. Restore on exit.
+  struct rte_rcu_qsbr* const saved_qs = g_.params.qs;
+  g_.params.qs = nullptr;
+  drain_pending_free_locked();
+  g_.params.qs = saved_qs;
 }
 
 }  // namespace pktgate::ctl::reload
