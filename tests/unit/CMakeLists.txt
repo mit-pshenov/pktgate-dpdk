@@ -66,3 +66,16 @@ pktgate_add_test(
 # flag so the test body at tests/unit/test_eal_unit.cpp U6.43b can
 # include the reload header and assert the owning symbol exists.
 target_compile_definitions(unit_test_eal_unit PRIVATE M8_C1_DONE=1)
+
+# M9 C0: rl_arena bucket-math (DPDK-free). U5.1 .. U5.10. The U5.8 /
+# U5.9 symbol-grep tests need the on-disk archive path; we inject it
+# as a quoted compile definition (see grabli_cmake_path_defines.md).
+pktgate_add_test(
+  NAME    unit.test_rl_arena
+  SOURCES test_rl_arena.cpp
+  LABELS  unit
+  LINK    pktgate_rl
+)
+target_compile_definitions(unit_test_rl_arena PRIVATE
+  "PKTGATE_RL_ARCHIVE_PATH=\"$<TARGET_FILE:pktgate_rl>\""
+)

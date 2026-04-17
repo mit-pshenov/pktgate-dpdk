@@ -138,6 +138,26 @@ target_link_libraries(pktgate_core PUBLIC PkgConfig::NLOHMANN_JSON)
 pktgate_apply_warnings(pktgate_core)
 pktgate_apply_sanitizer(pktgate_core)
 
+# ---- libpktgate_rl (M9 C0) — rate-limit arena (DPDK-free math layer) -----
+#
+# The bucket-math TU is deliberately DPDK-free (see memory
+# `grabli_m4c0_dpdk_free_core_library.md`): it takes `now_tsc` and
+# `tsc_hz` as explicit parameters instead of calling `rte_rdtsc()` /
+# `rte_get_tsc_hz()`. Unit tests run under the dev-* presets without
+# EAL. C1 adds the arena class (still DPDK-free). C2 wires the hot
+# path in a thin worker-side glue TU that links against DPDK.
+#
+# D1 is the load-bearing invariant: NO `std::atomic` / `_Atomic` in
+# this library. U5.8 asserts this via symbol grep on the built
+# archive, so a future regression wires a race back into the hot
+# path and fails the test at link time, not at runtime.
+add_library(pktgate_rl STATIC
+  src/rl_arena/rl_arena.cpp
+)
+target_include_directories(pktgate_rl PUBLIC ${CMAKE_SOURCE_DIR})
+pktgate_apply_warnings(pktgate_rl)
+pktgate_apply_sanitizer(pktgate_rl)
+
 # ---- libpktgate_dp (M3) — DPDK-dependent dataplane library ---------------
 #
 # Modules that require DPDK headers at compile time and rte_eal_init() at
