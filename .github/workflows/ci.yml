@@ -24,14 +24,12 @@
 # regression is. See implementation-plan.md §0.2 — "per-cycle gate"
 # explicitly covers the five dev-* flavours only.
 #
-# DPDK installation: we install from the distro package on both
-# ubuntu-24.04 and the nightly container. The dev VM uses a meson-
-# uninstalled DPDK 25.11 build (see user memory "Dev VM DPDK
-# layout"), but CI doesn't need 25.11 specifically — any DPDK the
-# presets can link against is enough for M0's empty `main()` and
-# will be enough for M1's pure-C++ parser/validator code too. When
-# M3 lands the first hot-path code that depends on a specific DPDK
-# feature, this file gets revisited.
+# DPDK: ubuntu-24.04 ships libdpdk-dev 23.11 which lacks rte_ip6.h
+# and other 25.11 APIs the codebase depends on since M5. We build
+# DPDK 25.11 from source and cache the installed prefix with
+# actions/cache. First run pays ~5 min; subsequent runs restore
+# from cache in ~15 s. Bump the cache key `-v` suffix when changing
+# meson flags or DPDK version.
 
 name: sanitizer-gate
 
@@ -54,6 +52,10 @@ concurrency:
   group: sanitizer-gate-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  DPDK_VERSION: "25.11"
+  DPDK_PREFIX: /opt/dpdk-25.11
+
 jobs:
   # ---------------------------------------------------------------------
   # Rotating per-commit job. Runs on push and on PRs; picks ONE preset
@@ -67,17 +69,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain + DPDK
+      - name: Install toolchain + DPDK build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++-14 clang-18 \
-            pkg-config libdpdk-dev nlohmann-json3-dev libgtest-dev
+            pkg-config nlohmann-json3-dev libgtest-dev \
+            meson python3-pyelftools libnuma-dev libelf-dev libbsd-dev
           # D2: presets use unversioned g++/clang++; pin to installed versions
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
+
+      - name: Cache DPDK ${{ env.DPDK_VERSION }}
+        id: dpdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DPDK_PREFIX }}
+          key: dpdk-${{ env.DPDK_VERSION }}-${{ runner.os }}-v1
+
+      - name: Build + install DPDK ${{ env.DPDK_VERSION }}
+        if: steps.dpdk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sLO https://fast.dpdk.org/rel/dpdk-${DPDK_VERSION}.tar.xz
+          tar xf dpdk-${DPDK_VERSION}.tar.xz
+          cd dpdk-${DPDK_VERSION}
+          meson setup build \
+            --prefix=${DPDK_PREFIX} \
+            -Dlibdir=lib \
+            -Dplatform=generic \
+            -Dtests=false \
+            -Ddisable_apps=*
+          ninja -C build -j$(nproc)
+          sudo ninja -C build install
+
+      - name: Register DPDK library paths
+        run: |
+          echo "${DPDK_PREFIX}/lib" | sudo tee /etc/ld.so.conf.d/dpdk.conf
+          sudo ldconfig
 
       - name: Pick rotating sanitizer from SHA
         id: pick
@@ -93,7 +123,7 @@ jobs:
           echo "::notice::rotating sanitizer for $GITHUB_SHA -> $preset"
 
       - name: Configure
-        run: cmake --preset ${{ steps.pick.outputs.preset }}
+        run: PKG_CONFIG_PATH=${DPDK_PREFIX}/lib/pkgconfig cmake --preset ${{ steps.pick.outputs.preset }}
 
       - name: Build
         run: cmake --build --preset ${{ steps.pick.outputs.preset }}
@@ -122,20 +152,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain + DPDK
+      - name: Install toolchain + DPDK build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++-14 clang-18 \
-            pkg-config libdpdk-dev nlohmann-json3-dev libgtest-dev
+            pkg-config nlohmann-json3-dev libgtest-dev \
+            meson python3-pyelftools libnuma-dev libelf-dev libbsd-dev
           # D2: presets use unversioned g++/clang++; pin to installed versions
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
 
+      - name: Cache DPDK ${{ env.DPDK_VERSION }}
+        id: dpdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DPDK_PREFIX }}
+          key: dpdk-${{ env.DPDK_VERSION }}-${{ runner.os }}-v1
+
+      - name: Build + install DPDK ${{ env.DPDK_VERSION }}
+        if: steps.dpdk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sLO https://fast.dpdk.org/rel/dpdk-${DPDK_VERSION}.tar.xz
+          tar xf dpdk-${DPDK_VERSION}.tar.xz
+          cd dpdk-${DPDK_VERSION}
+          meson setup build \
+            --prefix=${DPDK_PREFIX} \
+            -Dlibdir=lib \
+            -Dplatform=generic \
+            -Dtests=false \
+            -Ddisable_apps=*
+          ninja -C build -j$(nproc)
+          sudo ninja -C build install
+
+      - name: Register DPDK library paths
+        run: |
+          echo "${DPDK_PREFIX}/lib" | sudo tee /etc/ld.so.conf.d/dpdk.conf
+          sudo ldconfig
+
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }}
+        run: PKG_CONFIG_PATH=${DPDK_PREFIX}/lib/pkgconfig cmake --preset ${{ matrix.preset }}
 
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
