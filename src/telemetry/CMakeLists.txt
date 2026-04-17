@@ -18,7 +18,21 @@
 
 add_library(pktgate_telemetry STATIC
   prom_encoder.cpp
+  # M10 C1 — snapshot aggregation + single-writer/multi-reader ring.
+  # Pure C++; pulls in ruleset.h (DPDK-free header, forward-declares
+  # rte_hash / rte_fib). No DPDK symbols leak into this archive; the
+  # publisher adapter that calls `rte_eth_stats_get` will live in a
+  # separate DPDK-aware TU when the publisher thread wires into
+  # main.cpp (C3). In C1 the unit tests exercise build_snapshot with
+  # fake PortStats injected via span — zero DPDK.
+  snapshot.cpp
 )
 target_include_directories(pktgate_telemetry PUBLIC ${CMAKE_SOURCE_DIR})
+# M10 C1 — snapshot.h uses RuleCounter from src/ruleset/ruleset.h; the
+# header also transitively includes src/action/action.h +
+# src/compiler/compiler.h. These are DPDK-free cores of libpktgate_core;
+# link it here for the header chain, NOT because we need any DPDK
+# surface (D1 + grabli_m4c0_dpdk_free_core_library.md).
+target_link_libraries(pktgate_telemetry PUBLIC pktgate_core)
 pktgate_apply_warnings(pktgate_telemetry)
 pktgate_apply_sanitizer(pktgate_telemetry)

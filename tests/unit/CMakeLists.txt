@@ -126,3 +126,27 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_telemetry
 )
+
+# M10 C1: build_snapshot pure aggregation (U7.1, U7.2, U7.6). Fake
+# LcoreCounterView + fake PortStats — no DPDK, no threads, no EAL.
+# Lives in pktgate_telemetry alongside the encoder so the publisher
+# adapter (C3, main.cpp) sees a single archive.
+pktgate_add_test(
+  NAME    unit.test_snapshot_sum
+  SOURCES test_snapshot_sum.cpp
+  LABELS  unit
+  LINK    pktgate_telemetry
+)
+
+# M10 C1: SnapshotRing single-writer + multi-reader (U7.3, U7.4).
+# U7.3 includes a std::thread-based TSAN harness — publish/read loop
+# under dev-tsan must be race-free (acquire/release pair on
+# latest_gen_ + plain slot store BEFORE the release). Failing this
+# test under dev-tsan (TSAN_OPTIONS halt_on_error=1) is the
+# observable signal that D3 ring ordering regressed.
+pktgate_add_test(
+  NAME    unit.test_snapshot_ring
+  SOURCES test_snapshot_ring.cpp
+  LABELS  unit
+  LINK    pktgate_telemetry
+)
