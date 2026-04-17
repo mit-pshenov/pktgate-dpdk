@@ -178,6 +178,20 @@ target_link_libraries(pktgate_rl_ctl PUBLIC pktgate_rl)
 pktgate_apply_warnings(pktgate_rl_ctl)
 pktgate_apply_sanitizer(pktgate_rl_ctl)
 
+# ---- libpktgate_telemetry (M10 C0) — DPDK-free control-plane telemetry ---
+#
+# Hosts the Prometheus OpenMetrics encoder (C0), snapshot ring (C1),
+# snapshot publisher (C1), and HTTP /metrics endpoint (C3). Kept
+# DPDK-free in C0 so unit tests (tests/unit/test_prom_encoder.cpp)
+# run under dev-* presets without EAL. Introduce a thin DPDK-aware
+# bridge TU in C1+ when `rte_eth_stats` wiring lands; link it into
+# pktgate_dp then, not into this archive.
+#
+# Mirrors the pktgate_rl / pktgate_rl_ctl split: hot-path-adjacent
+# code stays in small math-only archives; control-plane logic with
+# heap + STL containers lives here.
+add_subdirectory(src/telemetry)
+
 # ---- libpktgate_runtime (M9 C4) — DPDK-free runtime helpers --------------
 #
 # Home for TUs that participate in the reload/runtime lifecycle but do

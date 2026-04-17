@@ -113,3 +113,16 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_runtime
 )
+
+# M10 C0: Prometheus OpenMetrics encoder formatters (U10.1 / U10.3 /
+# U10.4 / U7.7). Pure string formatting, DPDK-free, no EAL. Links
+# pktgate_telemetry (the control-plane archive that C1 will extend
+# with snapshot + ring; C3 with HTTP endpoint). U10.2 histogram is
+# DEFERRED per Phase 1 scope trim (errata §M10) — enum tag retained
+# so the Phase 2 addition is a pure extension.
+pktgate_add_test(
+  NAME    unit.test_prom_encoder
+  SOURCES test_prom_encoder.cpp
+  LABELS  unit
+  LINK    pktgate_telemetry
+)
