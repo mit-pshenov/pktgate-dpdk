@@ -661,5 +661,98 @@ pipeline-smoke guardrails.*
 
 ---
 
-*Last updated: 2026-04-17 (§M8 pre-M3 RCU reader gap RESOLVED by
-M8 C5). Add new items with date + origin cycle at append time.*
+## §M9 — Per-lcore token bucket arena (lines 513-540)
+
+### Boot-path RlSlotAllocator gap: main.cpp called `compile(cfg)` without allocator — RESOLVED by C5
+
+**CRITICAL — fifth D41 silent pipeline gap class.**
+
+M9 C3 (`f4c18ac`) extended the compiler signature with
+`RlSlotAllocator = std::function<uint16_t(uint64_t)>` (option a;
+keeps compiler DPDK/arena-free per `grabli_m4c0_dpdk_free_core_library.md`).
+The reload path (`src/ctl/reload.cpp`) was wired correctly at the
+same commit: `compile(cfg, opts, rl_alloc)` with a one-line lambda
+over `rl_arena_global().alloc_slot()`.
+
+The **boot path** — `src/main.cpp` initial config load before any
+reload — kept calling `compile(cfg)` with the default-arg empty
+allocator. Consequences on a fresh-boot binary with one or more
+RL rules in config:
+
+- Every boot-time `kRateLimit` action got `rl_slot = kInvalidSlot`.
+- `build_ruleset` saw the sentinel and skipped the D41 lockstep
+  populate of `Ruleset::rl_actions[slot] = {rule_id, rate, burst}`.
+- `n_rl_actions` stayed 0 across the whole process lifetime.
+- `apply_action(kRateLimit)` hit a slot the arena never knew about
+  → either default-allow or undefined behavior depending on the
+  branch order; in practice traffic just went through unfiltered.
+- Real reloads (SIGHUP-triggered) overwrote the broken initial
+  `g_active` with a correctly-built ruleset, hiding the boot bug
+  for any test that exercised at least one reload before measurement.
+
+**Why nothing surfaced before M9 C5:**
+- C2 integration test `test_rl_integration.cpp` manually wired
+  `arena.alloc_slot` + `Ruleset::rl_actions[s]` for hot-path-only
+  coverage — bypassed compiler entirely.
+- C3 integration test `test_rl_compile_build.cpp` constructed its
+  OWN allocator lambda inline and called `compile(cfg, opts,
+  rl_alloc)` directly. The boot-path `compile(cfg)` overload was
+  never invoked from any test.
+- Unit tests U4.* / U5.* construct `RateLimitArena` directly.
+- Functional F5 (M8 reload) tests issue a reload before measuring
+  → reload path wired correctly → no observable bug.
+- **Only F3.12 (allow under limit, no reload before measurement)
+  exercises real binary + boot path + RL classification.** F3.12
+  failed with `rl` list empty in stats-on-exit despite one RL rule
+  in config — surfaced the gap.
+
+**Resolution 2026-04-17 by M9 C5 (`3fa66d9`):**
+Symmetric wiring in `src/main.cpp` boot path:
+```cpp
+auto rl_alloc = [](uint64_t rule_id) -> uint16_t {
+    return pktgate::rl::rl_arena_global().alloc_slot(rule_id);
+};
+auto compiled = compiler::compile(cfg, opts, rl_alloc);
+```
+
+Same lambda shape as `reload.cpp` deploy path — duplicated by hand.
+A future cleanup could factor out a `make_default_rl_allocator()`
+helper to prevent this exact divergence on the next allocator-style
+field.
+
+**Why the bug was specifically D41 (silent pipeline gap):**
+The compiler signature change in C3 added a new "field" (the
+allocator argument) that the boot path never threaded through.
+Every test had its own allocator binding; production boot path
+got the default. Pattern matches M2 / M5 / M7 / M8 exactly:
+intermediate boundary (here, the compile() callsite) drops the
+contract; tests at each end construct the binding directly and
+never notice the gap. Only end-to-end pipeline smoke (F3
+functional, real binary + real classification + measure-before-reload)
+surfaces it.
+
+This is now the **fifth** D41 instance and the **second** that the
+M9 review missed at design time despite explicit `D41 watch in C3`
+in the supervisor handoff. The watch caught the compiler→builder
+roundtrip (covered by `C3-Roundtrip.TwoRulesThreeStagesLockstep`)
+but missed the `compile()` call-site fan-out — main.cpp wasn't on
+the surface area the integration test interrogated.
+
+**Phase 2 follow-up reminder:** the compile-time guard suggested
+in `grabli_m2_silent_pipeline_gap.md` (sizeof assert / lower-action
+function with -Wswitch-enum) does not catch this *call-site*
+variant. A separate guard for compiler entry-point arity drift —
+e.g. removing the default-arg overload and forcing every caller to
+supply the allocator explicitly — would. Defer to milestone-end
+hygiene pass.
+
+*Origin: M9 C5 `3fa66d9` 2026-04-17 → worker fixed in-cycle. The
+fix is correct (symmetric wiring) but the D41-class find warrants
+erratum so the call-site default-arg pattern is on the radar for
+M10+ pipeline additions.*
+
+---
+
+*Last updated: 2026-04-17 (§M9 boot-path RlSlotAllocator gap
+RESOLVED by M9 C5; fifth D41 instance). Add new items with date +
+origin cycle at append time.*

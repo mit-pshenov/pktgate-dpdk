@@ -816,6 +816,17 @@ int main(int argc, char* argv[]) {
                   std::span<const Label>{},
                   static_cast<std::int64_t>(snap.reload.active_generation));
 
+              // C5 / F8.13 — publisher liveness gauge. Monotonic
+              // counter of completed snapshot publishes; scraped
+              // alongside the other reload/active gauges. Its forward
+              // progress under a slow scraper is the observable that
+              // proves the N=4 ring decouples the 1 Hz writer from
+              // the reader.
+              body += format_gauge(
+                  "pktgate_publisher_generation",
+                  std::span<const Label>{},
+                  static_cast<std::int64_t>(snap.publisher_generation_gauge));
+
               // Active ruleset rule counts by layer.
               auto active_rules_line = [&](std::string layer,
                                            std::uint64_t v) {

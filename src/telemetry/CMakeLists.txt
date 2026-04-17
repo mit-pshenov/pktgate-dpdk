@@ -32,6 +32,10 @@ add_library(pktgate_telemetry STATIC
   # the seams through which main.cpp injects DPDK-aware glue.
   snapshot_publisher.cpp
   http_server.cpp
+  # M10 C5 REFACTOR — canonical §10.3 name constants. Header-only;
+  # listed in SOURCES so IDEs surface it and target_sources sees every
+  # public header. Produces no object code (inline constexpr only).
+  counter_names.h
 )
 target_include_directories(pktgate_telemetry PUBLIC ${CMAKE_SOURCE_DIR})
 # M10 C1 — snapshot.h uses RuleCounter from src/ruleset/ruleset.h; the

@@ -265,6 +265,15 @@ struct Snapshot {
   // C4 — reload + active-ruleset surface.
   ReloadState      reload{};
   ActiveRuleCounts active_rules{};
+
+  // C5 — publisher liveness gauge. Same value as `generation` above
+  // (the publisher increments both in lockstep) but surfaced as a
+  // separately-named §10.3 metric so F8.13 can observe the writer's
+  // forward progress across a slow-reader scrape without inferring it
+  // from `generation` (an internal ring field, not an exposition
+  // metric). Duplication is deliberate: `generation` is ring
+  // plumbing, `publisher_generation_gauge` is the §10.3 promise.
+  std::uint64_t publisher_generation_gauge = 0;
 };
 
 // -------------------------------------------------------------------------

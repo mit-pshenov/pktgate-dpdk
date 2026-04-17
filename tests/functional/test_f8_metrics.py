@@ -67,6 +67,8 @@ F8_2_CANONICAL_NAMES = [
     "pktgate_active_generation",
     "pktgate_active_rules",
     "pktgate_cmd_socket_rejected_total",
+    # M10 C5 / F8.13 — publisher liveness gauge.
+    "pktgate_publisher_generation",
     # System gauges
     "pktgate_mempool_in_use",
     "pktgate_mempool_free",
@@ -613,6 +615,401 @@ def test_f8_2_canonical_names_scrape_wired(pktgate_process):
         f"and they are not on the justified-absent list.\n"
         f"MISSING: {missing}\n"
         f"BODY (first 4 kB):\n{text[:4096]}"
+    )
+
+    proc.stop()
+    assert proc.returncode == 0
+
+
+# ------------------------------------------------------------------
+# F8.13 — slow reader does NOT block the snapshot writer.
+#
+# Setup: two scrape connections.
+#   * A "slow" socket connects, sends GET /metrics, reads the
+#     response headers + a first byte of body, then STALLS for
+#     ~5.5 s across multiple 1 Hz publish intervals before closing.
+#   * A "fast" probe polls /metrics every ~500 ms in parallel.
+#
+# Assertion: while the slow socket is held open, the fast probe
+#   (a) keeps getting 200 OK with non-empty bodies AND
+#   (b) observes `pktgate_publisher_generation` strictly increase
+#       across at least 3 publishes within the stall window.
+#
+# The N=4 ring (design.md §10.1, D3) is the mechanism: the writer
+# publishes into `gen % N` which rotates; a slow reader pinning ONE
+# slot cannot back-pressure the writer as long as the scraper doesn't
+# hold every slot simultaneously. 1 Hz cadence × 5 s stall × N=4
+# slots = writer advances at least 3 generations while the slow
+# reader is blocked.
+#
+# Covers: F8.13, §10.1 N=4 ring, D3, D42.
+# ------------------------------------------------------------------
+def _extract_publisher_generation(body_text):
+    """Return the integer value of the pktgate_publisher_generation
+    gauge in a /metrics body, or None if the line is absent."""
+    for line in body_text.splitlines():
+        # `pktgate_publisher_generation 42` (no labels).
+        if line.startswith("pktgate_publisher_generation "):
+            parts = line.split(" ", 1)
+            if len(parts) == 2:
+                try:
+                    return int(parts[1].strip())
+                except ValueError:
+                    return None
+    return None
+
+
+def test_f8_13_slow_reader_does_not_block_writer(pktgate_process):
+    """F8.13: a scraper that stalls across multiple publish intervals
+    does not block the 1 Hz snapshot writer. Verified by observing
+    `pktgate_publisher_generation` advance via a parallel fast probe."""
+    proc = pktgate_process(make_config(),
+                           eal_args=eal_args_for("f813"))
+    proc.start()
+    assert proc.wait_ready(timeout=60), (
+        f"binary not ready. stdout={proc.stdout_text!r} "
+        f"stderr={proc.stderr_text!r}"
+    )
+    port = wait_for_prom_endpoint(proc)
+    assert port is not None and port > 0
+
+    # Warm up: first probe confirms the scrape path is live and the
+    # publisher has ticked at least once.
+    status0, _, body0 = http_get(port, "/metrics")
+    assert status0 == 200, f"warm-up scrape failed, status={status0}"
+    gen0 = _extract_publisher_generation(body0.decode("utf-8", "replace"))
+    assert gen0 is not None, (
+        "pktgate_publisher_generation missing from warm-up scrape body — "
+        "publisher gauge not wired through /metrics?\n"
+        f"body (first 2 kB): {body0[:2048]!r}"
+    )
+
+    # Open a slow scraper: connect, send request, read headers + one
+    # chunk, then sleep without consuming the rest. The socket stays
+    # open (no close(), no more recv()) across the stall window —
+    # simulating a scraper that stalled mid-response.
+    slow = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    slow.settimeout(10.0)
+    slow.connect(("127.0.0.1", port))
+    slow.sendall(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    # Drain the header block (read once; don't consume the full body).
+    # We expect ~0.1 s for the server to flush the response.
+    try:
+        first_chunk = slow.recv(512)
+    except socket.timeout:
+        first_chunk = b""
+    assert first_chunk.startswith(b"HTTP/1.1 200 "), (
+        f"slow socket did not receive a 200 OK: first_chunk={first_chunk!r}"
+    )
+
+    # While the slow socket is held open, a fast probe every ~500 ms
+    # must keep getting 200 OK AND the publisher_generation gauge must
+    # advance by at least 3 ticks across a ~5.5 s window (1 Hz × ~5
+    # publishes; require 3 as a safety margin for TSAN cold-start and
+    # single-lcore scheduling jitter).
+    stall_window_s = 5.5
+    poll_interval_s = 0.5
+    deadline = time.monotonic() + stall_window_s
+    gen_observations = [gen0]
+    fast_failures = 0
+    while time.monotonic() < deadline:
+        status_n, _, body_n = http_get(port, "/metrics", timeout=3.0)
+        if status_n != 200:
+            fast_failures += 1
+        else:
+            gen_n = _extract_publisher_generation(
+                body_n.decode("utf-8", "replace"))
+            if gen_n is not None:
+                gen_observations.append(gen_n)
+        time.sleep(poll_interval_s)
+
+    # Now close the slow socket — we're done with it regardless of
+    # whether the server was going to kick it after SO_RCVTIMEO.
+    try:
+        slow.close()
+    except OSError:
+        pass
+
+    assert fast_failures == 0, (
+        f"fast probe failed {fast_failures} times while a slow scraper "
+        f"held a connection — writer appears to be blocked."
+    )
+
+    # The publisher generation must have advanced. 1 Hz × 5.5 s with
+    # N=4 ring slack = at least 3 publishes observable by the fast
+    # probe (first + >=2 more). Assert >= gen0 + 3 across observations.
+    max_gen = max(gen_observations)
+    assert max_gen >= gen0 + 3, (
+        f"publisher_generation did not advance under slow-reader "
+        f"contention: gen0={gen0}, observations={gen_observations}, "
+        f"max={max_gen}. Expected max >= gen0 + 3 (1 Hz × 5.5 s "
+        f"window; N=4 ring should decouple writer from reader)."
+    )
+
+    proc.stop()
+    assert proc.returncode == 0
+
+
+# ------------------------------------------------------------------
+# F8.14 — QinQ outer counter visible end-to-end via /metrics.
+#
+# A true QinQ stack (outer 0x88A8 S-tag, inner 0x8100 C-tag) injected
+# on a net_tap vdev bumps classify_l2's `qinq_outer_only_total`
+# (D32). The 1 Hz publisher sums it into Snapshot.qinq_outer_only_
+# total; the encoder emits
+# `pktgate_lcore_qinq_outer_only_total{lcore="agg"} N` with N >= 1.
+#
+# Distinguishes from the M4 C9 precedent (tests/functional/
+# test_f8_qinq_counter.py): that test read the stats_on_exit JSON
+# sibling (M4 observable); THIS test closes the D41 end-to-end loop
+# by reading the Prometheus scrape surface (M10 exposition path).
+#
+# Covers: F8.14, D32, §5.2, §10.3.
+# ------------------------------------------------------------------
+_F8_14_INGRESS_IFACE = "dtap_f8m_rx"
+_F8_14_EGRESS_IFACE  = "dtap_f8m_tx"
+
+
+def _delete_stale_tap(iface):
+    import subprocess
+    result = subprocess.run(
+        ["ip", "link", "show", iface],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and iface in result.stdout:
+        subprocess.run(["ip", "link", "delete", iface],
+                       capture_output=True)
+
+
+def _tap_iface_up(iface, timeout=5.0):
+    import subprocess
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["ip", "link", "show", iface],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and iface in result.stdout:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _f8_14_eal_args(prefix):
+    return [
+        "--no-pci",
+        "--no-huge",
+        "-m", "512",
+        "-d", DPDK_DRIVER_DIR,
+        "--vdev", f"net_tap0,iface={_F8_14_INGRESS_IFACE}",
+        "--vdev", f"net_tap1,iface={_F8_14_EGRESS_IFACE}",
+        "-l", "0,1",
+        "--log-level", "lib.*:error",
+        "--file-prefix", f"pktgate_f8m_{prefix}",
+    ]
+
+
+def _f8_14_config(prom_port=0):
+    cfg = make_config(prom_port=prom_port)
+    cfg["interface_roles"] = {
+        "upstream_port":   {"vdev": "net_tap0"},
+        "downstream_port": {"vdev": "net_tap1"},
+    }
+    # A single L2 rule that does NOT match our QinQ frame; the
+    # verdict is irrelevant, only the qinq_outer_only_total bump
+    # (which happens in classify_l2 regardless of rule match).
+    cfg["pipeline"]["layer_2"] = [
+        {
+            "id": 1814,
+            "src_mac": "cc:cc:cc:cc:cc:cc",
+            "action": {"type": "drop"},
+        }
+    ]
+    cfg["default_behavior"] = "allow"
+    return cfg
+
+
+def test_f8_14_qinq_outer_counter_via_metrics(pktgate_process,
+                                              nm_unmanaged_tap):
+    """F8.14: inject a true QinQ stack on net_tap ingress; assert
+    `pktgate_lcore_qinq_outer_only_total` >= 1 in the /metrics scrape
+    body."""
+    from scapy.all import Ether, Dot1Q, sendp, conf as scapy_conf
+    scapy_conf.verb = 0
+
+    _delete_stale_tap(_F8_14_INGRESS_IFACE)
+    _delete_stale_tap(_F8_14_EGRESS_IFACE)
+
+    proc = pktgate_process(_f8_14_config(),
+                           eal_args=_f8_14_eal_args("f814"))
+    proc.start()
+    assert proc.wait_ready(timeout=60), (
+        f"binary not ready. stdout={proc.stdout_text!r} "
+        f"stderr={proc.stderr_text!r}"
+    )
+    assert _tap_iface_up(_F8_14_INGRESS_IFACE), (
+        f"tap interface {_F8_14_INGRESS_IFACE!r} did not appear in 5 s"
+    )
+
+    import subprocess
+    subprocess.run(
+        ["sysctl", "-qw",
+         f"net.ipv6.conf.{_F8_14_INGRESS_IFACE}.disable_ipv6=1"],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["ip", "addr", "flush", "dev", _F8_14_INGRESS_IFACE],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["ip", "link", "set", _F8_14_INGRESS_IFACE, "arp", "off"],
+        capture_output=True,
+    )
+    time.sleep(0.5)
+
+    port = wait_for_prom_endpoint(proc)
+    assert port is not None and port > 0
+
+    # scapy: Ether(type=0x88A8) / Dot1Q(type=0x8100) /
+    # Dot1Q(type=0x0800) — outer S-tag, inner C-tag. classify_l2
+    # walks the S-tag, sees the inner tag is still a VLAN TPID, and
+    # bumps qinq_outer_only_total.
+    pkt = (
+        Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66",
+              type=0x88A8) /
+        Dot1Q(vlan=10, type=0x8100) /
+        Dot1Q(vlan=20, type=0x0800) /
+        (b"\x00" * 20)
+    )
+    # Send a handful of packets so the bump is non-ambiguous even
+    # under tap-driven RSS jitter.
+    from scapy.all import conf as sc
+    sc.ifaces.reload()
+    for _ in range(5):
+        sendp(pkt, iface=_F8_14_INGRESS_IFACE, verbose=False)
+    # Publisher is 1 Hz; wait for ~2 publish cycles so the bump
+    # is rolled into the latest snapshot.
+    time.sleep(2.5)
+
+    status, _, body = http_get(port, "/metrics")
+    assert status == 200, f"/metrics scrape failed, status={status}"
+    text = body.decode("utf-8", "replace")
+
+    # Match the agg-lcore emission line. Encoder emits
+    # `pktgate_lcore_qinq_outer_only_total{lcore="agg"} N`.
+    observed = None
+    for line in text.splitlines():
+        if line.startswith(
+                'pktgate_lcore_qinq_outer_only_total{lcore="agg"} '):
+            try:
+                observed = int(line.rsplit(" ", 1)[1].strip())
+            except (IndexError, ValueError):
+                observed = None
+            break
+
+    assert observed is not None, (
+        "pktgate_lcore_qinq_outer_only_total not present in /metrics body "
+        "under an `lcore=\"agg\"` label.\n"
+        f"body (first 4 kB): {text[:4096]}"
+    )
+    assert observed >= 1, (
+        f"pktgate_lcore_qinq_outer_only_total = {observed}, expected >= 1 "
+        f"after injecting QinQ frames. Possible causes: classify_l2 did "
+        f"not see the frame (tap path not up), publisher did not tick "
+        f"before scrape, or D32 bump site regressed."
+    )
+
+    proc.stop()
+    assert proc.returncode == 0
+
+
+# ------------------------------------------------------------------
+# F8.15 — `pkt_truncated` counter present (and zero) in a clean run.
+#
+# §10.3 lists `pktgate_lcore_pkt_truncated_total{lcore,where}` as a
+# presence-only counter (D31). A non-zero value requires crafted
+# truncated frames (adversarial-agent territory — out of scope here).
+#
+# This test asserts:
+#   * The name appears in /metrics body under every §10.3 `where`
+#     label value (l2, l2_vlan, l3_v4, l3_v6, l3_v6_frag_ext, l4).
+#   * Every emitted value is exactly 0 — clean workload, no
+#     truncation shapes injected.
+#
+# Covers: F8.15, D33, D31, §10.3.
+# ------------------------------------------------------------------
+def test_f8_15_pkt_truncated_present_and_zero_in_clean_run(pktgate_process):
+    """F8.15: the pkt_truncated family appears in /metrics for every
+    §10.3 `where` value, with value 0 after a clean (non-truncating)
+    workload."""
+    proc = pktgate_process(make_config(),
+                           eal_args=eal_args_for("f815"))
+    proc.start()
+    assert proc.wait_ready(timeout=60), (
+        f"binary not ready. stdout={proc.stdout_text!r} "
+        f"stderr={proc.stderr_text!r}"
+    )
+    port = wait_for_prom_endpoint(proc)
+    assert port is not None and port > 0
+
+    # Wait a publish cycle so the snapshot ring is primed.
+    time.sleep(1.5)
+
+    status, _, body = http_get(port, "/metrics")
+    assert status == 200, f"scrape failed, status={status}"
+    text = body.decode("utf-8", "replace")
+
+    # D31 §10.3 where-label values, mirrored from snapshot.cpp trunc_line
+    # calls in src/main.cpp BodyFn (M10 C4). If the encoder changes the
+    # label set, this test is the lockstep gate.
+    expected_where = [
+        "l2", "l2_vlan",
+        "l3_v4", "l3_v6", "l3_v6_frag_ext",
+        "l4",
+    ]
+
+    # Parse every `pktgate_lcore_pkt_truncated_total{...} N` line and
+    # index by the `where=` value.
+    observed = {}
+    for line in text.splitlines():
+        if not line.startswith("pktgate_lcore_pkt_truncated_total{"):
+            continue
+        try:
+            labels_end = line.index("} ")
+        except ValueError:
+            continue
+        labels = line[len("pktgate_lcore_pkt_truncated_total{"):labels_end]
+        value_str = line[labels_end + 2:].strip()
+        # labels looks like `lcore="agg",where="l2_vlan"` — pull
+        # the where value out. Insertion order is lcore,where in the
+        # encoder (see main.cpp trunc_line lambda).
+        where = None
+        for lbl in labels.split(","):
+            if lbl.startswith('where="') and lbl.endswith('"'):
+                where = lbl[len('where="'):-1]
+                break
+        if where is None:
+            continue
+        try:
+            observed[where] = int(value_str)
+        except ValueError:
+            continue
+
+    missing = [w for w in expected_where if w not in observed]
+    assert not missing, (
+        f"pkt_truncated family is missing `where` values: {missing}. "
+        f"Expected every §10.3 label from "
+        f"{expected_where}.\n"
+        f"Observed: {observed}\n"
+        f"BODY (first 4 kB):\n{text[:4096]}"
+    )
+
+    nonzero = {w: v for w, v in observed.items() if v != 0}
+    assert not nonzero, (
+        f"pkt_truncated values must be 0 in a clean workload; got "
+        f"{nonzero}. A non-zero value here means classify_l{{2,3,4}} "
+        f"hit a truncation guard without the test injecting a truncated "
+        f"frame — investigate before dismissing."
     )
 
     proc.stop()

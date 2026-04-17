@@ -109,7 +109,7 @@ using ::pktgate::telemetry::Snapshot;
 // the static source of truth and this list is the runtime mirror. If
 // §10.3 changes, BOTH must be updated in lockstep (D33 invariant).
 //
-// 36 entries as of 2026-04-17 (M10 C2).
+// 37 entries as of 2026-04-17 (M10 C5 added pktgate_publisher_generation).
 // =========================================================================
 const std::vector<std::string>& canonical_manifest() {
   static const std::vector<std::string> names = {
@@ -153,6 +153,8 @@ const std::vector<std::string>& canonical_manifest() {
       "pktgate_active_generation",
       "pktgate_active_rules",
       "pktgate_cmd_socket_rejected_total",
+      // M10 C5 / F8.13 — publisher liveness gauge.
+      "pktgate_publisher_generation",
 
       // System gauges (label: socket)
       "pktgate_mempool_in_use",
@@ -413,8 +415,9 @@ TEST(C7_27_CounterInvariant, EveryCanonicalNameHasProducerOrIsJustifiedZero) {
   // consistency.sh Pass 1 output. If this firecheck fails, the manifest
   // and §10.3 have drifted — not the C7.27 concern; re-sync the two
   // first.
-  ASSERT_EQ(canon.size(), 36u)
-      << "manifest size drift vs §10.3 Pass 1 count (36 as of 2026-04-17). "
+  ASSERT_EQ(canon.size(), 37u)
+      << "manifest size drift vs §10.3 Pass 1 count (37 as of 2026-04-17 "
+         "post-M10 C5). "
          "Either §10.3 grew a new metric or the manifest shrank. Fix "
          "both this TU and check-counter-consistency.sh in lockstep "
          "(D33). Expected justified-zero additions belong in `jz`, not "

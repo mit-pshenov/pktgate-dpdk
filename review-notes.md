@@ -2361,6 +2361,99 @@ explicitly in the handoff alongside compile-side smoke.
 
 **Origin:** M4 C8 `populate_ruleset_eal()` orphan, 2026-04-13.
 
+### D42 — Control-plane HTTP is hand-rolled, not vendored
+
+**Decision.** All Phase 1 control-plane HTTP endpoints (starting with
+M10 `/metrics`) are implemented hand-rolled inside `pktgate_telemetry`.
+The project does NOT vendor cpp-httplib or any other third-party HTTP
+library for this purpose. First instance ships as M10 C3.
+
+Concrete shape of the server (locked at decision time):
+
+- Bind `127.0.0.1:<sizing.prom_port>` (AF_INET, default `9090`).
+  No IPv6 listen on Phase 1 (Prometheus scrape is always v4 on local
+  loopback; IPv6 is deferred, not refused on principle).
+- Accept **HTTP/1.0 and HTTP/1.1** request lines for `/metrics`.
+  Response is always framed as HTTP/1.1 regardless of request version.
+  HTTP/2.0 and higher → 505 Version Not Supported.
+- Verb: `GET` only. Non-GET → 405. Path != `/metrics` → 404.
+  Malformed request line, body-bearing GET (`Content-Length` present),
+  `Transfer-Encoding` header present → 400.
+- Request line cap 8 KB, header-block total cap 8 KB. Oversized →
+  400 (or 414 / 431 if a stricter status is preferred — worker picks
+  one and documents).
+- Socket read deadline 5 s via `SO_RCVTIMEO` — bounds slowloris
+  attacks and stuck readers.
+- Response always carries `Connection: close`. No keep-alive, no
+  `Transfer-Encoding: chunked`, no compression, no TLS, no auth
+  (plaintext on the configured port; operator firewalls at their
+  edge, same as the kube-prometheus convention).
+- Single accept thread, sequential request handling (Prometheus
+  scrape rate ≈ 1 req per 15 s — pool / reactor is unjustified
+  complexity).
+
+**Why.**
+1. Scope is one verb + one path. `cpp-httplib`'s value-add — multi-
+   route tables, multipart upload, SSE, websockets, chunked transfer,
+   keep-alive, compression — is ~95 % dead code for the
+   `/metrics` use case.
+2. pktgate-dpdk has vendored zero third-party C++ libraries so far:
+   DPDK is system, `nlohmann_json` is narrow-scope and header-only,
+   `gtest` is test-only. Adding a 10 k-LoC vendored single-header
+   blob for one endpoint breaks that pattern and introduces a new
+   CVE-tracking obligation (upstream drift, transitive OpenSSL on
+   the TLS branch, etc.).
+3. The binary sits inline on the GGSN-Gi interface of a mobile
+   operator — a high-trust network position. Half of nginx's CVE
+   history consists of partial-request-handling bugs in the HTTP
+   framing layer. A hand-rolled ~200 LoC endpoint is small enough
+   for full security review by one reader; a vendored 10 k-LoC blob
+   is not, regardless of upstream quality.
+4. D1/D10 spirit: control-plane libs (`pktgate_rl_ctl`,
+   `pktgate_telemetry`) own their layering and their dependencies.
+   The HTTP surface is no different — this is where «own the code
+   you ship» applies at the control-plane tier.
+
+**Trade-off accepted.** Hand-rolled HTTP has a known failure mode:
+"looks easy, turns hard" — keep-alive, chunked transfer, partial-
+read resumption, CRLF normalisation, header-folding edge cases all
+trip naïve implementations. Mitigation is structural, not hopeful:
+the RED phase of M10 C3 enumerates every framing edge case
+(oversized request line, oversized headers, wrong verb, wrong path,
+slowloris slow read, Content-Length on GET, HTTP/2.0 attempt,
+bare LF / bare CR / `\r\r\n`) with explicit unit + functional tests
+BEFORE implementation lands. The C3 cycle spec carries an
+anti-creep rail list forbidding keep-alive / chunked / gzip /
+additional endpoints during the cycle; commit message must
+acknowledge the list.
+
+**Scope.** Applies to all Phase 1 control-plane HTTP surface. The
+only Phase 1 HTTP endpoint after scope trim is `/metrics` (M10),
+so D42 in practice binds one endpoint today — but the pattern is
+the rule, not the specific endpoint. Any future Phase 2 HTTP
+endpoint (`/reload`, `/healthz`, `/rules/dump`, etc., if added)
+extends the same hand-rolled surface rather than reopening the
+cpp-httplib discussion. Decision does NOT apply to:
+
+- `cmd_socket` UDS verbs — Unix-domain socket, length-prefixed
+  framing, not HTTP.
+- `rte_telemetry` endpoints — Phase 2, delegated to the DPDK
+  telemetry library, which is system-level and out of scope for
+  project-owned code.
+
+**Folds into §10.2 at batch revision.** `design.md` §10.2 today
+describes the Prometheus exporter at a high level without
+committing to an implementation strategy. Batch-revision writer
+should expand §10.2 with the shape specified above and
+cross-reference D42 as the rationale source.
+
+**Origin.** M10 C3 pre-dispatch consultant pass, 2026-04-17.
+Operational spec (tests, files, anti-creep list, exit gate) lives
+in `scratch/m10-c3-draft.md` pending supervisor dispatch when
+C0-C2 close. `scratch/` is not checked in; the draft is
+ephemeral scaffolding for C3, while D42 itself is the durable
+decision record.
+
 ### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
 
 Not standalone decisions; one-paragraph prose fixes surfaced by
@@ -2400,11 +2493,13 @@ the test-architect brigade.
   the flag is undefined; the validator rejects
   `cmd_socket.test_allow_uids` as `unknown field` in release.
 
-*Last updated: 2026-04-13 (D41 amendment — boot-path wiring clause
-added after M4 C8 populate_ruleset_eal orphan; previously 2026-04-12
-D41 added after M2 silent gap caught in
-M3 C6 — compile_l2/l4_rules unit-tested in isolation but never
-wired into top-level compile(); retrofit scheduled as M4 C0).*
+*Last updated: 2026-04-17 (D42 — control-plane HTTP hand-rolled,
+not vendored; decided pre-M10 C3 dispatch). Previously 2026-04-13
+(D41 amendment — boot-path wiring clause added after M4 C8
+populate_ruleset_eal orphan); 2026-04-12 (D41 added after M2 silent
+gap caught in M3 C6 — compile_l2/l4_rules unit-tested in isolation
+but never wired into top-level compile(); retrofit scheduled as
+M4 C0).*
 
 *Previously: 2026-04-11 (D31–D38 + full five-lawyer triage,
 single batch commit after the embarrassing D30 fix; D39/D40 +

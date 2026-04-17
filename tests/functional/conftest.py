@@ -47,6 +47,9 @@ _TAP_IFACES_TO_UNMANAGE = [
     "dtap_f2_rx", "dtap_f2_tx",
     # M4 C9 — F8.14 QinQ counter visibility test uses its own dtap pair.
     "dtap_f8_rx", "dtap_f8_tx",
+    # M10 C5 — F8.14 /metrics scrape arm uses a separate dtap pair so it
+    # runs alongside the M4 C9 stats_on_exit arm in the same session.
+    "dtap_f8m_rx", "dtap_f8m_tx",
     # M5 C10 — F4 L3 functional tests use their own dtap pair.
     "dtap_f4_rx", "dtap_f4_tx",
     # M6 C5 — F2 L4 functional tests use their own dtap pair.

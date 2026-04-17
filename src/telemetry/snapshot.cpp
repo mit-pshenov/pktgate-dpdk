@@ -190,6 +190,12 @@ Snapshot build_snapshot(std::uint64_t generation,
   out.reload       = reload;
   out.active_rules = active_rules;
 
+  // -- Publisher liveness gauge -----------------------------------
+  // Mirror the writer-assigned generation into the exposition field.
+  // F8.13 observes this across a slow-reader scrape to prove the
+  // 1 Hz writer is not blocked by a stalled scraper.
+  out.publisher_generation_gauge = generation;
+
   return out;
 }
 
@@ -267,6 +273,10 @@ std::set<std::string> snapshot_metric_names(const Snapshot& snap) {
 
   // C4 — active ruleset rule counts by layer.
   names.insert("pktgate_active_rules");
+
+  // C5 — publisher liveness gauge (F8.13 / D3). Always surfaced; the
+  // publisher always stamps `publisher_generation_gauge = generation`.
+  names.insert("pktgate_publisher_generation");
 
   return names;
 }

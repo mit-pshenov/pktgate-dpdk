@@ -141,6 +141,7 @@ capability bits, queue count):
 | **D39** | Headers-in-first-seg invariant (`nb_segs==1` + scatter-off + mempool-fit validator) | Принят, test-architect brigade (C6.14) |
 | **D40** | IPv4 fragment-skip/drop counters + IPv6 symmetric `pkt_frag_*` family | Принят, test-architect brigade |
 | **D41** | Multi-stage milestones ship with end-to-end pipeline smoke (не только per-stage unit tests) | Принят, M2 silent gap aftermath (M3 C6) |
+| **D42** | Control-plane HTTP hand-rolled, не cpp-httplib (scope small, repo pattern, security surface) | Принят, pre-M10 C3 dispatch, 2026-04-17 |
 
 ## Q-findings (test-architect → closed)
 

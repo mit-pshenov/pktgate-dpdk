@@ -2364,6 +2364,12 @@ pktgate_reload_latency_seconds                                    histogram
 pktgate_reload_pending_free_depth                                 gauge   # D36
 pktgate_active_generation                                         gauge
 pktgate_active_rules{layer}                                       gauge
+# M10 C5 / D3 — telemetry-publisher liveness gauge. Monotonic
+# counter of completed snapshot publishes; scraped alongside the
+# other reload/active gauges. Its forward progress under a slow
+# scraper is the observable that proves the N=4 ring decouples
+# the 1 Hz writer from the reader (F8.13).
+pktgate_publisher_generation                                      gauge
 # D38 — UDS peer-cred rejections.
 pktgate_cmd_socket_rejected_total{reason="peer_uid|peer_gid"}     counter
 
