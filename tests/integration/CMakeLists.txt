@@ -57,3 +57,67 @@ pktgate_add_test(
   LABELS  "integration"
   LINK    pktgate_core pktgate_rl_ctl
 )
+
+# M10 C2 — D33 living invariant, runtime enumeration arm (C7.27).
+#
+# RED → GREEN ladder across C2 → C4.
+#
+# The binary bundles three TEST cases:
+#   * EveryCanonicalNameHasProducerOrIsJustifiedZero — the D33 gate.
+#       Fails in C2 because most §10.3 names are not wired through
+#       Snapshot yet. WILL_FAIL TRUE on the primary ctest entry below
+#       so a RED gtest result counts as PASS. C4 wires the missing
+#       names + flips WILL_FAIL to FALSE.
+#   * ScalarFamilyWired         — C1 wiring safety net; must stay GREEN.
+#   * ManifestIsSorted          — manifest uniqueness; must stay GREEN.
+#
+# Two ctest entries share one binary and split by --gtest_filter:
+# `integration.c7_27_sanity` runs the must-be-green cases (standard
+# label), and `integration.c7_27_d33_gate` runs only the D33 gate with
+# WILL_FAIL TRUE so RED counts as PASS in C2.
+#
+# We build the executable directly (not via pktgate_add_test) because
+# the helper would also register a default wildcard ctest entry, and
+# we want explicit control over which gtest cases each ctest entry
+# invokes. The warnings + sanitizer helpers are applied manually.
+#
+# DPDK-free — links pktgate_telemetry + pktgate_core only. No EAL init,
+# no mempool. Snapshot-direct harness: builds fake producer state
+# in-process and calls build_snapshot() directly. C5 may re-run the
+# same assertion over a live /metrics scrape (F8.2) as end-to-end
+# validation.
+add_executable(integration_test_c7_27_counter_invariant
+  test_c7_27_counter_invariant.cpp
+)
+target_link_libraries(integration_test_c7_27_counter_invariant
+  PRIVATE GTest::gtest GTest::gtest_main pktgate_telemetry pktgate_core
+)
+pktgate_apply_warnings(integration_test_c7_27_counter_invariant)
+pktgate_apply_sanitizer(integration_test_c7_27_counter_invariant)
+
+# Entry 1 — sanity cases (GREEN, standard `integration` label).
+add_test(
+  NAME    integration.c7_27_sanity
+  COMMAND integration_test_c7_27_counter_invariant
+          --gtest_filter=*ScalarFamilyWired*:*ManifestIsSorted*
+)
+set_tests_properties(integration.c7_27_sanity
+  PROPERTIES LABELS "integration")
+
+# Entry 2 — the D33 runtime gate. WILL_FAIL TRUE — the test IS
+# expected to fail in C2 (most §10.3 names not wired). C4 flips this
+# to FALSE after extending Snapshot + snapshot_metric_names().
+#
+# Document the ladder here so a future reader knows the RED is
+# deliberate. If this test ever goes green in C2, CTest reports a
+# `Failed (Ignored)` regression on the gate (WILL_FAIL + actual pass
+# = CTest FAIL) — the desired signal that C4 wiring sneaked in early.
+add_test(
+  NAME    integration.c7_27_d33_gate
+  COMMAND integration_test_c7_27_counter_invariant
+          --gtest_filter=*EveryCanonicalName*
+)
+set_tests_properties(integration.c7_27_d33_gate
+  PROPERTIES
+    LABELS "integration"
+    WILL_FAIL TRUE)

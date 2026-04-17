@@ -36,7 +36,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "src/ruleset/ruleset.h"
@@ -180,5 +182,29 @@ Snapshot build_snapshot(std::uint64_t generation,
                         std::span<const LcoreCounterView> lcore_views,
                         std::span<const RuleIdent> per_rule_ids,
                         std::span<const PortStats> port_stats);
+
+// -------------------------------------------------------------------------
+// snapshot_metric_names — enumerate §10.3 metric names the given Snapshot
+// actually surfaces (C2 C7.27 — D33 living invariant).
+//
+// Purpose: the C7.27 runtime enumeration test asks "which §10.3 names are
+// wired through the snapshot right now?" and compares that against the
+// §10.3 canonical manifest. Names in §10.3 but not in this helper's
+// output are either genuinely missing (→ C4 wire-up work) or listed on
+// the C7.27 justified-zero list (exempt from the check).
+//
+// The returned set contains the *base* metric name (no labels). If the
+// snapshot has ≥1 per_rule entry, `pktgate_rule_packets_total` etc. are
+// emitted; if `per_port` is non-empty, the port family is emitted; scalar
+// counters emit their base name unconditionally as long as the snapshot
+// was built with the corresponding LcoreCounterView field populated.
+//
+// C4 grows this set as reload/qinq/frag/truncation/etc. fields get added
+// to `Snapshot`. The D33 invariant is lockstep: every §10.3 name → every
+// Snapshot field → every producer site. snapshot_metric_names() is one
+// link in that chain.
+//
+// Pure function — DPDK-free, no IO, no threads.
+std::set<std::string> snapshot_metric_names(const Snapshot& snap);
 
 }  // namespace pktgate::telemetry

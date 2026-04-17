@@ -207,6 +207,13 @@ echo "pass2: ok — 3 compiler counter families verified, ${deferred_count} defe
 #   pktgate_dpdk_fuzz_*    — fuzz harness prefix (§14).
 #   pktgate_core           — lib name (from libpktgate_core.a, §14).
 #   pktgate_dp             — lib name (from libpktgate_dp.a, §14).
+#   pktgate_rl             — lib name (M9 math archive, libpktgate_rl.a).
+#   pktgate_rl_ctl         — lib name (M9 control-plane arena,
+#                             libpktgate_rl_ctl.a; cited in D42).
+#   pktgate_runtime        — lib name (M9 C4 arena_gc TU,
+#                             libpktgate_runtime.a).
+#   pktgate_telemetry      — lib name (M10 control-plane telemetry,
+#                             libpktgate_telemetry.a; cited in D42).
 #   pktgate_uid            — the daemon's own-uid variable (§10.7 / D38).
 #   pktgate_gid            — the daemon's own-gid variable (§10.7 / D38).
 #   pktgate_test           — auxiliary Q9 test user account name.
@@ -215,6 +222,7 @@ is_allowlisted() {
   case "$1" in
     pktgate_dpdk|pktgate_dpdk_test_*|pktgate_dpdk_fuzz_*|\
     pktgate_core|pktgate_dp|\
+    pktgate_rl|pktgate_rl_ctl|pktgate_runtime|pktgate_telemetry|\
     pktgate_uid|pktgate_gid|\
     pktgate_test|pktgate_test2)
       return 0

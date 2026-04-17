@@ -10,7 +10,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <span>
+#include <string>
 
 namespace pktgate::telemetry {
 
@@ -85,6 +87,46 @@ Snapshot build_snapshot(std::uint64_t generation,
   out.per_port.assign(port_stats.begin(), port_stats.end());
 
   return out;
+}
+
+// -------------------------------------------------------------------------
+// snapshot_metric_names — see header. Emits §10.3 base names for every
+// Snapshot field the current (M10 C1) struct surfaces. C4 extends this
+// as reload/qinq/frag/truncation/etc. fields get wired.
+std::set<std::string> snapshot_metric_names(const Snapshot& snap) {
+  std::set<std::string> names;
+
+  // Per-rule family — emitted whenever the snapshot carries >= 1 rule
+  // row. Zero rules means no L2/L3/L4 traffic observed; the encoder
+  // convention is "no counter line emitted" (mirrors stats_on_exit
+  // at main.cpp:588). For D33 purposes the family is still considered
+  // "wired" as long as the aggregation path exists — the test feeds
+  // at least one rule to exercise all three names in the same call.
+  if (!snap.per_rule.empty()) {
+    names.insert("pktgate_rule_packets_total");
+    names.insert("pktgate_rule_bytes_total");
+    names.insert("pktgate_rule_drops_total");
+  }
+
+  // Per-port family — emitted whenever the publisher surfaced any
+  // PortStats. Single port is enough to prove the 6-metric family is
+  // routed.
+  if (!snap.per_port.empty()) {
+    names.insert("pktgate_port_rx_packets_total");
+    names.insert("pktgate_port_tx_packets_total");
+    names.insert("pktgate_port_rx_bytes_total");
+    names.insert("pktgate_port_tx_bytes_total");
+    names.insert("pktgate_port_rx_dropped_total");
+    names.insert("pktgate_port_tx_dropped_total");
+  }
+
+  // Scalar lcore counters wired in M10 C1. Unconditionally surfaced
+  // (a zero snapshot value is still a valid observation — the field
+  // exists on Snapshot and round-trips through the encoder).
+  names.insert("pktgate_lcore_pkt_multiseg_drop_total");
+  names.insert("pktgate_lcore_qinq_outer_only_total");
+
+  return names;
 }
 
 }  // namespace pktgate::telemetry
