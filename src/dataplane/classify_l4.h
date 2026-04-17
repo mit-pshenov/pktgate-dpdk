@@ -50,6 +50,7 @@
 #include <rte_udp.h>
 
 #include "src/compiler/rule_compiler.h"
+#include "src/dataplane/lcore_counter.h"  // M11 C1.5 — relaxed_bump helpers
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 #include "src/ruleset/types.h"
@@ -186,7 +187,8 @@ inline ClassifyL4Verdict classify_l4(struct rte_mbuf* m,
 
   if (need && m->pkt_len < static_cast<std::uint32_t>(l4off) + need) {
     if (trunc_ctrs) {
-      ++(*trunc_ctrs)[static_cast<std::size_t>(L4TruncBucket::kL4)];
+      relaxed_bump_bucket(trunc_ctrs->data(),
+                          static_cast<std::size_t>(L4TruncBucket::kL4));
     }
     return ClassifyL4Verdict::kTerminalDrop;
   }

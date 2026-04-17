@@ -753,6 +753,100 @@ M10+ pipeline additions.*
 
 ---
 
-*Last updated: 2026-04-17 (§M9 boot-path RlSlotAllocator gap
-RESOLVED by M9 C5; fifth D41 instance). Add new items with date +
-origin cycle at append time.*
+## §M11 C1.5 — TSAN race fix + M10 C5 retroactive claim correction
+
+### The race that ate M10 C5's exit-gate claim
+
+At M10 C4 (commit `b87149b`, "wire §10.3 counters → snapshot →
+encoder + F8.2 living invariant"), the telemetry snapshot pipeline
+landed with:
+
+- **Writer side** (worker lcore, in `classify_l{2,3,4}.h`,
+  `classify_entry.h`, `action_dispatch.h`, `worker.cpp`): plain
+  `++(*ctr)` / `++(*ctrs)[idx]` read-modify-write on
+  `std::uint64_t` storage.
+- **Reader side** (SnapshotPublisher thread, in
+  `src/telemetry/snapshot.cpp::relaxed_load_u64` /
+  `relaxed_load_bucket`): `__atomic_load_n(p, __ATOMIC_RELAXED)`.
+
+The file header comment in `snapshot.cpp` at that point claimed
+"reader-side uses `__atomic_load_n` to make TSan see the access as
+synchronising". **That is false.** The C++ memory model requires
+BOTH sides of a concurrent access to be atomic operations on the
+same storage for the pair to be well-defined (and for TSan to not
+report a race). Plain write + atomic load = data race, reported
+every time.
+
+### Exit-gate claim correction
+
+M10 C5 commit `00b7d23` body asserted dev-tsan **38/38 GREEN** on
+the functional label. Re-running dev-tsan on the
+`m10-telemetry` tag at M11 C1.5 kickoff reproduced the race and
+seven failing dtap-based functional tests:
+
+- `functional.test_f2_l2`
+- `functional.test_f2_l4`
+- `functional.test_f4_l3`
+- `functional.test_f3_action`
+- `functional.test_f3_ratelimit`
+- `functional.test_f8_qinq_counter`
+- `functional.test_f8_metrics::test_f8_14_qinq_outer_counter_via_metrics`
+
+All seven share the same root cause: the plain-write ↔ atomic-load
+pair described above, on a counter stored in `WorkerCtx` (or a
+RuleCounter row inside `ruleset::counter_row(lcore_id)`) on the main
+thread's stack, bumped by the worker and sampled by the
+SnapshotPublisher on every 1 Hz tick.
+
+The **m10-telemetry annotated tag is NOT rewritten** — tag history
+is immutable. The errata records the correction forward.
+
+### Protocol addendum — exit-gate TSAN claim evidence
+
+Henceforth every exit-gate commit body that mentions dev-tsan test
+counts MUST paste the actual ctest tail (last ~20 lines of
+`ctest --preset dev-tsan -L "..."  -j 1 --output-on-failure`) into
+the commit body. Naked "N/N GREEN" claims without evidence are
+rejected at exit gate. Applies to M0-M13 retroactively for future
+milestones; supervisor handoff files should surface this as a
+pre-commit checklist item.
+
+### Fix summary (landed in M11 C1.5)
+
+- **New header** `src/dataplane/lcore_counter.h` with three inline
+  helpers: `relaxed_bump(p)`, `relaxed_bump_bucket(arr, idx)`,
+  `relaxed_add(p, delta)`. Each lowers to `mov; op; mov` on x86-64
+  (no `lock` prefix) — codegen story unchanged vs. the previous
+  plain `++(*p)`; the only difference is that the load and store
+  are tagged atomic so the C++ memory model treats the access as
+  a matched pair with `relaxed_load_u64` on the reader side.
+- **Writer-side replacements** at ~20 bump sites across
+  `classify_l2.h`, `classify_l3.h`, `classify_l4.h`,
+  `classify_entry.h`, `action_dispatch.h`, `worker.cpp`.
+- **Reader side**: `src/telemetry/snapshot.cpp` comment rewritten
+  to reflect the corrected model (both sides atomic; single-writer
+  invariant; no `lock` prefix on x86-64).
+- **D1 amendment**: `review-notes.md` §D1 gains a "telemetry
+  counter clause" with the rationale + codegen check + forbidden
+  alternatives (`fetch_add`, `no_sanitize`, `std::atomic::fetch_add`).
+- **`tests/tsan.supp` unchanged** — still 16 lines (M3 baseline);
+  no new suppression. This is a real-bug fix, not a silencer.
+
+### Forward commitment
+
+Any future change that adds a counter read by the publisher thread
+MUST use `dataplane::relaxed_bump` (or `_bucket` / `_add`) on the
+writer side, and MUST NOT introduce `fetch_add` / `std::atomic` on
+the counter field. A reviewer seeing `++` on a cross-thread-read
+counter treats it as a bug, not a stylistic preference.
+
+*Origin: M11 C1.5 (2026-04-17). Seven functional tests turned RED
+at M11 C1 HEAD; bisect traced to M10 C4, M10 C5's exit-gate claim
+retroactively falsified. Fix approved in this cycle; no push, no
+amend, no tag rewrite.*
+
+---
+
+*Last updated: 2026-04-17 (§M11 C1.5 TSAN race fix + M10 C5 exit-gate
+claim retroactively corrected). Add new items with date + origin
+cycle at append time.*

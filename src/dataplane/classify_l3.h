@@ -89,6 +89,7 @@
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
+#include "src/dataplane/lcore_counter.h"  // M11 C1.5 — relaxed_bump helpers
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 #include "src/ruleset/types.h"
@@ -373,7 +374,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
                                sizeof(struct rte_ipv4_hdr);
     if (rte_pktmbuf_pkt_len(m) < need) {
       if (trunc_ctrs) {
-        ++(*trunc_ctrs)[static_cast<std::size_t>(L3TruncBucket::kL3V4)];
+        relaxed_bump_bucket(trunc_ctrs->data(),
+                            static_cast<std::size_t>(L3TruncBucket::kL3V4));
       }
       return ClassifyL3Verdict::kTerminalDrop;
     }
@@ -397,7 +399,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     const std::uint8_t ihl = ip4->version_ihl & 0x0F;
     if (ihl < 5) {
       if (trunc_ctrs) {
-        ++(*trunc_ctrs)[static_cast<std::size_t>(L3TruncBucket::kL3V4)];
+        relaxed_bump_bucket(trunc_ctrs->data(),
+                            static_cast<std::size_t>(L3TruncBucket::kL3V4));
       }
       return ClassifyL3Verdict::kTerminalDrop;
     }
@@ -436,7 +439,9 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
           // D40: every dropped fragment (first or non-first) bumps the
           // v4 drop counter at this single site.
           if (frag_ctrs) {
-            ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragDroppedV4)];
+            relaxed_bump_bucket(
+                frag_ctrs->data(),
+                static_cast<std::size_t>(L3FragBucket::kL3FragDroppedV4));
           }
           return ClassifyL3Verdict::kTerminalDrop;
         }
@@ -459,7 +464,9 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
           if (is_nonfirst) {
             dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
             if (frag_ctrs) {
-              ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragSkippedV4)];
+              relaxed_bump_bucket(
+                  frag_ctrs->data(),
+                  static_cast<std::size_t>(L3FragBucket::kL3FragSkippedV4));
             }
           }
           break;  // fall through to L3 matching
@@ -554,7 +561,8 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
                                sizeof(struct rte_ipv6_hdr);
     if (rte_pktmbuf_pkt_len(m) < need) {
       if (trunc_ctrs) {
-        ++(*trunc_ctrs)[static_cast<std::size_t>(L3TruncBucket::kL3V6)];
+        relaxed_bump_bucket(trunc_ctrs->data(),
+                            static_cast<std::size_t>(L3TruncBucket::kL3V6));
       }
       return ClassifyL3Verdict::kTerminalDrop;
     }
@@ -576,7 +584,7 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
     // M5 C10). Fragment (44) excluded — D27 (C6).
     if (is_ext_proto(nxt)) {
       dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
-      if (exthdr_ctr) ++(*exthdr_ctr);
+      if (exthdr_ctr) relaxed_bump(exthdr_ctr);
     }
 
     // ---- D27 Fragment extension header (U6.15, U6.28-U6.30) ----------------
@@ -593,7 +601,9 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
           sizeof(struct rte_ipv6_hdr) + 8u;
       if (rte_pktmbuf_pkt_len(m) < frag_need) {
         if (trunc_ctrs) {
-          ++(*trunc_ctrs)[static_cast<std::size_t>(L3TruncBucket::kL3V6FragExt)];
+          relaxed_bump_bucket(
+              trunc_ctrs->data(),
+              static_cast<std::size_t>(L3TruncBucket::kL3V6FragExt));
         }
         return ClassifyL3Verdict::kTerminalDrop;
       }
@@ -614,7 +624,9 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
       switch (policy) {
         case kFragDrop: {
           if (frag_ctrs) {
-            ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragDroppedV6)];
+            relaxed_bump_bucket(
+                frag_ctrs->data(),
+                static_cast<std::size_t>(L3FragBucket::kL3FragDroppedV6));
           }
           return ClassifyL3Verdict::kTerminalDrop;
         }
@@ -636,16 +648,18 @@ inline ClassifyL3Verdict classify_l3(struct rte_mbuf* m,
             dyn->parsed_l3_proto = inner_nxt;
             if (is_ext_proto(inner_nxt) || inner_nxt == 44) {
               dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
-              if (exthdr_ctr) ++(*exthdr_ctr);
+              if (exthdr_ctr) relaxed_bump(exthdr_ctr);
             }
           } else {
             // D27: non-first fragment — no L4 header, SKIP_L4.
             dyn->flags |= static_cast<std::uint8_t>(eal::kSkipL4);
             // D27 named counter + D40 alias invariant (U6.26c sentinel):
             // both bump at the same site.
-            if (frag_nonfirst_ctr) ++(*frag_nonfirst_ctr);
+            if (frag_nonfirst_ctr) relaxed_bump(frag_nonfirst_ctr);
             if (frag_ctrs) {
-              ++(*frag_ctrs)[static_cast<std::size_t>(L3FragBucket::kL3FragSkippedV6)];
+              relaxed_bump_bucket(
+                  frag_ctrs->data(),
+                  static_cast<std::size_t>(L3FragBucket::kL3FragSkippedV6));
             }
           }
           break;  // fall through to FIB lookup

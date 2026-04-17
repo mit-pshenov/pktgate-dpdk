@@ -51,6 +51,7 @@
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
+#include "src/dataplane/lcore_counter.h"  // M11 C1.5 — relaxed_bump helpers
 #include "src/dataplane/worker.h"
 #include "src/rl_arena/arena.h"
 #include "src/rl_arena/rl_arena.h"
@@ -76,7 +77,7 @@ inline void stage_redirect(WorkerCtx* ctx, std::uint16_t port,
   // is the array size; port_id == 0xFFFF (RuleAction "no port" sentinel)
   // and any forged oversized index lands here.
   if (port >= RTE_MAX_ETHPORTS) {
-    ctx->redirect_dropped_total++;
+    relaxed_bump(&ctx->redirect_dropped_total);
     rte_pktmbuf_free(m);
     return;
   }
@@ -84,7 +85,7 @@ inline void stage_redirect(WorkerCtx* ctx, std::uint16_t port,
   if (s.count >= kRedirectBurstMax) {
     // Buffer full — drop the new arrival, keep the staged packets
     // (they are closer to being drained).  No OOB write.
-    ctx->redirect_dropped_total++;
+    relaxed_bump(&ctx->redirect_dropped_total);
     rte_pktmbuf_free(m);
     return;
   }
@@ -104,7 +105,8 @@ inline void redirect_drain(WorkerCtx* ctx) {
       for (std::uint16_t i = sent; i < s.count; ++i) {
         rte_pktmbuf_free(s.pkts[i]);
       }
-      ctx->redirect_dropped_total += (s.count - sent);
+      relaxed_add(&ctx->redirect_dropped_total,
+                  static_cast<std::uint64_t>(s.count - sent));
     }
     s.count = 0;
   }
@@ -230,7 +232,7 @@ inline void apply_dscp_pcp(WorkerCtx* ctx, rte_mbuf* m,
     } else {
       // D19: untagged + PCP = no-op + counter bump, do NOT insert a tag.
       if (ctx != nullptr) {
-        ctx->tag_pcp_noop_untagged_total++;
+        relaxed_bump(&ctx->tag_pcp_noop_untagged_total);
       }
     }
   }
@@ -336,7 +338,7 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
     default:
       // D25 runtime backstop: unknown disposition. Bump counter,
       // free mbuf, return. U6.44 covers this branch.
-      ctx->dispatch_unreachable_total++;
+      relaxed_bump(&ctx->dispatch_unreachable_total);
       rte_pktmbuf_free(m);
       return;
   }
@@ -347,7 +349,7 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
     // dispatch_unreachable — this is a state-machine bug. (Not
     // covered by a dedicated test; the worker never passes nullptr
     // for kMatch.)
-    ctx->dispatch_unreachable_total++;
+    relaxed_bump(&ctx->dispatch_unreachable_total);
     rte_pktmbuf_free(m);
     return;
   }
@@ -399,7 +401,7 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       if (ctx->rl_arena == nullptr ||
           action->rl_index >= rs.rl_actions_capacity ||
           rs.rl_actions == nullptr) {
-        ctx->dispatch_unreachable_total++;
+        relaxed_bump(&ctx->dispatch_unreachable_total);
         rte_pktmbuf_free(m);
         return;
       }
@@ -412,7 +414,7 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       // test thread) would out-of-bounds index the per-lcore array.
       // Drop defensively.
       if (lcore_id >= rl_arena::kMaxLcores) {
-        ctx->dispatch_unreachable_total++;
+        relaxed_bump(&ctx->dispatch_unreachable_total);
         rte_pktmbuf_free(m);
         return;
       }
@@ -466,14 +468,14 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       // D7 — compiler rejects MIRROR at publish time. Reaching here
       // means the compiler-reject path was bypassed; treat as
       // unreachable and free.
-      ctx->dispatch_unreachable_total++;
+      relaxed_bump(&ctx->dispatch_unreachable_total);
       rte_pktmbuf_free(m);
       return;
 
     default:
       // D25 runtime backstop: unknown verb. U6.45 covers this
       // branch by forging action->verb = 99.
-      ctx->dispatch_unreachable_total++;
+      relaxed_bump(&ctx->dispatch_unreachable_total);
       rte_pktmbuf_free(m);
       return;
   }

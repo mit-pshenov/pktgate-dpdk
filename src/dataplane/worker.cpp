@@ -28,6 +28,7 @@
 #include "src/dataplane/classify_l2.h"
 #include "src/dataplane/classify_l3.h"
 #include "src/dataplane/classify_l4.h"
+#include "src/dataplane/lcore_counter.h"  // M11 C1.5 — relaxed_bump helpers
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 
@@ -68,12 +69,17 @@ inline void bump_l4_counter(const ruleset::Ruleset& rs,
   if (!row || slot >= rs.counter_slots_per_lcore) return;
 
   ruleset::RuleCounter& ctr = row[slot];
-  ++ctr.matched_packets;
+  // M11 C1.5: RELAXED load+store pair — paired with publisher-side
+  // __atomic_load_n(&row.matched_packets/.drops/..., RELAXED). Worker
+  // is the single writer for this lcore's slot; publisher reads under
+  // RCU read-side (acquire-load of g_active) on the SnapshotPublisher
+  // thread.
+  relaxed_bump(&ctr.matched_packets);
   // classify_l4 returns kMatch for all matched rules regardless of
   // action verb. Check the action verb directly to bump drops.
   if (static_cast<compiler::ActionVerb>(act.verb) ==
       compiler::ActionVerb::kDrop) {
-    ++ctr.drops;
+    relaxed_bump(&ctr.drops);
   }
 }
 
@@ -100,9 +106,10 @@ inline void bump_l2_counter(const ruleset::Ruleset& rs,
   if (!row || slot >= rs.counter_slots_per_lcore) return;
 
   ruleset::RuleCounter& ctr = row[slot];
-  ++ctr.matched_packets;
+  // M11 C1.5: RELAXED load+store pair (see bump_l4_counter rationale).
+  relaxed_bump(&ctr.matched_packets);
   if (verdict == ClassifyL2Verdict::kDrop) {
-    ++ctr.drops;
+    relaxed_bump(&ctr.drops);
   }
 }
 

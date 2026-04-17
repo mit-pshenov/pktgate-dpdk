@@ -33,6 +33,8 @@
 #include <rte_debug.h>
 #include <rte_mbuf.h>
 
+#include "src/dataplane/lcore_counter.h"
+
 namespace pktgate::dataplane {
 
 // -------------------------------------------------------------------------
@@ -64,7 +66,9 @@ inline bool classify_entry_ok(const struct rte_mbuf* m,
                               std::uint64_t* multiseg_drop_ctr = nullptr) noexcept {
   if (unlikely(m->nb_segs != 1)) {
     if (multiseg_drop_ctr != nullptr) {
-      ++(*multiseg_drop_ctr);
+      // M11 C1.5: RELAXED load+store pair (not plain ++); paired with
+      // publisher-side __atomic_load_n in src/telemetry/snapshot.cpp.
+      relaxed_bump(multiseg_drop_ctr);
     }
     return false;
   }

@@ -52,6 +52,7 @@
 
 #include "src/action/action.h"
 #include "src/compiler/rule_compiler.h"   // l2_mask:: constants
+#include "src/dataplane/lcore_counter.h"  // M11 C1.5 — relaxed_bump helpers
 #include "src/eal/dynfield.h"
 #include "src/ruleset/ruleset.h"
 #include "src/ruleset/types.h"
@@ -256,7 +257,8 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
   // other logic — including empty-ruleset bail and header parse.
   if (rte_pktmbuf_pkt_len(m) < 14u) {
     if (trunc_ctrs) {
-      ++(*trunc_ctrs)[static_cast<std::size_t>(L2TruncBucket::kL2)];
+      relaxed_bump_bucket(trunc_ctrs->data(),
+                          static_cast<std::size_t>(L2TruncBucket::kL2));
     }
     return ClassifyL2Verdict::kDrop;
   }
@@ -280,7 +282,8 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
   // (VLAN TCI + inner ethertype) is only present when pkt_len >= 18.
   if (detail::is_vlan_tpid(outer_etype) && rte_pktmbuf_pkt_len(m) < 18u) {
     if (trunc_ctrs) {
-      ++(*trunc_ctrs)[static_cast<std::size_t>(L2TruncBucket::kL2Vlan)];
+      relaxed_bump_bucket(trunc_ctrs->data(),
+                          static_cast<std::size_t>(L2TruncBucket::kL2Vlan));
     }
     return ClassifyL2Verdict::kDrop;
   }
@@ -311,7 +314,7 @@ inline ClassifyL2Verdict classify_l2(struct rte_mbuf* m,
     // NOTE: counter bump happens BEFORE the empty-ruleset short-circuit
     // so observability is independent of rule presence (C7 fix).
     if (detail::is_vlan_tpid(pkt_etype) && qinq_ctr != nullptr) {
-      ++(*qinq_ctr);
+      relaxed_bump(qinq_ctr);
     }
   }
 

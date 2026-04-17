@@ -178,8 +178,49 @@ the path surfaces the edge). Currently permitted atomics:
   coordination. Two reads + two writes per lifetime.
 - `CmdSocketServer::running` — pre-existing, same lifecycle scope.
 
+**D1 telemetry counter clause (M11 C1.5, 2026-04-17)** — per-lcore
+telemetry counters read concurrently by the SnapshotPublisher thread
+may (and MUST) be bumped via a RELAXED load+store pair
+(`__atomic_store_n(p, __atomic_load_n(p, RELAXED) + 1, RELAXED)`, see
+`src/dataplane/lcore_counter.h::relaxed_bump`). Rationale:
+
+- **Single-writer invariant**: each counter is written by exactly one
+  worker lcore. No worker-to-worker contention on the cache line, so
+  the correctness-critical reason for `lock xadd` (cross-CPU RMW
+  ordering) does not apply.
+- **Reader-side pair**: the publisher uses
+  `__atomic_load_n(p, RELAXED)` in `src/telemetry/snapshot.cpp`. The
+  C++ memory model requires BOTH sides atomic for the access to be
+  well-defined (and for TSan to not report a race). Before M11 C1.5
+  the writer used a plain `++(*p)` RMW — that paired with the atomic
+  load is a data race, reported every time on dev-tsan (classified
+  7 functional tests red at HEAD 798903b; same race reproducible at
+  m10-telemetry / 00b7d23, M10 C5's "38/38 GREEN" exit-gate claim
+  was retroactively false).
+- **Codegen on x86-64**: plain `mov; inc; mov` (or `mov; add; mov`
+  for `+= delta`). NO `lock` prefix, NO bus fence, NO cache-line
+  ownership transfer. Indistinguishable from `++(*p)` at the ISA
+  level on the writer CPU. This is NOT an "atomic RMW on the
+  packet-rate hot path" in the D1-forbidden sense — that prohibition
+  targets `lock xadd` / CAS / `std::atomic::fetch_add` which emit a
+  LOCK-prefixed read-modify-write for cross-CPU coordination. A
+  RELAXED load+store pair on single-writer storage emits neither.
+- **Scope**: the helper lives in `src/dataplane/lcore_counter.h` and
+  is used at every worker-side bump site whose value is later read
+  by `src/telemetry/snapshot.cpp` (~20 sites across `classify_l2.h`,
+  `classify_l3.h`, `classify_l4.h`, `classify_entry.h`,
+  `action_dispatch.h`, `worker.cpp`). Counters never read
+  cross-thread (pure per-lcore internal state) do NOT need the
+  helper and may stay plain `++`.
+- **Forbidden alternatives**: `__atomic_fetch_add(p, 1, RELAXED)`
+  (emits `lock xadd` on x86-64 — D1 violation);
+  `__attribute__((no_sanitize("thread")))` (hides the race, doesn't
+  fix memory-model correctness); `std::atomic<uint64_t>::fetch_add`
+  (same `lock xadd`, same D1 violation).
+
 Any NEW atomic MUST carry the scope argument in its commit body:
-hot path acquire-load only (reader) vs lifecycle handshake.
+hot path acquire-load only (reader) vs lifecycle handshake vs
+single-writer telemetry counter (load+store RELAXED pair).
 Atomic RMW / CAS / fetch_add on the packet-rate path remains
 forbidden.
 

@@ -1,14 +1,40 @@
 // src/telemetry/snapshot.cpp
 //
-// M10 C1 — build_snapshot impl.
-// M10 C4 — extended to aggregate every §10.3 name via LcoreCounterView
-//          pointer fields (D31 truncation, D40 fragments, D20/D27 IPv6
-//          skip, D25 backstop, D19 TAG no-op, D16 redirect drop) plus
-//          ReloadState + ActiveRuleCounts + per_port_link_up.
+// M10 C1   — build_snapshot impl.
+// M10 C4   — extended to aggregate every §10.3 name via LcoreCounterView
+//            pointer fields (D31 truncation, D40 fragments, D20/D27 IPv6
+//            skip, D25 backstop, D19 TAG no-op, D16 redirect drop) plus
+//            ReloadState + ActiveRuleCounts + per_port_link_up.
+// M11 C1.5 — writer side corrected: per-lcore counters are bumped by
+//            the worker via dataplane::relaxed_bump (RELAXED
+//            load+store pair) so the access is atomic on both ends.
 //
-// Pure aggregation — no DPDK, no threads, no IO. The reader-side
-// relaxed-atomic load on WorkerCtx counter sources satisfies TSan
-// without forcing worker-side atomics (D1 amendment 2026-04-17).
+// Pure aggregation — no DPDK, no threads, no IO.
+//
+// Concurrency model (D1 amendment §telemetry counter clause, 2026-04-17):
+//
+//   * WRITER: the owning worker lcore, at packet-rate. Uses
+//     dataplane::relaxed_bump(p) = __atomic_store_n(p,
+//     __atomic_load_n(p, RELAXED) + 1, RELAXED). On x86-64 this lowers
+//     to plain `mov; inc; mov` — no `lock` prefix, no bus fence, no
+//     cache-line ownership transfer. Functionally indistinguishable
+//     from a plain `++(*p)` on the single-writer CPU; the load+store
+//     pair is the TSan synchronisation annotation, not an inter-CPU
+//     fence. D1 hot-path philosophy preserved.
+//
+//   * READER: this file. `__atomic_load_n(p, RELAXED)` — single `mov`
+//     on x86-64.
+//
+//   * Pairing: the C++ memory model requires BOTH sides of a
+//     concurrent access to be atomic operations on the same storage
+//     for TSan to treat the pair as synchronising. Before M11 C1.5
+//     the writer used a plain `++(*p)` RMW — that is a data race
+//     against the atomic load here, reported every time (seen at M10
+//     C5 in classify_l3.h bumps against relaxed_load_u64). The fix
+//     makes the writer side atomic as well; codegen is unchanged on
+//     x86-64 because single-writer means no LOCK is required for
+//     correctness, only for cross-CPU RMW ordering that we explicitly
+//     do not need here.
 
 #include "src/telemetry/snapshot.h"
 
@@ -23,9 +49,9 @@ namespace pktgate::telemetry {
 namespace {
 
 // Reader-side relaxed load — single `mov` on x86-64, no fence.
-// Paired with plain worker-side writes (D1 sacred: worker side stays
-// non-atomic; reader side uses __atomic_load_n to make TSan see the
-// access as synchronising).
+// Pairs with dataplane::relaxed_bump / relaxed_add on the worker side
+// (M11 C1.5). Both sides atomic is required by the C++ memory model
+// for TSan to treat the pair as synchronising; see the file header.
 inline std::uint64_t relaxed_load_u64(const std::uint64_t* p) {
   if (p == nullptr) return 0;
   return __atomic_load_n(p, __ATOMIC_RELAXED);
@@ -34,6 +60,7 @@ inline std::uint64_t relaxed_load_u64(const std::uint64_t* p) {
 // Array-bucket relaxed load: sums (p[0..n)) via per-slot relaxed loads.
 // Returns zero if p is null. Used for the L2/L3/L4 truncation and the
 // L3 fragment bucket arrays — each slot is its own scalar counter.
+// Writer-side pair is dataplane::relaxed_bump_bucket.
 inline std::uint64_t relaxed_load_bucket(const std::uint64_t* p,
                                          std::uint32_t idx) {
   if (p == nullptr) return 0;
