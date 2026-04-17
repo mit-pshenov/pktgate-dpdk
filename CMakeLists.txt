@@ -158,6 +158,26 @@ target_include_directories(pktgate_rl PUBLIC ${CMAKE_SOURCE_DIR})
 pktgate_apply_warnings(pktgate_rl)
 pktgate_apply_sanitizer(pktgate_rl)
 
+# ---- libpktgate_rl_ctl (M9 C1) — control-plane arena (slot lifecycle) ----
+#
+# The `RateLimitArena` class lives in a SEPARATE TU and SEPARATE static
+# library from the bucket-math TU above. Rationale: U5.8 / U5.9 grep
+# `libpktgate_rl.a` for banned symbols (`std::atomic`, `unordered_map`,
+# `id_to_slot`, hash iterator symbols). The arena uses unordered_map
+# for `id_to_slot` — a control-plane-only lookup — so it must not land
+# in pktgate_rl.a. Control-plane callers (compiler, builder, reload,
+# telemetry) link BOTH libraries; the hot path links only pktgate_rl.
+#
+# Still DPDK-free: the arena owns RlRow storage but does no rte_* calls.
+# Worker integration (C2) adds a thin DPDK-aware TU that bridges.
+add_library(pktgate_rl_ctl STATIC
+  src/rl_arena/arena.cpp
+)
+target_include_directories(pktgate_rl_ctl PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(pktgate_rl_ctl PUBLIC pktgate_rl)
+pktgate_apply_warnings(pktgate_rl_ctl)
+pktgate_apply_sanitizer(pktgate_rl_ctl)
+
 # ---- libpktgate_dp (M3) — DPDK-dependent dataplane library ---------------
 #
 # Modules that require DPDK headers at compile time and rte_eal_init() at

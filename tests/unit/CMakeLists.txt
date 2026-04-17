@@ -79,3 +79,15 @@ pktgate_add_test(
 target_compile_definitions(unit_test_rl_arena PRIVATE
   "PKTGATE_RL_ARCHIVE_PATH=\"$<TARGET_FILE:pktgate_rl>\""
 )
+
+# M9 C1: RateLimitArena slot lifecycle (D24). U4.9 .. U4.12 + U4.9b
+# exhaustion sentinel. Links against pktgate_rl_ctl (which pulls in
+# pktgate_rl transitively). Separate TU/archive from pktgate_rl so the
+# U5.9 invariant (no unordered_map / id_to_slot in the math archive)
+# holds — see top-level CMakeLists.txt pktgate_rl_ctl comment.
+pktgate_add_test(
+  NAME    unit.test_rl_arena_slot
+  SOURCES test_rl_arena_slot.cpp
+  LABELS  unit
+  LINK    pktgate_rl_ctl
+)
