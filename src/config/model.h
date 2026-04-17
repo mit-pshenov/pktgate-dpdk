@@ -270,6 +270,11 @@ struct Sizing {
   std::uint32_t ethertype_entries_max{};
   std::uint32_t vlan_entries_max{};
   std::uint32_t pcp_entries_max{};
+  // M10 C3 — Prometheus /metrics listen port (D42 §Sub-question #2).
+  // Default 9090 (kube-prometheus convention). `0` in the config file
+  // requests an OS-assigned ephemeral port — used by functional tests
+  // for isolation. Bound on 127.0.0.1 only, IPv4 only on Phase 1.
+  std::uint16_t prom_port{9090};
 };
 
 using SubnetCidr = std::variant<Cidr4, Cidr6>;

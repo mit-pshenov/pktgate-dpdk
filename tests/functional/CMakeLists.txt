@@ -135,6 +135,22 @@ set_tests_properties(functional.test_f5_reload PROPERTIES
   TIMEOUT 180
 )
 
+# M10 C3 — F8.1 / F8.16 / F8.17 / F8.18: Prometheus /metrics HTTP
+# endpoint. Uses net_null vdevs (no packet injection needed — scrape
+# works off the snapshot ring regardless of dataplane traffic).
+# Needs prometheus_client for F8.1 OpenMetrics parsing (skipped
+# gracefully if absent). Boots fresh EAL per test-case; 4 cases
+# under 8 s each + EAL teardown slack → 120 s total.
+add_test(
+  NAME functional.test_f8_metrics
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f8_metrics.py"
+)
+set_tests_properties(functional.test_f8_metrics PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 180
+)
+
 # M9 C5 — F3.12..F3.16: rate-limit end-to-end functional tests.
 # Uses dedicated dtap_f3rl_* interface pair. FIB DIR24_8 needs ~128 MB
 # heap so tests use --no-huge -m 512. F3.16 alone sleeps 5 s, F3.13

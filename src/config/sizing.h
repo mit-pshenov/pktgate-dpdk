@@ -78,6 +78,7 @@ inline constexpr Sizing kSizingDevDefaults{
     /*ethertype_entries_max =*/32,
     /*vlan_entries_max      =*/256,
     /*pcp_entries_max       =*/8,
+    /*prom_port             =*/9090,  // M10 C3 / D42
 };
 
 // D6 prod column. First-class constant, **not** a "v2 target". The
@@ -94,6 +95,7 @@ inline constexpr Sizing kSizingProdDefaults{
     /*ethertype_entries_max =*/64,
     /*vlan_entries_max      =*/4096,
     /*pcp_entries_max       =*/8,
+    /*prom_port             =*/9090,  // M10 C3 / D42
 };
 
 // Parse the inline `sizing` object. Returns nullopt on success (value

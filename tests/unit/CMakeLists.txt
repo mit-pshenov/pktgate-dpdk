@@ -138,6 +138,28 @@ pktgate_add_test(
   LINK    pktgate_telemetry
 )
 
+# M10 C3: SnapshotPublisher thread wrapper (U7.X1, U7.X2, U7.X3).
+# Uses std::thread + short wall-clock waits; must stay race-free
+# under dev-tsan. Links pktgate_telemetry.
+pktgate_add_test(
+  NAME    unit.test_snapshot_publisher
+  SOURCES test_snapshot_publisher.cpp
+  LABELS  unit
+  LINK    pktgate_telemetry
+)
+
+# M10 C3: hand-rolled HTTP server (D42). U10.X1..X11 cover the full
+# request-framing edge-case list (version gate, method gate, path
+# gate, cap boundaries, bare CR/LF rejection, required response
+# headers). Uses AF_UNIX socketpair under the hood so no TCP port
+# is bound at unit tier. Links pktgate_telemetry.
+pktgate_add_test(
+  NAME    unit.test_http_server
+  SOURCES test_http_server.cpp
+  LABELS  unit
+  LINK    pktgate_telemetry
+)
+
 # M10 C1: SnapshotRing single-writer + multi-reader (U7.3, U7.4).
 # U7.3 includes a std::thread-based TSAN harness — publish/read loop
 # under dev-tsan must be race-free (acquire/release pair on

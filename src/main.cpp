@@ -41,6 +41,12 @@
 #include "src/ruleset/builder.h"
 #include "src/ruleset/builder_eal.h"
 #include "src/ruleset/ruleset.h"
+// M10 C3 — Prometheus /metrics scrape pipeline (D42 hand-rolled HTTP).
+#include "src/telemetry/http_server.h"
+#include "src/telemetry/prom_encoder.h"
+#include "src/telemetry/snapshot.h"
+#include "src/telemetry/snapshot_publisher.h"
+#include "src/telemetry/snapshot_ring.h"
 
 // -------------------------------------------------------------------------
 // Structured logging helpers.
@@ -446,6 +452,110 @@ int main(int argc, char* argv[]) {
              ctl_sock_path + "\"}");
   }
 
+  // ---- Phase 6b: telemetry (snapshot publisher + /metrics HTTP) ----
+  //
+  // M10 C3 (D42 hand-rolled HTTP; D3 snapshot ring).
+  //
+  // Publisher: 1 Hz loop that builds a Snapshot from live WorkerCtx
+  // counter sources + rte_eth_stats + Ruleset rule rows and publishes
+  // into the SnapshotRing. Runs on its own thread; shutdown when
+  // ctl::g_running flips false (same atomic SIGTERM flips for the
+  // workers).
+  //
+  // D41 watch: prom_port flows config → sizing → main → HttpServer
+  // — four edges. Boot-path smoke F8.1 covers: if the port never
+  // arrives, connect refused; if the snapshot never publishes, body
+  // fn returns empty but 200 still emits (empty-but-valid scrape).
+  //
+  // Layering (D10): publisher BuildFn + HttpServer BodyFn are the
+  // seams through which DPDK state (rte_eth_stats_get) enters this
+  // otherwise-DPDK-free telemetry lib. Only main.cpp links both
+  // sides; pktgate_telemetry stays `nm`-clean of rte_* symbols.
+  pktgate::telemetry::ProdSnapshotRing prom_ring;
+  pktgate::telemetry::SnapshotPublisher prom_publisher;
+  pktgate::telemetry::HttpServer prom_http;
+
+  {
+    const auto& ports_ref = port_ids;
+    prom_publisher.start(
+        prom_ring, pktgate::ctl::g_running,
+        [&ports_ref](std::uint64_t gen) {
+          using namespace pktgate::telemetry;
+          // Port stats: one PortStats per live port. rte_eth_stats_get
+          // is the only DPDK call on this control-plane path; it's
+          // invoked here (main.cpp is DPDK-aware) and the results flow
+          // into the DPDK-free Snapshot struct.
+          std::vector<PortStats> ps;
+          ps.reserve(ports_ref.size());
+          for (auto pid : ports_ref) {
+            struct rte_eth_stats es{};
+            rte_eth_stats_get(pid, &es);
+            PortStats s;
+            s.ipackets  = es.ipackets;
+            s.opackets  = es.opackets;
+            s.ibytes    = es.ibytes;
+            s.obytes    = es.obytes;
+            s.imissed   = es.imissed;
+            s.ierrors   = es.ierrors;
+            s.oerrors   = es.oerrors;
+            s.rx_nombuf = es.rx_nombuf;
+            ps.push_back(s);
+          }
+          // C3 emits the subset of §10.3 the C1 Snapshot surfaces.
+          // C4 extends LcoreCounterView + RuleIdent wiring; for C3
+          // we feed empty lcore_views and rule_ids so the publisher
+          // exercises its full loop without reaching into WorkerCtx
+          // (which, in C3, is owned by a worker thread on a
+          // different lcore — reader-side relaxed loads there are
+          // fine but wiring the view span is a C4 task per handoff).
+          return build_snapshot(
+              gen,
+              /*lcore_views=*/{},
+              /*per_rule_ids=*/{},
+              /*port_stats=*/std::span<const PortStats>(ps.data(), ps.size()));
+        });
+
+    std::string err;
+    if (!prom_http.start(
+            cfg.sizing.prom_port, pktgate::ctl::g_running,
+            [&prom_ring]() -> std::string {
+              using namespace pktgate::telemetry;
+              auto snap_opt = prom_ring.read_latest();
+              if (!snap_opt) return {};
+              const auto& snap = *snap_opt;
+              std::string body;
+              body.reserve(2048);
+              // Per-port counter family — emit what Snapshot carries.
+              for (std::size_t pid = 0; pid < snap.per_port.size(); ++pid) {
+                const auto& s = snap.per_port[pid];
+                std::vector<Label> lbls{{"port", std::to_string(pid)}};
+                body += format_counter("pktgate_port_rx_packets_total",
+                                       lbls, s.ipackets);
+                body += format_counter("pktgate_port_tx_packets_total",
+                                       lbls, s.opackets);
+                body += format_counter("pktgate_port_rx_bytes_total",
+                                       lbls, s.ibytes);
+                body += format_counter("pktgate_port_tx_bytes_total",
+                                       lbls, s.obytes);
+                body += format_counter("pktgate_port_rx_dropped_total",
+                                       lbls, s.imissed + s.ierrors +
+                                                s.rx_nombuf);
+                body += format_counter("pktgate_port_tx_dropped_total",
+                                       lbls, s.oerrors);
+              }
+              return body;
+            },
+            &err)) {
+      log_json(std::string{"{\"error\":\"prom_http_start_failed\",\"reason\":\""}
+               + err + "\"}");
+      // Non-fatal: continue without /metrics. F5 / F2 tests don't
+      // need scrape to pass.
+    } else {
+      log_json(std::string{"{\"event\":\"prom_endpoint_ready\",\"port\":"}
+               + std::to_string(prom_http.bound_port()) + "}");
+    }
+  }
+
   // ---- Phase 7: launch worker(s) ----
   //
   // M3: single worker on the first available worker lcore.
@@ -551,6 +661,22 @@ int main(int argc, char* argv[]) {
       usleep(1000);
     }
   }
+
+  // ---- M10 C3: stop telemetry threads before touching Ruleset ----
+  //
+  // Order: HTTP accept loop first (no new scrape requests), then the
+  // publisher (no new snapshot builds). Both honour
+  // ctl::g_running.load(acquire) which is already false by this
+  // point, so each join returns promptly (< 200 ms — U7.X2 guards).
+  //
+  // Why BEFORE stats_on_exit + reload::shutdown: the publisher's
+  // BuildFn captures port_ids and calls rte_eth_stats_get; stopping
+  // it here means no new callback fires while we're tearing down
+  // ports / the ruleset. The BodyFn only reads prom_ring (no DPDK),
+  // so HTTP is safe to drop at any point — but we stop it first
+  // anyway so no pending scrape holds a response half-written.
+  prom_http.stop();
+  prom_publisher.stop();
 
   // ---- M4 C8: emit per-rule counter summary for functional tests ---------
   //

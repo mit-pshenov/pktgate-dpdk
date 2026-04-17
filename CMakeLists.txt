@@ -247,7 +247,11 @@ endif()
 # binary, and linking main() next to LLVMFuzzerTestOneInput would fail.
 if(NOT PKTGATE_FUZZ)
   add_executable(pktgate_dpdk src/main.cpp)
-  target_link_libraries(pktgate_dpdk PRIVATE pktgate_dp)
+  # M10 C3: pktgate_telemetry carries snapshot_publisher + http_server,
+  # which main.cpp wires into the boot sequence (Phase 6b). Must be
+  # linked alongside pktgate_dp. pktgate_telemetry stays DPDK-free;
+  # the DPDK-facing BuildFn/BodyFn lambdas live here in main.cpp.
+  target_link_libraries(pktgate_dpdk PRIVATE pktgate_dp pktgate_telemetry)
   pktgate_apply_warnings(pktgate_dpdk)
   pktgate_apply_sanitizer(pktgate_dpdk)
 endif()

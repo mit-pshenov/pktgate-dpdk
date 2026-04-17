@@ -104,10 +104,17 @@ std::optional<ParseError> parse_sizing(const nlohmann::json& j, Sizing& out) {
           {"rules_per_layer_max", "mac_entries_max", "ipv4_prefixes_max",
            "ipv6_prefixes_max", "l4_entries_max", "vrf_entries_max",
            "rate_limit_rules_max", "ethertype_entries_max",
-           "vlan_entries_max", "pcp_entries_max"})) {
+           "vlan_entries_max", "pcp_entries_max",
+           // M10 C3 / D42 — Prometheus /metrics listen port. Optional
+           // field; when absent the struct-init default (9090) stands.
+           "prom_port"})) {
     return *err;
   }
 
+  // Start from tmp{} (default-constructed → prom_port=9090). The
+  // required-field parsers below fill the ten mandatory fields; the
+  // optional prom_port path (M10 C3) overwrites the default if the
+  // key is present.
   Sizing tmp{};
   if (auto err = parse_u32_required(j, "rules_per_layer_max",
                                      tmp.rules_per_layer_max)) return *err;
@@ -129,6 +136,24 @@ std::optional<ParseError> parse_sizing(const nlohmann::json& j, Sizing& out) {
                                      tmp.vlan_entries_max)) return *err;
   if (auto err = parse_u32_required(j, "pcp_entries_max",
                                      tmp.pcp_entries_max)) return *err;
+
+  // M10 C3 / D42 — optional prom_port. Missing → struct-default 9090.
+  // Range [0..65535]; 0 means OS-assigned ephemeral (functional tests
+  // exercise this to avoid port collisions on CI).
+  if (j.contains("prom_port")) {
+    const json& v = j["prom_port"];
+    if (!v.is_number_integer()) {
+      return make_err(ParseError::kTypeMismatch,
+                      "sizing field 'prom_port' must be an integer");
+    }
+    const std::int64_t raw = v.get<std::int64_t>();
+    if (raw < 0 || raw > 65535) {
+      return make_err(ParseError::kOutOfRange,
+                      std::string{"sizing field 'prom_port' = "} +
+                          std::to_string(raw) + " out of range [0..65535]");
+    }
+    tmp.prom_port = static_cast<std::uint16_t>(raw);
+  }
 
   // D6 §3a.2 hard minimum — 16 rules per layer. Below this the
   // test suite loses first-match-wins signal, so the config is

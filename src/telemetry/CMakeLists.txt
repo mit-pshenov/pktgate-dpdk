@@ -26,6 +26,12 @@ add_library(pktgate_telemetry STATIC
   # main.cpp (C3). In C1 the unit tests exercise build_snapshot with
   # fake PortStats injected via span — zero DPDK.
   snapshot.cpp
+  # M10 C3 — publisher thread wrapper (deferred from C1) + hand-rolled
+  # HTTP server (D42: no cpp-httplib vendor). Both stay DPDK-free;
+  # the publisher BuildFn callback and the HTTP BodyFn callback are
+  # the seams through which main.cpp injects DPDK-aware glue.
+  snapshot_publisher.cpp
+  http_server.cpp
 )
 target_include_directories(pktgate_telemetry PUBLIC ${CMAKE_SOURCE_DIR})
 # M10 C1 — snapshot.h uses RuleCounter from src/ruleset/ruleset.h; the
