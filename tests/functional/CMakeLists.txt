@@ -151,6 +151,21 @@ set_tests_properties(functional.test_f8_metrics PROPERTIES
   TIMEOUT 180
 )
 
+# M11 C1 — F7.1: inotify direct-edit IN_CLOSE_WRITE triggers exactly
+# one reload. Uses net_null vdevs (no dataplane traffic needed —
+# assertion is purely on the /metrics scrape of the reload counter
+# family). Boots one binary, rewrites the watched config file in
+# place, polls /metrics for the bump. Extended in C2 with F7.2..F7.6.
+add_test(
+  NAME functional.test_f7_inotify
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f7_inotify.py"
+)
+set_tests_properties(functional.test_f7_inotify PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 120
+)
+
 # M9 C5 — F3.12..F3.16: rate-limit end-to-end functional tests.
 # Uses dedicated dtap_f3rl_* interface pair. FIB DIR24_8 needs ~128 MB
 # heap so tests use --no-huge -m 512. F3.16 alone sleeps 5 s, F3.13

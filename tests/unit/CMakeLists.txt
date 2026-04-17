@@ -195,3 +195,15 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_inotify_ctl
 )
+
+# M11 C1: inotify watcher lifecycle (Ui.1 / Ui.1b / Ui.1c). Spawns a
+# std::thread backed by a real inotify fd on a temp directory; the
+# test pins start/stop/destructor paths under ASAN + TSAN. No kernel
+# events are fed — functional tier (test_f7_inotify.py) covers the
+# event-driven path.
+pktgate_add_test(
+  NAME    unit.test_inotify_watcher_lifecycle
+  SOURCES test_inotify_watcher_lifecycle.cpp
+  LABELS  unit
+  LINK    pktgate_inotify_ctl
+)

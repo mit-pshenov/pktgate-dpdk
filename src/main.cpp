@@ -47,6 +47,8 @@
 #include "src/telemetry/snapshot.h"
 #include "src/telemetry/snapshot_publisher.h"
 #include "src/telemetry/snapshot_ring.h"
+// M11 C1 — inotify watcher thread (D38 inotify half) → reload::deploy().
+#include "src/ctl/inotify/watcher.h"
 
 // -------------------------------------------------------------------------
 // Structured logging helpers.
@@ -852,6 +854,42 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // ---- Phase 6c: inotify watcher (M11 C1, D38 inotify half) ----
+  //
+  // Spawns a control-plane thread that watches the parent directory
+  // of --config for IN_CLOSE_WRITE | IN_MOVED_TO on the config
+  // basename, debounces 150 ms (§9.3), and invokes
+  // ctl::reload::deploy(contents) via the D35 funnel.
+  //
+  // The watcher is started AFTER reload::init() (Phase 5) but
+  // BEFORE workers launch so an early edit during bring-up is
+  // handled cleanly once the first deploy() completes.
+  //
+  // Shutdown ordering (below, Phase 9): stopped BEFORE
+  // reload::shutdown() tears down g_active — same slot where
+  // prom_publisher.stop() lives so new deploy() calls can't race
+  // the reload manager teardown.
+  pktgate::ctl::inotify::InotifyWatcher inotify_watcher;
+  if (!inotify_watcher.start(
+          config_path,
+          [](std::string contents) {
+            auto r = pktgate::ctl::reload::deploy(contents);
+            if (r.ok) {
+              log_json(std::string{"{\"event\":\"inotify_reload_ok\","
+                                   "\"generation\":"} +
+                       std::to_string(r.generation) + "}");
+            } else {
+              log_json(std::string{"{\"event\":\"inotify_reload_failed\","
+                                   "\"kind\":"} +
+                       std::to_string(static_cast<int>(r.kind)) +
+                       ",\"error\":\"" + r.error + "\"}");
+            }
+          })) {
+    // Non-fatal: binary continues without file-watch reload. The
+    // telemetry /pktgate/reload endpoint (M8 C5) remains available.
+    log_json("{\"event\":\"inotify_watcher_start_failed\"}");
+  }
+
   // ---- Phase 7: launch worker(s) ----
   //
   // M3: single worker on the first available worker lcore.
@@ -948,6 +986,12 @@ int main(int argc, char* argv[]) {
   // ports / the ruleset. The BodyFn only reads prom_ring (no DPDK),
   // so HTTP is safe to drop at any point — but we stop it first
   // anyway so no pending scrape holds a response half-written.
+  //
+  // M11 C1 — stop the inotify watcher FIRST so no late kernel event
+  // can land a deploy() call after reload::shutdown() has torn down
+  // g_active. The watcher's poll() tick is bounded at 100 ms, so
+  // stop() returns within that window.
+  inotify_watcher.stop();
   prom_http.stop();
   prom_publisher.stop();
 

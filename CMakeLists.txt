@@ -263,7 +263,8 @@ if(NOT PKTGATE_FUZZ)
   # which main.cpp wires into the boot sequence (Phase 6b). Must be
   # linked alongside pktgate_dp. pktgate_telemetry stays DPDK-free;
   # the DPDK-facing BuildFn/BodyFn lambdas live here in main.cpp.
-  target_link_libraries(pktgate_dpdk PRIVATE pktgate_dp pktgate_telemetry)
+  target_link_libraries(pktgate_dpdk PRIVATE pktgate_dp pktgate_telemetry
+                                             pktgate_inotify_ctl)
   pktgate_apply_warnings(pktgate_dpdk)
   pktgate_apply_sanitizer(pktgate_dpdk)
 endif()

@@ -17,10 +17,17 @@
 
 add_library(pktgate_inotify_ctl STATIC
   debounce.cpp
+  # C1 — watcher thread: inotify_init1 + inotify_add_watch on parent
+  # directory, poll() loop, basename filter, debounce, file-read,
+  # TriggerFn callback (→ ctl::reload::deploy() in main.cpp).
+  watcher.cpp
   # Header-only filter; listed so IDEs surface it and target_sources
   # sees the full public surface. No object code.
   event_filter.h
 )
 target_include_directories(pktgate_inotify_ctl PUBLIC ${CMAKE_SOURCE_DIR})
+# C1 — watcher.cpp spawns a std::thread; link pthread for portability.
+find_package(Threads REQUIRED)
+target_link_libraries(pktgate_inotify_ctl PUBLIC Threads::Threads)
 pktgate_apply_warnings(pktgate_inotify_ctl)
 pktgate_apply_sanitizer(pktgate_inotify_ctl)
