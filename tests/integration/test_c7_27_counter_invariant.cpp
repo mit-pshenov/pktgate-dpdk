@@ -169,7 +169,10 @@ const std::vector<std::string>& canonical_manifest() {
 // =========================================================================
 // Justified-zero list — §10.3 names that are "present-only" contracts.
 //
-// Each entry's comment explains WHY it's on the list. Keep under 15.
+// Each entry's comment explains WHY it's on the list. Keep under ~16;
+// M10 C4 grew the list to 15 entries to cover the four Phase-2 deferrals
+// (lcore_packets / lcore_idle_iters / lcore_cycles_per_burst / mirror_
+// dropped) — every one of them tagged with its deferral D-ref.
 //
 // C2 NOTE: this list is NOT the C2 RED-set. Most RED names below are
 // C4 wire-up targets, not justified-zero. Entries here are the ones
@@ -219,6 +222,22 @@ const std::set<std::string>& justified_zero() {
       // D38 UDS peer-cred rejection — needs a real UDS + a hostile
       // peer. Deferred to M11-equivalent integration; presence-only.
       "pktgate_cmd_socket_rejected_total",
+
+      // Phase-2 deferred producers (errata §Phase 1 scope trim).
+      // No WorkerCtx bump sites exist for these yet; C4 explicitly
+      // does NOT add producers (handoff obstacle: STOP+report on D41-
+      // class additions). Cycle histogram + lcore packet/idle totals
+      // are Phase-2 (U10.2 histogram formatter + M11 lcore dashboard).
+      // Presence on §10.3 reflects the CONTRACT; the producer wiring
+      // lands in Phase 2 alongside the lcore-per-worker Snapshot split.
+      "pktgate_lcore_packets_total",
+      "pktgate_lcore_idle_iters_total",
+      "pktgate_lcore_cycles_per_burst",
+
+      // D7 Mirror verb drop counter — compiler rejects MIRROR rules in
+      // MVP (D26 MUTATING_VERBS gate), so no runtime producer exists.
+      // Deferred to v2 per D7 prose.
+      "pktgate_mirror_dropped_total",
   };
   return names;
 }
@@ -234,23 +253,92 @@ const std::set<std::string>& justified_zero() {
 // names), and scalar lcore (multiseg_drop, qinq_outer). C4 will grow
 // this function as the Snapshot struct grows new fields.
 // =========================================================================
-Snapshot build_adversarial_snapshot() {
-  // Per-rule producer state: one L4 rule with observed traffic.
+// C4 — static local storage for adversarial snapshot. The LcoreCounterView
+// holds pointers to scalar/array counters; they must outlive the view
+// span passed into build_snapshot. Using function-local `static` keeps
+// the addresses stable across test cases in the same TU run.
+struct AdvCountersStorage {
   std::array<RuleCounter, 8> lcore0_row{};
-  lcore0_row[2].matched_packets = 42;  // slot 2 = arbitrary layer-4 slot
-  lcore0_row[2].matched_bytes   = 1500;
-  lcore0_row[2].drops           = 1;
-  lcore0_row[2].rl_drops        = 0;
 
-  std::uint64_t multiseg_drop = 0;  // presence-only per justified_zero
-  std::uint64_t qinq_outer    = 0;  // presence-only per justified_zero
+  std::uint64_t multiseg_drop = 0;  // D39 presence-only
+  std::uint64_t qinq_outer    = 0;  // D32 presence-only
 
-  LcoreCounterView view{
-      .pkt_multiseg_drop_total = &multiseg_drop,
-      .qinq_outer_only_total   = &qinq_outer,
-      .counter_row             = lcore0_row.data(),
-      .n_slots                 = static_cast<std::uint32_t>(lcore0_row.size()),
-  };
+  // D31 truncation bucket arrays — worker side owns std::array; here we
+  // mimic the exact shape so LcoreCounterView pointers align with the
+  // production layout (idx 0=l2, 1=l2_vlan; 0=l3_v4, 1=l3_v6, 2=l3_v6
+  // _frag_ext; 0=l4).
+  std::array<std::uint64_t, 2> pkt_truncated_l2{};
+  std::array<std::uint64_t, 3> pkt_truncated_l3{};
+  std::array<std::uint64_t, 1> pkt_truncated_l4{};
+
+  // D40 fragment bucket array — 4 slots: dropped_v4, skipped_v4,
+  // dropped_v6, skipped_v6.
+  std::array<std::uint64_t, 4> pkt_frag_l3{};
+
+  // D20 / D27 IPv6 skip counters (justified-zero).
+  std::uint64_t l4_skipped_ipv6_extheader         = 0;
+  std::uint64_t l4_skipped_ipv6_fragment_nonfirst = 0;
+
+  // D25 runtime backstop (justified-zero), D19 TAG PCP no-op,
+  // D16 REDIRECT drop — all observable via adversarial workload where
+  // the producer site is reachable. Non-zero values used where the
+  // §10.3 name must round-trip as "wired" in the C7.27 gate.
+  std::uint64_t dispatch_unreachable_total  = 0;  // D25 presence-only
+  std::uint64_t tag_pcp_noop_untagged_total = 7;  // adversarial bump
+  std::uint64_t redirect_dropped_total      = 3;  // adversarial bump
+};
+
+Snapshot build_adversarial_snapshot() {
+  // Function-local static so pointers stored into LcoreCounterView
+  // outlive the returned Snapshot-building span lifetime.
+  static AdvCountersStorage s{};
+
+  // Reset state every call so test case ordering doesn't accumulate.
+  s = AdvCountersStorage{};
+
+  // Per-rule producer state: one L4 rule with observed traffic.
+  s.lcore0_row[2].matched_packets = 42;  // slot 2 = arbitrary layer-4 slot
+  s.lcore0_row[2].matched_bytes   = 1500;
+  s.lcore0_row[2].drops           = 1;
+  s.lcore0_row[2].rl_drops        = 0;
+
+  // D31: populate at least one truncation bucket per stage so the
+  // §10.3 name is a "present, non-zero" observation. The encoder
+  // emits one line per bucket — doesn't matter which bucket we bump.
+  s.pkt_truncated_l2[0] = 5;
+  s.pkt_truncated_l3[0] = 11;
+  s.pkt_truncated_l4[0] = 13;
+
+  // D40: populate the v4 buckets; v6 stays zero (justified by
+  // workload shape — testbench does not craft v6 fragments here).
+  s.pkt_frag_l3[0] = 4;  // dropped_v4
+  s.pkt_frag_l3[1] = 6;  // skipped_v4
+
+  // D19 / D16 bumps already applied in the storage initializer.
+
+  LcoreCounterView view{};
+  view.pkt_multiseg_drop_total = &s.multiseg_drop;
+  view.qinq_outer_only_total   = &s.qinq_outer;
+  view.pkt_truncated_l2        = s.pkt_truncated_l2.data();
+  view.pkt_truncated_l2_count  =
+      static_cast<std::uint32_t>(s.pkt_truncated_l2.size());
+  view.pkt_truncated_l3        = s.pkt_truncated_l3.data();
+  view.pkt_truncated_l3_count  =
+      static_cast<std::uint32_t>(s.pkt_truncated_l3.size());
+  view.pkt_truncated_l4        = s.pkt_truncated_l4.data();
+  view.pkt_truncated_l4_count  =
+      static_cast<std::uint32_t>(s.pkt_truncated_l4.size());
+  view.pkt_frag_l3             = s.pkt_frag_l3.data();
+  view.pkt_frag_l3_count       =
+      static_cast<std::uint32_t>(s.pkt_frag_l3.size());
+  view.l4_skipped_ipv6_extheader         = &s.l4_skipped_ipv6_extheader;
+  view.l4_skipped_ipv6_fragment_nonfirst = &s.l4_skipped_ipv6_fragment_nonfirst;
+  view.dispatch_unreachable_total        = &s.dispatch_unreachable_total;
+  view.tag_pcp_noop_untagged_total       = &s.tag_pcp_noop_untagged_total;
+  view.redirect_dropped_total            = &s.redirect_dropped_total;
+  view.counter_row                       = s.lcore0_row.data();
+  view.n_slots = static_cast<std::uint32_t>(s.lcore0_row.size());
+
   std::array<LcoreCounterView, 1> views{view};
 
   std::array<RuleIdent, 1> idents{
@@ -268,10 +356,38 @@ Snapshot build_adversarial_snapshot() {
   ports[0].oerrors  = 0;
   ports[0].rx_nombuf = 0;
 
-  return build_snapshot(/*generation=*/1u,
-                        std::span<const LcoreCounterView>(views),
-                        std::span<const RuleIdent>(idents),
-                        std::span<const PortStats>(ports));
+  // Per-port link-up gauge (D33 `pktgate_port_link_up`).
+  std::array<std::uint8_t, 1> link_up{1u};
+
+  // ReloadState — adversarial bump so every reload counter name routes.
+  pktgate::telemetry::ReloadState rl{};
+  rl.success_total         = 5;
+  rl.parse_error_total     = 1;
+  rl.validate_error_total  = 1;
+  rl.compile_error_total   = 1;
+  rl.build_eal_error_total = 0;
+  rl.timeout_total         = 0;
+  rl.internal_error_total  = 0;
+  rl.pending_free_depth    = 2;
+  rl.active_generation     = 5;
+  rl.latency_seconds_last  = 0;
+
+  // ActiveRuleCounts — reflect the adversarial workload's 1-L4-rule
+  // ruleset (the C7.27 test cares about wiring presence, not the
+  // numeric accuracy of per-layer counts).
+  pktgate::telemetry::ActiveRuleCounts arc{};
+  arc.l2 = 0;
+  arc.l3 = 0;
+  arc.l4 = 1;
+
+  return build_snapshot(
+      /*generation=*/1u,
+      std::span<const LcoreCounterView>(views),
+      std::span<const RuleIdent>(idents),
+      std::span<const PortStats>(ports),
+      rl,
+      arc,
+      std::span<const std::uint8_t>(link_up));
 }
 
 }  // namespace

@@ -26,6 +26,87 @@ import time
 import pytest
 
 
+# §10.3 canonical manifest — mirrors tests/integration/
+# test_c7_27_counter_invariant.cpp::canonical_manifest(). Kept in sync
+# as a hand-transcribed list; the integration test enforces the C++ side,
+# this test enforces the observable /metrics scrape exposes every name.
+F8_2_CANONICAL_NAMES = [
+    # Rule-match family
+    "pktgate_rule_packets_total",
+    "pktgate_rule_bytes_total",
+    "pktgate_rule_drops_total",
+    "pktgate_default_action_total",
+    # Per-port family
+    "pktgate_port_rx_packets_total",
+    "pktgate_port_tx_packets_total",
+    "pktgate_port_rx_bytes_total",
+    "pktgate_port_tx_bytes_total",
+    "pktgate_port_rx_dropped_total",
+    "pktgate_port_tx_dropped_total",
+    "pktgate_port_link_up",
+    # Per-lcore family
+    "pktgate_lcore_packets_total",
+    "pktgate_lcore_cycles_per_burst",
+    "pktgate_lcore_idle_iters_total",
+    "pktgate_lcore_l4_skipped_ipv6_extheader_total",
+    "pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total",
+    "pktgate_lcore_tag_pcp_noop_untagged_total",
+    "pktgate_lcore_dispatch_unreachable_total",
+    "pktgate_lcore_pkt_truncated_total",
+    "pktgate_lcore_qinq_outer_only_total",
+    "pktgate_lcore_pkt_multiseg_drop_total",
+    "pktgate_lcore_pkt_frag_skipped_total",
+    "pktgate_lcore_pkt_frag_dropped_total",
+    # Dispatch / mirror / redirect
+    "pktgate_redirect_dropped_total",
+    "pktgate_mirror_dropped_total",
+    # Reload / control plane
+    "pktgate_reload_total",
+    "pktgate_reload_latency_seconds",
+    "pktgate_reload_pending_free_depth",
+    "pktgate_active_generation",
+    "pktgate_active_rules",
+    "pktgate_cmd_socket_rejected_total",
+    # System gauges
+    "pktgate_mempool_in_use",
+    "pktgate_mempool_free",
+    # Watchdog / bypass / log
+    "pktgate_watchdog_restarts_total",
+    "pktgate_bypass_active",
+    "pktgate_log_dropped_total",
+]
+
+# Justified-absence list — §10.3 names that are presence-only contracts
+# and NOT expected to appear on the /metrics body in the current
+# (Phase 1) build. Each entry is mirrored against the integration-test
+# justified_zero() list with matching D-ref rationale.
+F8_2_JUSTIFIED_ABSENT = {
+    # Phase-2 deferrals (no producer wired in Phase 1).
+    "pktgate_lcore_packets_total",
+    "pktgate_lcore_idle_iters_total",
+    "pktgate_lcore_cycles_per_burst",
+    # D7 Mirror verb — compiler rejects MIRROR in MVP.
+    "pktgate_mirror_dropped_total",
+    # M11-equivalent / phase-2 emergency / gauges.
+    "pktgate_watchdog_restarts_total",
+    "pktgate_bypass_active",
+    "pktgate_log_dropped_total",
+    "pktgate_mempool_in_use",
+    "pktgate_mempool_free",
+    "pktgate_cmd_socket_rejected_total",
+    # Per-rule family is traffic-gated: zero-traffic rules are skipped
+    # from snap.per_rule by design (cardinality control, mirror of
+    # stats_on_exit convention in snapshot.cpp). F8.2 binds to
+    # net_null0/null1 vdevs that cannot generate match traffic, so
+    # per-rule counters never materialize. The per-rule arm of D33 is
+    # covered by integration.c7_27_d33_gate which constructs snapshot
+    # fixtures with non-empty per_rule directly.
+    "pktgate_rule_packets_total",
+    "pktgate_rule_bytes_total",
+    "pktgate_rule_drops_total",
+}
+
+
 DPDK_DRIVER_DIR = os.environ.get(
     "DPDK_DRIVER_DIR", "/home/mit/Dev/dpdk-25.11/build/drivers/"
 )
@@ -150,11 +231,16 @@ def test_f8_1_metrics_200_parseable(pktgate_process):
     proc = pktgate_process(make_config(),
                            eal_args=eal_args_for("f81"))
     proc.start()
-    # timeout=30: dev-tsan cold-start is ~2-3x dev-asan; net_null EAL
-    # init + snapshot publisher thread spawn + HTTP bind under TSAN
-    # instrumentation has been observed past 15 s when tests run
-    # back-to-back and the host is already under sanitizer load.
-    assert proc.wait_ready(timeout=30), (
+    # timeout=60: under dev-tsan, DPDK's rte_eal_remote_launch round
+    # trip (main writes to the worker's EAL pipe, blocks until the
+    # worker picks up the launch request and ACKs via a second pipe)
+    # takes several seconds on a cold worker lcore, and compounds
+    # across back-to-back F8 tests because each binary re-does the
+    # entire EAL bring-up.  30 s was sufficient in isolation but the
+    # F8 suite flaked at ~40% when run sequentially under TSAN; 60 s
+    # clears the observed ceiling with margin.  dev-asan cold-start
+    # stays sub-second, so the bump does not penalise the fast paths.
+    assert proc.wait_ready(timeout=60), (
         f"binary not ready. stdout={proc.stdout_text!r} "
         f"stderr={proc.stderr_text!r}"
     )
@@ -197,11 +283,16 @@ def test_f8_16_slowloris_bounded(pktgate_process):
     proc = pktgate_process(make_config(),
                            eal_args=eal_args_for("f816"))
     proc.start()
-    # timeout=30: dev-tsan cold-start is ~2-3x dev-asan; net_null EAL
-    # init + snapshot publisher thread spawn + HTTP bind under TSAN
-    # instrumentation has been observed past 15 s when tests run
-    # back-to-back and the host is already under sanitizer load.
-    assert proc.wait_ready(timeout=30)
+    # timeout=60: under dev-tsan, DPDK's rte_eal_remote_launch round
+    # trip (main writes to the worker's EAL pipe, blocks until the
+    # worker picks up the launch request, ACKs via a second pipe) is
+    # several seconds on a cold worker lcore, and compounds across
+    # back-to-back F8 tests because each binary re-does the entire
+    # EAL bring-up. 30 s was sufficient in isolation but flakes the
+    # F8 suite at ~40% when run sequentially under TSAN; 60 s clears
+    # the observed ceiling with margin.  dev-asan cold-start remains
+    # sub-second so the bump does not penalise the fast paths.
+    assert proc.wait_ready(timeout=60)
     port = wait_for_prom_endpoint(proc)
     assert port is not None
 
@@ -262,11 +353,16 @@ def test_f8_17_bind_loopback_only(pktgate_process):
     proc = pktgate_process(make_config(),
                            eal_args=eal_args_for("f817"))
     proc.start()
-    # timeout=30: dev-tsan cold-start is ~2-3x dev-asan; net_null EAL
-    # init + snapshot publisher thread spawn + HTTP bind under TSAN
-    # instrumentation has been observed past 15 s when tests run
-    # back-to-back and the host is already under sanitizer load.
-    assert proc.wait_ready(timeout=30)
+    # timeout=60: under dev-tsan, DPDK's rte_eal_remote_launch round
+    # trip (main writes to the worker's EAL pipe, blocks until the
+    # worker picks up the launch request, ACKs via a second pipe) is
+    # several seconds on a cold worker lcore, and compounds across
+    # back-to-back F8 tests because each binary re-does the entire
+    # EAL bring-up. 30 s was sufficient in isolation but flakes the
+    # F8 suite at ~40% when run sequentially under TSAN; 60 s clears
+    # the observed ceiling with margin.  dev-asan cold-start remains
+    # sub-second so the bump does not penalise the fast paths.
+    assert proc.wait_ready(timeout=60)
     port = wait_for_prom_endpoint(proc)
     assert port is not None
 
@@ -333,11 +429,16 @@ def test_f8_18_error_paths(pktgate_process):
     proc = pktgate_process(make_config(),
                            eal_args=eal_args_for("f818"))
     proc.start()
-    # timeout=30: dev-tsan cold-start is ~2-3x dev-asan; net_null EAL
-    # init + snapshot publisher thread spawn + HTTP bind under TSAN
-    # instrumentation has been observed past 15 s when tests run
-    # back-to-back and the host is already under sanitizer load.
-    assert proc.wait_ready(timeout=30)
+    # timeout=60: under dev-tsan, DPDK's rte_eal_remote_launch round
+    # trip (main writes to the worker's EAL pipe, blocks until the
+    # worker picks up the launch request, ACKs via a second pipe) is
+    # several seconds on a cold worker lcore, and compounds across
+    # back-to-back F8 tests because each binary re-does the entire
+    # EAL bring-up. 30 s was sufficient in isolation but flakes the
+    # F8 suite at ~40% when run sequentially under TSAN; 60 s clears
+    # the observed ceiling with margin.  dev-asan cold-start remains
+    # sub-second so the bump does not penalise the fast paths.
+    assert proc.wait_ready(timeout=60)
     port = wait_for_prom_endpoint(proc)
     assert port is not None
 
@@ -383,6 +484,135 @@ def test_f8_18_error_paths(pktgate_process):
     assert resp.startswith(b"HTTP/1.1 400 ") or resp == b"", (
         f"GARBAGE line must be rejected or closed silently; got "
         f"{resp[:80]!r}"
+    )
+
+    proc.stop()
+    assert proc.returncode == 0
+
+
+# ------------------------------------------------------------------
+# F8.2 — D33 living invariant, /metrics scrape arm.
+#
+# Boots pktgate with an L2/L3/L4 ruleset that exercises every
+# producer site reachable from a net_null vdev pair (no packet
+# injection — net_null drops every RX call). The scrape endpoint is
+# driven by the 1 Hz snapshot publisher, which reads WorkerCtx
+# counters + reload::counters_snapshot() + active_ruleset()
+# regardless of dataplane traffic. Every §10.3 name must appear in
+# the scrape body OR be on the F8_2_JUSTIFIED_ABSENT list.
+#
+# This is the runtime mirror of integration/test_c7_27_counter_
+# invariant.cpp: the integration test exercises Snapshot-direct,
+# this one exercises the full /metrics HTTP encoder path. A name
+# that round-trips through Snapshot but not through the encoder
+# regression (e.g. someone extends snapshot_metric_names() but
+# forgets to emit in BodyFn) fails here where the integration test
+# would pass — a D41 silent-pipeline-gap gate on the last mile.
+# ------------------------------------------------------------------
+def make_f8_2_config(prom_port=0):
+    """Config for F8.2 — includes one of each L2/L3/L4 rule so the
+    per-rule family has something to aggregate, plus a default_behavior
+    that exercises the default_action counter."""
+    cfg = {
+        "version": 1,
+        "interface_roles": {
+            "upstream_port":   {"vdev": "net_null0"},
+            "downstream_port": {"vdev": "net_null1"},
+        },
+        "default_behavior": "drop",
+        "objects": {
+            "subnets": {
+                "net_allow": ["10.0.0.0/8"],
+            },
+        },
+        "pipeline": {
+            "layer_2": [
+                {
+                    "id":      9001,
+                    "ethertype": 0x0800,
+                    "action":  {"type": "allow"},
+                },
+            ],
+            "layer_3": [
+                {
+                    "id":          9002,
+                    "dst_subnet":  "net_allow",
+                    "action":      {"type": "allow"},
+                },
+            ],
+            "layer_4": [
+                {
+                    "id":       9003,
+                    "proto":    6,
+                    "dst_port": 80,
+                    "action":   {"type": "allow"},
+                },
+            ],
+        },
+        "sizing": {
+            "rules_per_layer_max":  256,
+            "mac_entries_max":      256,
+            "ipv4_prefixes_max":    1024,
+            "ipv6_prefixes_max":    1024,
+            "l4_entries_max":       256,
+            "vrf_entries_max":      32,
+            "rate_limit_rules_max": 256,
+            "ethertype_entries_max": 32,
+            "vlan_entries_max":     256,
+            "pcp_entries_max":      8,
+            "prom_port":            prom_port,
+        },
+    }
+    return cfg
+
+
+def test_f8_2_canonical_names_scrape_wired(pktgate_process):
+    """D33 living invariant, /metrics arm. Every §10.3 name must appear
+    in the scrape body OR be on the justified-absent list."""
+    proc = pktgate_process(make_f8_2_config(),
+                           eal_args=eal_args_for("f82"))
+    proc.start()
+    assert proc.wait_ready(timeout=60), (
+        f"binary not ready. stdout={proc.stdout_text!r} "
+        f"stderr={proc.stderr_text!r}"
+    )
+    port = wait_for_prom_endpoint(proc)
+    assert port is not None and port > 0
+
+    # Wait one full publish cycle (1 Hz) so the ring has a populated
+    # snapshot before we scrape. Publisher's first tick waits
+    # kPublishIntervalMs (1000 ms); we give a ~2 s slack so TSAN
+    # cold-start doesn't miss the first publish.
+    time.sleep(2.0)
+
+    status, headers, body = http_get(port, "/metrics")
+    assert status == 200, f"scrape failed, status={status}"
+    text = body.decode("utf-8", errors="replace")
+
+    # Collect every name observed in the body. A name "appears" if the
+    # body contains it followed by `{` (label segment) or a literal
+    # space (no-label counter line). Either form is a valid OpenMetrics
+    # line prefix; both are worth accepting so the test doesn't flake
+    # on cardinality choices in the encoder.
+    present = set()
+    for name in F8_2_CANONICAL_NAMES:
+        if (name + "{") in text or (name + " ") in text:
+            present.add(name)
+
+    missing = []
+    for name in F8_2_CANONICAL_NAMES:
+        if name in present:
+            continue
+        if name in F8_2_JUSTIFIED_ABSENT:
+            continue
+        missing.append(name)
+
+    assert not missing, (
+        f"F8.2 (D33 living invariant): /metrics body is missing "
+        f"{len(missing)} of {len(F8_2_CANONICAL_NAMES)} §10.3 names "
+        f"and they are not on the justified-absent list.\n"
+        f"MISSING: {missing}\n"
+        f"BODY (first 4 kB):\n{text[:4096]}"
     )
 
     proc.stop()

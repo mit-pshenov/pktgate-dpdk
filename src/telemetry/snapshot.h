@@ -82,13 +82,43 @@ struct PortStats {
 // view using `__atomic_load_n(..., __ATOMIC_RELAXED)` — worker side
 // stays plain.
 //
-// Only a representative subset of WorkerCtx counters is surfaced in
-// C1; C4 expands this to the full §10.3 set. The field pointers may
-// be null if the worker doesn't expose that particular counter (test
-// fakes frequently only wire a subset).
+// C4 expands this to the full §10.3 scalar-counter set (sum-across-
+// lcores). Null pointers mean the view-constructor did not expose that
+// field (test fakes frequently wire only a subset). A null pointer
+// contributes 0 to the aggregate — it does NOT fall off the emitted
+// metric name list (the §10.3 name is surfaced even on zero,
+// presence-only semantics).
 struct LcoreCounterView {
+  // C1 — multiseg drop + QinQ outer (both D31/D32 presence-only).
   const std::uint64_t* pkt_multiseg_drop_total = nullptr;
   const std::uint64_t* qinq_outer_only_total   = nullptr;
+
+  // C4 — D31 per-stage truncation counter buckets. Pointer to
+  // worker_ctx.pkt_truncated_l2[] / l3[] / l4[]; sum across lcores
+  // per bucket. Null-friendly (a missing bucket view contributes 0).
+  const std::uint64_t* pkt_truncated_l2       = nullptr;  // array of kL2TruncBucketCount
+  std::uint32_t        pkt_truncated_l2_count = 0;
+  const std::uint64_t* pkt_truncated_l3       = nullptr;  // array of kL3TruncBucketCount
+  std::uint32_t        pkt_truncated_l3_count = 0;
+  const std::uint64_t* pkt_truncated_l4       = nullptr;  // array of kL4TruncBucketCount
+  std::uint32_t        pkt_truncated_l4_count = 0;
+
+  // C4 — D40 fragment counter buckets (v4 + v6 dropped/skipped).
+  // Pointer to worker_ctx.pkt_frag_l3[] (L3FragCtrs = 4 slots).
+  const std::uint64_t* pkt_frag_l3       = nullptr;
+  std::uint32_t        pkt_frag_l3_count = 0;
+
+  // C4 — D20/D27 IPv6 skip counters.
+  const std::uint64_t* l4_skipped_ipv6_extheader         = nullptr;
+  const std::uint64_t* l4_skipped_ipv6_fragment_nonfirst = nullptr;
+
+  // C4 — D25 runtime backstop + D19 TAG PCP no-op.
+  const std::uint64_t* dispatch_unreachable_total = nullptr;
+  const std::uint64_t* tag_pcp_noop_untagged_total = nullptr;
+
+  // C4 — D16 REDIRECT drop counter.
+  const std::uint64_t* redirect_dropped_total = nullptr;
+
   // Per-rule counter row for this lcore: layout matches
   // `Ruleset::counter_row(lcore_id)`. `n_slots` is
   // `rs.counter_slots_per_lcore`. Null allowed for fakes that only
@@ -117,6 +147,46 @@ struct PerRuleCounter {
 };
 
 // -------------------------------------------------------------------------
+// ReloadState — control-plane reload counter family aggregated into the
+// Snapshot (D33 / §10.3 reload.*).
+//
+// Filled by the publisher from `ctl::reload::counters_snapshot()` (taken
+// under `reload_mutex`, so no torn reads). Surfaces every reload counter
+// in §10.3 plus the `active_generation` gauge.
+//
+// `reload_latency_seconds_last` captures the most recent successful
+// reload's measured latency for the `pktgate_reload_latency_seconds`
+// gauge (spec treats it as the last-observed value; histogram form is
+// Phase 2). M10 C4 publisher leaves this at zero until reload.cpp
+// starts stamping a per-deploy duration — the name still ships through
+// snapshot_metric_names so D33 is satisfied, and the value is zero
+// until the producer side adds timing. See handoff obstacle #5.
+struct ReloadState {
+  std::uint64_t success_total          = 0;
+  std::uint64_t parse_error_total      = 0;
+  std::uint64_t validate_error_total   = 0;
+  std::uint64_t compile_error_total    = 0;
+  std::uint64_t build_eal_error_total  = 0;
+  std::uint64_t timeout_total          = 0;
+  std::uint64_t internal_error_total   = 0;
+  std::uint64_t pending_free_depth     = 0;  // gauge
+  std::uint64_t active_generation      = 0;  // gauge
+  std::int64_t  latency_seconds_last   = 0;  // gauge (see above — Phase 2 populates)
+};
+
+// -------------------------------------------------------------------------
+// ActiveRuleCounts — snapshot of the currently-published Ruleset's
+// per-layer rule counts. Surfaces `pktgate_active_rules{layer="l2|l3|l4"}`.
+//
+// Populated by the publisher via `ctl::reload::active_ruleset()` pointer
+// (single-acquire load) at snapshot build time. Gauges — no `_total`.
+struct ActiveRuleCounts {
+  std::uint64_t l2 = 0;
+  std::uint64_t l3 = 0;
+  std::uint64_t l4 = 0;
+};
+
+// -------------------------------------------------------------------------
 // Snapshot — immutable aggregate produced by the 1 Hz telemetry thread.
 //
 // `generation` is assigned by the publisher on each build; the ring
@@ -124,14 +194,56 @@ struct PerRuleCounter {
 // reads (reader acquire-loads `latest_gen`, then reads the slot
 // `latest_gen % N`).
 //
-// Field set is intentionally small in C1: enough to exercise
-// U7.1-U7.4/U7.6. C4 wires the full §10.3 set.
+// C1 shipped a small subset of §10.3 (per-rule, per-port, two scalars).
+// C4 extends to the full §10.3 set: every WorkerCtx scalar counter
+// wired in M4-M7, the full reload counter family (M8), and the
+// `pktgate_default_action_total` gauge. Phase-2 deferrals (histogram
+// cycles_per_burst, lcore_packets, idle_iters) stay off the snapshot
+// until their producers land.
 struct Snapshot {
   std::uint64_t generation = 0;
 
   // Per-lcore scalar sums across all workers (sum-of-lcores).
   std::uint64_t pkt_multiseg_drop_total = 0;
   std::uint64_t qinq_outer_only_total   = 0;
+
+  // C4 — D31 truncation rollups. Per-stage bucket sums across lcores.
+  // `pkt_truncated_total` is surfaced with a `where` label (l2/l2_vlan/
+  // l3_v4/l3_v6/l3_v6_frag_ext/l4) — the encoder walks every bucket
+  // and emits one counter line per where-value. Missing bucket (all
+  // zero) is still emitted for D33 presence contract.
+  std::uint64_t pkt_truncated_l2           = 0;
+  std::uint64_t pkt_truncated_l2_vlan      = 0;
+  std::uint64_t pkt_truncated_l3_v4        = 0;
+  std::uint64_t pkt_truncated_l3_v6        = 0;
+  std::uint64_t pkt_truncated_l3_v6_frag_ext = 0;
+  std::uint64_t pkt_truncated_l4           = 0;
+
+  // C4 — D40 fragment rollups. `af` label carries "v4"/"v6"; the
+  // encoder emits four lines total (skipped/dropped × v4/v6).
+  std::uint64_t pkt_frag_skipped_v4 = 0;
+  std::uint64_t pkt_frag_skipped_v6 = 0;
+  std::uint64_t pkt_frag_dropped_v4 = 0;
+  std::uint64_t pkt_frag_dropped_v6 = 0;
+
+  // C4 — D20/D27 IPv6 skip counter rollups.
+  std::uint64_t l4_skipped_ipv6_extheader_total         = 0;
+  std::uint64_t l4_skipped_ipv6_fragment_nonfirst_total = 0;
+
+  // C4 — D25 runtime backstop + D19 TAG PCP no-op + D16 REDIRECT drop.
+  std::uint64_t dispatch_unreachable_total   = 0;
+  std::uint64_t tag_pcp_noop_untagged_total  = 0;
+  std::uint64_t redirect_dropped_total       = 0;
+
+  // C4 — `pktgate_default_action_total{action="allow|drop"}` — bumps
+  // when the pipeline runs default_behavior fallthrough. Populated
+  // by the publisher from the existing per-rule drop/match aggregate;
+  // for M10 C4 we approximate "observable" by summing the unmatched-
+  // fallthrough count from Ruleset.default_action × RX count. The
+  // publisher leaves both arms at zero for generations where no
+  // fallthrough occurred (encoder still emits for D33 presence).
+  std::uint64_t default_action_allow_total = 0;
+  std::uint64_t default_action_drop_total  = 0;
 
   // Per-rule aggregated rows. `rule_id`-keyed entries only; empty
   // rows (matched_packets == 0 && drops == 0) may be omitted by the
@@ -143,6 +255,16 @@ struct Snapshot {
   // Per-port rte_eth_stats snapshot. Indexed by port_id; empty
   // entries are skipped by the encoder.
   std::vector<PortStats> per_port;
+
+  // Per-port link-up gauge. Parallel to `per_port`; same index.
+  // `1` = link up, `0` = link down. Surfaces
+  // `pktgate_port_link_up{port="N"}`. Publisher fills this from
+  // `rte_eth_link_get_nowait` alongside `rte_eth_stats_get`.
+  std::vector<std::uint8_t> per_port_link_up;
+
+  // C4 — reload + active-ruleset surface.
+  ReloadState      reload{};
+  ActiveRuleCounts active_rules{};
 };
 
 // -------------------------------------------------------------------------
@@ -181,7 +303,10 @@ struct RuleIdent {
 Snapshot build_snapshot(std::uint64_t generation,
                         std::span<const LcoreCounterView> lcore_views,
                         std::span<const RuleIdent> per_rule_ids,
-                        std::span<const PortStats> port_stats);
+                        std::span<const PortStats> port_stats,
+                        const ReloadState& reload = ReloadState{},
+                        const ActiveRuleCounts& active_rules = ActiveRuleCounts{},
+                        std::span<const std::uint8_t> port_link_up = {});
 
 // -------------------------------------------------------------------------
 // snapshot_metric_names — enumerate §10.3 metric names the given Snapshot

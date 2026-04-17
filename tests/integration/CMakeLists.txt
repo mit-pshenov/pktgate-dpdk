@@ -104,14 +104,13 @@ add_test(
 set_tests_properties(integration.c7_27_sanity
   PROPERTIES LABELS "integration")
 
-# Entry 2 — the D33 runtime gate. WILL_FAIL TRUE — the test IS
-# expected to fail in C2 (most §10.3 names not wired). C4 flips this
-# to FALSE after extending Snapshot + snapshot_metric_names().
-#
-# Document the ladder here so a future reader knows the RED is
-# deliberate. If this test ever goes green in C2, CTest reports a
-# `Failed (Ignored)` regression on the gate (WILL_FAIL + actual pass
-# = CTest FAIL) — the desired signal that C4 wiring sneaked in early.
+# Entry 2 — the D33 runtime gate. WILL_FAIL flipped to FALSE in M10 C4:
+# Snapshot now surfaces every §10.3 name via extended LcoreCounterView /
+# ReloadState / ActiveRuleCounts plus the justified-zero list covers
+# the Phase-2 deferrals (lcore_packets, lcore_idle_iters,
+# lcore_cycles_per_burst, mirror_dropped). If a new §10.3 name ever
+# lands without Snapshot wiring, this test RED will be a real failure —
+# exactly the living-invariant signal D33 exists to provide.
 add_test(
   NAME    integration.c7_27_d33_gate
   COMMAND integration_test_c7_27_counter_invariant
@@ -120,4 +119,4 @@ add_test(
 set_tests_properties(integration.c7_27_d33_gate
   PROPERTIES
     LABELS "integration"
-    WILL_FAIL TRUE)
+    WILL_FAIL FALSE)

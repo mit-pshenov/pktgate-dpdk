@@ -8,6 +8,7 @@
 #
 # Design anchors: harness.md §H1.5 (EAL argv), §H8 (dev-test.sh).
 
+import fcntl
 import json
 import os
 import signal
@@ -128,6 +129,7 @@ class PktgateProcess:
         self.stderr_text = ""
         self.returncode = None
         self._config_file = None
+        self._stderr_file = None
         self._binary = find_binary()
 
     def start(self):
@@ -142,13 +144,49 @@ class PktgateProcess:
             "--config", self._config_file.name
         ] + self.extra_args
 
+        # stderr goes to a temp file rather than a PIPE.  Under dev-tsan,
+        # EAL + TSan runtime can dump >64 kB of diagnostics into stderr
+        # during cold-start; if the test harness does not drain the
+        # stderr PIPE concurrently, the binary blocks inside write(2)
+        # on a full pipe and stdout progress stalls as a side effect
+        # (observed as "wait_ready empty stdout/stderr" under ctest).
+        # A file has no backpressure, so the binary never blocks on log
+        # output regardless of sanitiser chatter.
+        self._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w+", suffix=".stderr", delete=False
+        )
+        # Binary mode (no text=True) + fcntl O_NONBLOCK on stdout so the
+        # harness can use os.read() directly.  Using Popen's TextIOWrapper
+        # readline() combined with select() misses lines that arrive in a
+        # burst: select returns readable once, readline() drains the kernel
+        # pipe into the TextIOWrapper's 8 KB buffer, returns a single line,
+        # and leaves the rest buffered.  Subsequent select() calls see an
+        # empty kernel fd and sleep forever while the remaining lines
+        # (including {"ready":true}) sit unread in user-space buffer.
+        # Observed under dev-tsan F8 suite where pktgate emits 7 startup
+        # log_json lines within ~0.2 s — all batch into one kernel read.
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stderr=self._stderr_file,
         )
+        fd = self.process.stdout.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        self._stdout_buf = b""
         self._collected_lines = []
+
+    def _drain_stderr_file(self):
+        """Read whatever is currently in the stderr temp-file into
+        self.stderr_text, if the file is open."""
+        if not self._stderr_file:
+            return ""
+        try:
+            self._stderr_file.flush()
+            with open(self._stderr_file.name, "r", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
 
     def wait_ready(self, timeout=None):
         """Wait for the 'ready' log line in stdout."""
@@ -164,23 +202,55 @@ class PktgateProcess:
                 # Check if process exited
                 if self.process.poll() is not None:
                     # Process exited before ready
-                    remaining_out, remaining_err = self.process.communicate(timeout=1)
-                    self.stdout_text = "\n".join(self._collected_lines) + "\n" + remaining_out
-                    self.stderr_text = remaining_err
+                    remaining_bytes, _ = self.process.communicate(timeout=1)
+                    tail = (self._stdout_buf + (remaining_bytes or b"")
+                            ).decode("utf-8", errors="replace")
+                    self.stdout_text = "\n".join(self._collected_lines) + "\n" + tail
+                    self.stderr_text = self._drain_stderr_file()
                     self.returncode = self.process.returncode
                     return False
                 time.sleep(0.05)
+        # Timed out without ready: make stdout/stderr available for the
+        # caller's assertion message so a hang is debuggable instead of
+        # silent ("stdout='' stderr=''").  Some tests call wait_ready
+        # with a bare assert (no f-string), so print the dump here too
+        # so the ctest log captures it unconditionally.
+        self.stdout_text = "\n".join(self._collected_lines)
+        self.stderr_text = self._drain_stderr_file()
         return False
 
     def _read_line_nonblocking(self):
-        """Read a single line from stdout, non-blocking."""
+        """Return one line from stdout, or None if none buffered / pending.
+
+        Uses os.read on the raw fd + an internal byte buffer rather than
+        proc.stdout.readline() — the latter's TextIOWrapper drains the
+        kernel pipe into an 8 KB buffer on the first readable notify and
+        subsequent select() calls see the empty kernel fd, never handing
+        back the buffered tail (silently losing {"ready":true} under
+        burst-emission cold-start conditions).
+        """
         import select
-        if self.process and self.process.stdout:
-            r, _, _ = select.select([self.process.stdout], [], [], 0.1)
-            if r:
-                line = self.process.stdout.readline()
-                if line:
-                    return line.strip()
+        # 1. Emit any complete line already in the byte buffer.
+        if b"\n" in self._stdout_buf:
+            line, self._stdout_buf = self._stdout_buf.split(b"\n", 1)
+            return line.decode("utf-8", errors="replace").strip()
+        if not (self.process and self.process.stdout):
+            return None
+        # 2. Pump more bytes if the kernel fd is readable.
+        fd = self.process.stdout.fileno()
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if not r:
+            return None
+        try:
+            data = os.read(fd, 4096)
+        except BlockingIOError:
+            return None
+        if not data:
+            return None
+        self._stdout_buf += data
+        if b"\n" in self._stdout_buf:
+            line, self._stdout_buf = self._stdout_buf.split(b"\n", 1)
+            return line.decode("utf-8", errors="replace").strip()
         return None
 
     def send_signal(self, sig=signal.SIGTERM):
@@ -192,23 +262,26 @@ class PktgateProcess:
         """Wait for the process to exit and capture output."""
         timeout = timeout or self.timeout
         try:
-            remaining_out, remaining_err = self.process.communicate(timeout=timeout)
-            # Combine lines collected during wait_ready with remaining output.
+            remaining_bytes, _ = self.process.communicate(timeout=timeout)
+            tail = (self._stdout_buf + (remaining_bytes or b"")
+                    ).decode("utf-8", errors="replace")
             pre = "\n".join(self._collected_lines)
-            if pre and remaining_out:
-                self.stdout_text = pre + "\n" + remaining_out
+            if pre and tail:
+                self.stdout_text = pre + "\n" + tail
             elif pre:
                 self.stdout_text = pre + "\n"
             else:
-                self.stdout_text = remaining_out
-            self.stderr_text = remaining_err
+                self.stdout_text = tail
+            self.stderr_text = self._drain_stderr_file()
             self.returncode = self.process.returncode
         except subprocess.TimeoutExpired:
             self.process.kill()
-            remaining_out, remaining_err = self.process.communicate(timeout=5)
+            remaining_bytes, _ = self.process.communicate(timeout=5)
+            tail = (self._stdout_buf + (remaining_bytes or b"")
+                    ).decode("utf-8", errors="replace")
             pre = "\n".join(self._collected_lines)
-            self.stdout_text = (pre + "\n" + (remaining_out or "")) if pre else (remaining_out or "")
-            self.stderr_text = remaining_err or ""
+            self.stdout_text = (pre + "\n" + tail) if pre else tail
+            self.stderr_text = self._drain_stderr_file()
             self.returncode = self.process.returncode
 
     def stop(self):
@@ -226,8 +299,53 @@ class PktgateProcess:
                 pass
         if self._config_file and os.path.exists(self._config_file.name):
             os.unlink(self._config_file.name)
+        # Close and remove the stderr backing file now that stderr_text
+        # has been captured (or can be re-read on demand from the path).
+        if self._stderr_file is not None:
+            try:
+                self._stderr_file.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(self._stderr_file.name)
+            except OSError:
+                pass
+            self._stderr_file = None
+        # Drain leaked per-process DPDK runtime dirs from this pktgate
+        # instance's file-prefix.  With `--no-huge` the EAL writes its
+        # fbarray / config files under $XDG_RUNTIME_DIR/dpdk/<prefix>/
+        # rather than /run/dpdk/.  Nothing cleans them after SIGTERM,
+        # so successive tests accumulate an ever-growing pool that can
+        # slow EAL init (stat + namespace scan) and, under dev-tsan,
+        # push worker cold-start past the 30 s wait_ready budget.
+        self._cleanup_dpdk_runtime_dir()
         # Give EAL a moment to release hugepage mappings.
         time.sleep(0.2)
+
+    def _cleanup_dpdk_runtime_dir(self):
+        """Remove this instance's per-prefix DPDK runtime dir if it was
+        pointed at one via `--file-prefix`."""
+        prefix = None
+        eal = self.eal_args or []
+        for i, a in enumerate(eal):
+            if a == "--file-prefix" and i + 1 < len(eal):
+                prefix = eal[i + 1]
+                break
+        if not prefix:
+            return
+        xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        candidates = [
+            os.path.join(xdg, "dpdk", prefix),
+            os.path.join("/run/dpdk", prefix),
+            os.path.join("/var/run/dpdk", prefix),
+        ]
+        for path in candidates:
+            if os.path.isdir(path):
+                try:
+                    import shutil
+                    shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
 
 
 @pytest.fixture

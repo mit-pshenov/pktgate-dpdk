@@ -452,113 +452,14 @@ int main(int argc, char* argv[]) {
              ctl_sock_path + "\"}");
   }
 
-  // ---- Phase 6b: telemetry (snapshot publisher + /metrics HTTP) ----
+  // ---- Phase 6b.pre: WorkerCtx setup ----
   //
-  // M10 C3 (D42 hand-rolled HTTP; D3 snapshot ring).
-  //
-  // Publisher: 1 Hz loop that builds a Snapshot from live WorkerCtx
-  // counter sources + rte_eth_stats + Ruleset rule rows and publishes
-  // into the SnapshotRing. Runs on its own thread; shutdown when
-  // ctl::g_running flips false (same atomic SIGTERM flips for the
-  // workers).
-  //
-  // D41 watch: prom_port flows config → sizing → main → HttpServer
-  // — four edges. Boot-path smoke F8.1 covers: if the port never
-  // arrives, connect refused; if the snapshot never publishes, body
-  // fn returns empty but 200 still emits (empty-but-valid scrape).
-  //
-  // Layering (D10): publisher BuildFn + HttpServer BodyFn are the
-  // seams through which DPDK state (rte_eth_stats_get) enters this
-  // otherwise-DPDK-free telemetry lib. Only main.cpp links both
-  // sides; pktgate_telemetry stays `nm`-clean of rte_* symbols.
-  pktgate::telemetry::ProdSnapshotRing prom_ring;
-  pktgate::telemetry::SnapshotPublisher prom_publisher;
-  pktgate::telemetry::HttpServer prom_http;
-
-  {
-    const auto& ports_ref = port_ids;
-    prom_publisher.start(
-        prom_ring, pktgate::ctl::g_running,
-        [&ports_ref](std::uint64_t gen) {
-          using namespace pktgate::telemetry;
-          // Port stats: one PortStats per live port. rte_eth_stats_get
-          // is the only DPDK call on this control-plane path; it's
-          // invoked here (main.cpp is DPDK-aware) and the results flow
-          // into the DPDK-free Snapshot struct.
-          std::vector<PortStats> ps;
-          ps.reserve(ports_ref.size());
-          for (auto pid : ports_ref) {
-            struct rte_eth_stats es{};
-            rte_eth_stats_get(pid, &es);
-            PortStats s;
-            s.ipackets  = es.ipackets;
-            s.opackets  = es.opackets;
-            s.ibytes    = es.ibytes;
-            s.obytes    = es.obytes;
-            s.imissed   = es.imissed;
-            s.ierrors   = es.ierrors;
-            s.oerrors   = es.oerrors;
-            s.rx_nombuf = es.rx_nombuf;
-            ps.push_back(s);
-          }
-          // C3 emits the subset of §10.3 the C1 Snapshot surfaces.
-          // C4 extends LcoreCounterView + RuleIdent wiring; for C3
-          // we feed empty lcore_views and rule_ids so the publisher
-          // exercises its full loop without reaching into WorkerCtx
-          // (which, in C3, is owned by a worker thread on a
-          // different lcore — reader-side relaxed loads there are
-          // fine but wiring the view span is a C4 task per handoff).
-          return build_snapshot(
-              gen,
-              /*lcore_views=*/{},
-              /*per_rule_ids=*/{},
-              /*port_stats=*/std::span<const PortStats>(ps.data(), ps.size()));
-        });
-
-    std::string err;
-    if (!prom_http.start(
-            cfg.sizing.prom_port, pktgate::ctl::g_running,
-            [&prom_ring]() -> std::string {
-              using namespace pktgate::telemetry;
-              auto snap_opt = prom_ring.read_latest();
-              if (!snap_opt) return {};
-              const auto& snap = *snap_opt;
-              std::string body;
-              body.reserve(2048);
-              // Per-port counter family — emit what Snapshot carries.
-              for (std::size_t pid = 0; pid < snap.per_port.size(); ++pid) {
-                const auto& s = snap.per_port[pid];
-                std::vector<Label> lbls{{"port", std::to_string(pid)}};
-                body += format_counter("pktgate_port_rx_packets_total",
-                                       lbls, s.ipackets);
-                body += format_counter("pktgate_port_tx_packets_total",
-                                       lbls, s.opackets);
-                body += format_counter("pktgate_port_rx_bytes_total",
-                                       lbls, s.ibytes);
-                body += format_counter("pktgate_port_tx_bytes_total",
-                                       lbls, s.obytes);
-                body += format_counter("pktgate_port_rx_dropped_total",
-                                       lbls, s.imissed + s.ierrors +
-                                                s.rx_nombuf);
-                body += format_counter("pktgate_port_tx_dropped_total",
-                                       lbls, s.oerrors);
-              }
-              return body;
-            },
-            &err)) {
-      log_json(std::string{"{\"error\":\"prom_http_start_failed\",\"reason\":\""}
-               + err + "\"}");
-      // Non-fatal: continue without /metrics. F5 / F2 tests don't
-      // need scrape to pass.
-    } else {
-      log_json(std::string{"{\"event\":\"prom_endpoint_ready\",\"port\":"}
-               + std::to_string(prom_http.bound_port()) + "}");
-    }
-  }
-
-  // ---- Phase 7: launch worker(s) ----
-  //
-  // M3: single worker on the first available worker lcore.
+  // M10 C4 reorder: declare + initialise worker_ctx BEFORE the telemetry
+  // publisher starts so the publisher's BuildFn can capture &worker_ctx
+  // and wire LcoreCounterView fields to the live counter storage. The
+  // worker thread doesn't observe worker_ctx until the rte_eal_remote_launch
+  // call below (Phase 7); the publisher only reads via relaxed atomic
+  // loads, which are safe against uninitialised-but-zeroed worker state.
   pktgate::dataplane::WorkerCtx worker_ctx{};
   worker_ctx.port_id = port_ids[0];
   // M7 C0: egress port for ALLOW / TAG / TERMINAL_PASS-allow.
@@ -584,6 +485,367 @@ int main(int argc, char* argv[]) {
   // each packet in the RL verb path.
   worker_ctx.rl_arena = &pktgate::rl_arena::rl_arena_global();
   worker_ctx.tsc_hz = rte_get_tsc_hz();
+
+  // ---- Phase 6b: telemetry (snapshot publisher + /metrics HTTP) ----
+  //
+  // M10 C3 (D42 hand-rolled HTTP; D3 snapshot ring).
+  // M10 C4 — extended BuildFn/BodyFn to surface every §10.3 name.
+  //
+  // Publisher: 1 Hz loop that builds a Snapshot from live WorkerCtx
+  // counter sources + rte_eth_stats + Ruleset rule rows and publishes
+  // into the SnapshotRing. Runs on its own thread; shutdown when
+  // ctl::g_running flips false (same atomic SIGTERM flips for the
+  // workers).
+  //
+  // D41 watch: prom_port flows config → sizing → main → HttpServer
+  // — four edges. Boot-path smoke F8.1 covers: if the port never
+  // arrives, connect refused; if the snapshot never publishes, body
+  // fn returns empty but 200 still emits (empty-but-valid scrape).
+  //
+  // Layering (D10): publisher BuildFn + HttpServer BodyFn are the
+  // seams through which DPDK state (rte_eth_stats_get) enters this
+  // otherwise-DPDK-free telemetry lib. Only main.cpp links both
+  // sides; pktgate_telemetry stays `nm`-clean of rte_* symbols.
+  pktgate::telemetry::ProdSnapshotRing prom_ring;
+  pktgate::telemetry::SnapshotPublisher prom_publisher;
+  pktgate::telemetry::HttpServer prom_http;
+
+  {
+    const auto& ports_ref = port_ids;
+    prom_publisher.start(
+        prom_ring, pktgate::ctl::g_running,
+        [&ports_ref, &worker_ctx](std::uint64_t gen) {
+          using namespace pktgate::telemetry;
+          // Port stats + link-up: one per live port. rte_eth_stats_get
+          // + rte_eth_link_get_nowait are the only DPDK calls on this
+          // control-plane path; invoked here (main.cpp is DPDK-aware)
+          // and the results flow into the DPDK-free Snapshot struct.
+          std::vector<PortStats> ps;
+          std::vector<std::uint8_t> link_up;
+          ps.reserve(ports_ref.size());
+          link_up.reserve(ports_ref.size());
+          for (auto pid : ports_ref) {
+            struct rte_eth_stats es{};
+            rte_eth_stats_get(pid, &es);
+            PortStats s;
+            s.ipackets  = es.ipackets;
+            s.opackets  = es.opackets;
+            s.ibytes    = es.ibytes;
+            s.obytes    = es.obytes;
+            s.imissed   = es.imissed;
+            s.ierrors   = es.ierrors;
+            s.oerrors   = es.oerrors;
+            s.rx_nombuf = es.rx_nombuf;
+            ps.push_back(s);
+
+            struct rte_eth_link link{};
+            (void)rte_eth_link_get_nowait(pid, &link);
+            link_up.push_back(link.link_status ? 1u : 0u);
+          }
+
+          // C4 — wire every §10.3 scalar/per-rule/reload name through
+          // LcoreCounterView + RuleIdent + ReloadState + ActiveRuleCounts.
+          // WorkerCtx pointers alias into live worker fields; reader-side
+          // relaxed atomic loads satisfy TSan (D1 amendment 2026-04-17).
+          //
+          // This process currently runs a single worker (M3/M4/.../M10
+          // scope), so views has length 1. Multi-worker extension is a
+          // later milestone: push one view per launched WorkerCtx.
+          LcoreCounterView view{};
+          view.pkt_multiseg_drop_total = &worker_ctx.pkt_multiseg_drop_total;
+          view.qinq_outer_only_total   = &worker_ctx.qinq_outer_only_total;
+          view.pkt_truncated_l2        = worker_ctx.pkt_truncated_l2.data();
+          view.pkt_truncated_l2_count  =
+              static_cast<std::uint32_t>(worker_ctx.pkt_truncated_l2.size());
+          view.pkt_truncated_l3        = worker_ctx.pkt_truncated_l3.data();
+          view.pkt_truncated_l3_count  =
+              static_cast<std::uint32_t>(worker_ctx.pkt_truncated_l3.size());
+          view.pkt_truncated_l4        = worker_ctx.pkt_truncated_l4.data();
+          view.pkt_truncated_l4_count  =
+              static_cast<std::uint32_t>(worker_ctx.pkt_truncated_l4.size());
+          view.pkt_frag_l3             = worker_ctx.pkt_frag_l3.data();
+          view.pkt_frag_l3_count       =
+              static_cast<std::uint32_t>(worker_ctx.pkt_frag_l3.size());
+          view.l4_skipped_ipv6_extheader =
+              &worker_ctx.l4_skipped_ipv6_extheader;
+          view.l4_skipped_ipv6_fragment_nonfirst =
+              &worker_ctx.l4_skipped_ipv6_fragment_nonfirst;
+          view.dispatch_unreachable_total =
+              &worker_ctx.dispatch_unreachable_total;
+          view.tag_pcp_noop_untagged_total =
+              &worker_ctx.tag_pcp_noop_untagged_total;
+          view.redirect_dropped_total = &worker_ctx.redirect_dropped_total;
+
+          // Walk the currently-active ruleset to build RuleIdent spans
+          // + ActiveRuleCounts. The manager's active_ruleset() acquire-
+          // loads under RCU; the pointer is valid for the duration of
+          // this callback (publisher stops BEFORE reload::shutdown()).
+          const auto* rs = pktgate::ctl::reload::active_ruleset();
+          std::vector<RuleIdent> rule_ids;
+          ActiveRuleCounts arc{};
+          if (rs != nullptr) {
+            arc.l2 = rs->n_l2_rules;
+            arc.l3 = rs->n_l3_rules;
+            arc.l4 = rs->n_l4_rules;
+            rule_ids.reserve(
+                static_cast<std::size_t>(rs->n_l2_rules) +
+                static_cast<std::size_t>(rs->n_l3_rules) +
+                static_cast<std::size_t>(rs->n_l4_rules));
+            // L2 layer_base = 0.
+            if (rs->l2_actions != nullptr) {
+              for (std::uint32_t i = 0; i < rs->n_l2_rules; ++i) {
+                const auto& a = rs->l2_actions[i];
+                rule_ids.push_back(RuleIdent{
+                    a.rule_id,
+                    static_cast<std::uint32_t>(a.counter_slot),
+                    std::uint8_t{2}});
+              }
+            }
+            // L3 layer_base = 1 * l2_actions_capacity.
+            if (rs->l3_actions != nullptr) {
+              const auto l3_base = rs->l2_actions_capacity;
+              for (std::uint32_t i = 0; i < rs->n_l3_rules; ++i) {
+                const auto& a = rs->l3_actions[i];
+                rule_ids.push_back(RuleIdent{
+                    a.rule_id,
+                    static_cast<std::uint32_t>(a.counter_slot) + l3_base,
+                    std::uint8_t{3}});
+              }
+            }
+            // L4 layer_base = 2 * l2_actions_capacity.
+            if (rs->l4_actions != nullptr) {
+              const auto l4_base = 2u * rs->l2_actions_capacity;
+              for (std::uint32_t i = 0; i < rs->n_l4_rules; ++i) {
+                const auto& a = rs->l4_actions[i];
+                rule_ids.push_back(RuleIdent{
+                    a.rule_id,
+                    static_cast<std::uint32_t>(a.counter_slot) + l4_base,
+                    std::uint8_t{4}});
+              }
+            }
+            // Wire the per-rule counter row pointer into the view.
+            // Single worker: use lcore 0 unconditionally; multi-worker
+            // extension pushes one view per worker and picks each
+            // worker's own lcore id.
+            view.counter_row = rs->counter_row(0);
+            view.n_slots     = rs->counter_slots_per_lcore;
+          }
+
+          // Reload state — snapshot under reload_mutex (D35). Copies
+          // happen on this publisher thread, no torn reads.
+          ReloadState rl{};
+          const auto rc = pktgate::ctl::reload::counters_snapshot();
+          rl.success_total         = rc.success;
+          rl.parse_error_total     = rc.parse_error;
+          rl.validate_error_total  = rc.validate_error;
+          rl.compile_error_total   = rc.compile_error;
+          rl.build_eal_error_total = rc.build_eal_error;
+          rl.timeout_total         = rc.timeout;
+          rl.internal_error_total  = rc.internal_error;
+          rl.pending_free_depth    = rc.pending_depth;
+          rl.active_generation     = rc.active_generation;
+          // Latency gauge stays at 0 until reload.cpp stamps a per-
+          // deploy duration (Phase 2 per handoff obstacle #5). The
+          // name still ships via snapshot_metric_names for D33.
+          rl.latency_seconds_last  = 0;
+
+          std::array<LcoreCounterView, 1> views{view};
+          return build_snapshot(
+              gen,
+              std::span<const LcoreCounterView>(views),
+              std::span<const RuleIdent>(rule_ids),
+              std::span<const PortStats>(ps.data(), ps.size()),
+              rl,
+              arc,
+              std::span<const std::uint8_t>(link_up.data(), link_up.size()));
+        });
+
+    std::string err;
+    if (!prom_http.start(
+            cfg.sizing.prom_port, pktgate::ctl::g_running,
+            [&prom_ring]() -> std::string {
+              using namespace pktgate::telemetry;
+              auto snap_opt = prom_ring.read_latest();
+              if (!snap_opt) return {};
+              const auto& snap = *snap_opt;
+              std::string body;
+              body.reserve(4096);
+
+              // ---- Per-port family (counter + link-up gauge) --------
+              for (std::size_t pid = 0; pid < snap.per_port.size(); ++pid) {
+                const auto& s = snap.per_port[pid];
+                std::vector<Label> lbls{{"port", std::to_string(pid)}};
+                body += format_counter("pktgate_port_rx_packets_total",
+                                       lbls, s.ipackets);
+                body += format_counter("pktgate_port_tx_packets_total",
+                                       lbls, s.opackets);
+                body += format_counter("pktgate_port_rx_bytes_total",
+                                       lbls, s.ibytes);
+                body += format_counter("pktgate_port_tx_bytes_total",
+                                       lbls, s.obytes);
+                body += format_counter("pktgate_port_rx_dropped_total",
+                                       lbls, s.imissed + s.ierrors +
+                                                s.rx_nombuf);
+                body += format_counter("pktgate_port_tx_dropped_total",
+                                       lbls, s.oerrors);
+                const std::uint8_t up =
+                    pid < snap.per_port_link_up.size()
+                        ? snap.per_port_link_up[pid]
+                        : 0u;
+                body += format_gauge("pktgate_port_link_up",
+                                     lbls,
+                                     static_cast<std::int64_t>(up));
+              }
+
+              // ---- Per-rule family ---------------------------------
+              for (const auto& r : snap.per_rule) {
+                std::vector<Label> lbls;
+                // layer label if present (2/3/4 → "l2"/"l3"/"l4").
+                if (r.layer == 2 || r.layer == 3 || r.layer == 4) {
+                  lbls.push_back(
+                      Label{"layer",
+                            std::string{"l"} + std::to_string(r.layer)});
+                }
+                lbls.push_back(format_rule_id_label(r.rule_id));
+                body += format_counter("pktgate_rule_packets_total",
+                                       lbls, r.matched_packets);
+                body += format_counter("pktgate_rule_bytes_total",
+                                       lbls, r.matched_bytes);
+                body += format_counter("pktgate_rule_drops_total",
+                                       lbls, r.drops + r.rl_drops);
+              }
+
+              // ---- Scalar per-lcore family (D31/D32/D39/D40/D20/D27/
+              // D25/D19/D16). Single aggregated lcore label for MVP;
+              // multi-worker extension will emit per-lcore later. ----
+              std::vector<Label> lc_lbls{{"lcore", "agg"}};
+              body += format_counter("pktgate_lcore_pkt_multiseg_drop_total",
+                                     lc_lbls, snap.pkt_multiseg_drop_total);
+              body += format_counter("pktgate_lcore_qinq_outer_only_total",
+                                     lc_lbls, snap.qinq_outer_only_total);
+
+              // D31 truncation buckets — one line per `where` value.
+              auto trunc_line = [&](std::string where,
+                                    std::uint64_t v) {
+                std::vector<Label> lbls{{"lcore", "agg"},
+                                        {"where", std::move(where)}};
+                body += format_counter("pktgate_lcore_pkt_truncated_total",
+                                       lbls, v);
+              };
+              trunc_line("l2",             snap.pkt_truncated_l2);
+              trunc_line("l2_vlan",        snap.pkt_truncated_l2_vlan);
+              trunc_line("l3_v4",          snap.pkt_truncated_l3_v4);
+              trunc_line("l3_v6",          snap.pkt_truncated_l3_v6);
+              trunc_line("l3_v6_frag_ext", snap.pkt_truncated_l3_v6_frag_ext);
+              trunc_line("l4",             snap.pkt_truncated_l4);
+
+              // D40 fragment rollups — `af` label.
+              auto frag_skip = [&](std::string af, std::uint64_t v) {
+                std::vector<Label> lbls{{"lcore", "agg"},
+                                        {"af", std::move(af)}};
+                body += format_counter("pktgate_lcore_pkt_frag_skipped_total",
+                                       lbls, v);
+              };
+              auto frag_drop = [&](std::string af, std::uint64_t v) {
+                std::vector<Label> lbls{{"lcore", "agg"},
+                                        {"af", std::move(af)}};
+                body += format_counter("pktgate_lcore_pkt_frag_dropped_total",
+                                       lbls, v);
+              };
+              frag_skip("v4", snap.pkt_frag_skipped_v4);
+              frag_skip("v6", snap.pkt_frag_skipped_v6);
+              frag_drop("v4", snap.pkt_frag_dropped_v4);
+              frag_drop("v6", snap.pkt_frag_dropped_v6);
+
+              // D20 / D27 IPv6 skips.
+              body += format_counter(
+                  "pktgate_lcore_l4_skipped_ipv6_extheader_total",
+                  lc_lbls, snap.l4_skipped_ipv6_extheader_total);
+              body += format_counter(
+                  "pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total",
+                  lc_lbls, snap.l4_skipped_ipv6_fragment_nonfirst_total);
+
+              // D25 backstop + D19 TAG no-op + D16 REDIRECT drop.
+              body += format_counter(
+                  "pktgate_lcore_dispatch_unreachable_total",
+                  lc_lbls, snap.dispatch_unreachable_total);
+              body += format_counter(
+                  "pktgate_lcore_tag_pcp_noop_untagged_total",
+                  lc_lbls, snap.tag_pcp_noop_untagged_total);
+              body += format_counter(
+                  "pktgate_redirect_dropped_total",
+                  /*no labels*/ std::span<const Label>{},
+                  snap.redirect_dropped_total);
+
+              // Default-action fallthrough — `action` label.
+              {
+                std::vector<Label> lbls{{"action", "allow"}};
+                body += format_counter("pktgate_default_action_total",
+                                       lbls, snap.default_action_allow_total);
+              }
+              {
+                std::vector<Label> lbls{{"action", "drop"}};
+                body += format_counter("pktgate_default_action_total",
+                                       lbls, snap.default_action_drop_total);
+              }
+
+              // ---- Reload family (counter + gauges) -----------------
+              auto reload_line = [&](std::string result,
+                                     std::uint64_t v) {
+                std::vector<Label> lbls{{"result", std::move(result)}};
+                body += format_counter("pktgate_reload_total", lbls, v);
+              };
+              reload_line("success",         snap.reload.success_total);
+              reload_line("parse_error",     snap.reload.parse_error_total);
+              reload_line("validate_error",  snap.reload.validate_error_total);
+              reload_line("compile_error",   snap.reload.compile_error_total);
+              reload_line("build_eal_error", snap.reload.build_eal_error_total);
+              reload_line("timeout",         snap.reload.timeout_total);
+              reload_line("internal_error",  snap.reload.internal_error_total);
+
+              body += format_gauge(
+                  "pktgate_reload_latency_seconds",
+                  std::span<const Label>{},
+                  snap.reload.latency_seconds_last);
+              body += format_gauge(
+                  "pktgate_reload_pending_free_depth",
+                  std::span<const Label>{},
+                  static_cast<std::int64_t>(snap.reload.pending_free_depth));
+              body += format_gauge(
+                  "pktgate_active_generation",
+                  std::span<const Label>{},
+                  static_cast<std::int64_t>(snap.reload.active_generation));
+
+              // Active ruleset rule counts by layer.
+              auto active_rules_line = [&](std::string layer,
+                                           std::uint64_t v) {
+                std::vector<Label> lbls{{"layer", std::move(layer)}};
+                body += format_gauge(
+                    "pktgate_active_rules", lbls,
+                    static_cast<std::int64_t>(v));
+              };
+              active_rules_line("l2", snap.active_rules.l2);
+              active_rules_line("l3", snap.active_rules.l3);
+              active_rules_line("l4", snap.active_rules.l4);
+
+              return body;
+            },
+            &err)) {
+      log_json(std::string{"{\"error\":\"prom_http_start_failed\",\"reason\":\""}
+               + err + "\"}");
+      // Non-fatal: continue without /metrics. F5 / F2 tests don't
+      // need scrape to pass.
+    } else {
+      log_json(std::string{"{\"event\":\"prom_endpoint_ready\",\"port\":"}
+               + std::to_string(prom_http.bound_port()) + "}");
+    }
+  }
+
+  // ---- Phase 7: launch worker(s) ----
+  //
+  // M3: single worker on the first available worker lcore.
+  // M10 C4: worker_ctx already declared + populated above (before the
+  // publisher). Nothing else to initialise here.
 
   unsigned worker_lcore = RTE_MAX_LCORE;
   unsigned count = 0;
