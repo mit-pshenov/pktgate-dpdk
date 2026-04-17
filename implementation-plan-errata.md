@@ -654,7 +654,7 @@ tests at each end construct the runtime struct directly and never
 notice the gap. Only an end-to-end pipeline smoke (F5 functional,
 real worker + real reload) surfaces it.
 
-*Origin: M8 C5 `TBD-commit` 2026-04-17 → worker fixed in-cycle
+*Origin: M8 C5 `3e8d6fe` 2026-04-17 → worker fixed in-cycle
 rather than STOP+report; fix is correct (textbook RCU reader) but
 the D41-class find warrants erratum for future milestones'
 pipeline-smoke guardrails.*
