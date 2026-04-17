@@ -74,6 +74,19 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   rs.n_l3_rules = copy_actions(rs.l3_actions, cap, cr.l3_actions);
   rs.n_l4_rules = copy_actions(rs.l4_actions, cap, cr.l4_actions);
 
+  // ---- Rate-limit action arena (M9 C2) ----
+  //
+  // Sized to `cap` (same capacity as l{2,3,4}_actions so every rule
+  // can in principle carry an RL verb). C2 ships allocation + zero-
+  // init; C3 fills `rl_actions[i] = {rule_id, rate, burst}` from
+  // `CompiledAction`. Value-initialised via new[](): rule_id=0 in
+  // every slot is safe — the hot path only dereferences entries
+  // whose `rl_index` the compiler set, and those are always below
+  // `n_rl_actions` (populated by C3).
+  rs.rl_actions_capacity = cap;
+  rs.rl_actions = new RlAction[cap]();
+  rs.n_rl_actions = 0;  // C3 will populate.
+
   // ---- Per-lcore counter rows (§4.3, D3) ----
   //
   // n_rules_total = rules_per_layer_max * 3. Each lcore gets a
@@ -196,6 +209,17 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   rs.n_l2_rules = copy_actions(rs.l2_actions, cap, cr.l2_actions);
   rs.n_l3_rules = copy_actions(rs.l3_actions, cap, cr.l3_actions);
   rs.n_l4_rules = copy_actions(rs.l4_actions, cap, cr.l4_actions);
+
+  // ---- Rate-limit action arena (M9 C2, D23) ----
+  //
+  // Allocator-aware build path mirrors the zero-arg overload above —
+  // cap-sized array, zero-initialised, C3 fills. Uses alloc.allocate
+  // so the deallocator path (free_fn) handles the release symmetrically.
+  rs.rl_actions_capacity = cap;
+  const auto rl_bytes = cap * sizeof(RlAction);
+  rs.rl_actions = static_cast<RlAction*>(
+      alloc.allocate(rl_bytes, alignof(RlAction), socket_id, alloc.ctx));
+  rs.n_rl_actions = 0;
 
   // ---- Per-lcore counter rows (§4.3, D3, D23) ----
   const std::uint32_t total_slots = 3u * cap;

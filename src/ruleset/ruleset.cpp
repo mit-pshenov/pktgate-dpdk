@@ -32,12 +32,16 @@ Ruleset::~Ruleset() {
     if (l2_actions) free_fn(l2_actions, free_ctx);
     if (l3_actions) free_fn(l3_actions, free_ctx);
     if (l4_actions) free_fn(l4_actions, free_ctx);
+    if (rl_actions) free_fn(rl_actions, free_ctx);
     if (counters) free_fn(counters, free_ctx);
   } else {
     // C9 standard path — ::operator new / delete.
     delete[] l2_actions;
     delete[] l3_actions;
     delete[] l4_actions;
+    // M9 C2: rl_actions always new[]-allocated on the no-custom-allocator
+    // path (mirrors l{2,3,4}_actions — small, host-heap is fine).
+    delete[] rl_actions;
     if (counters) {
       ::operator delete(counters, std::align_val_t{64});
     }
@@ -65,6 +69,9 @@ Ruleset::Ruleset(Ruleset&& other) noexcept
       l4_compound_entries(other.l4_compound_entries),
       l4_compound_count(other.l4_compound_count),
       eal_owned(other.eal_owned),
+      rl_actions(other.rl_actions),
+      rl_actions_capacity(other.rl_actions_capacity),
+      n_rl_actions(other.n_rl_actions),
       default_action(other.default_action),
       fragment_policy(other.fragment_policy),
       generation(other.generation),
@@ -87,6 +94,9 @@ Ruleset::Ruleset(Ruleset&& other) noexcept
   other.l2_compound_entries = nullptr;
   other.l3_compound_entries = nullptr;
   other.l4_compound_entries = nullptr;
+  other.rl_actions = nullptr;
+  other.rl_actions_capacity = 0;
+  other.n_rl_actions = 0;
   other.eal_owned = false;
   other.eal_deleter = nullptr;
 }
@@ -107,11 +117,13 @@ Ruleset& Ruleset::operator=(Ruleset&& other) noexcept {
       if (l2_actions) free_fn(l2_actions, free_ctx);
       if (l3_actions) free_fn(l3_actions, free_ctx);
       if (l4_actions) free_fn(l4_actions, free_ctx);
+      if (rl_actions) free_fn(rl_actions, free_ctx);
       if (counters) free_fn(counters, free_ctx);
     } else {
       delete[] l2_actions;
       delete[] l3_actions;
       delete[] l4_actions;
+      delete[] rl_actions;
       if (counters) {
         ::operator delete(counters, std::align_val_t{64});
       }
@@ -138,6 +150,9 @@ Ruleset& Ruleset::operator=(Ruleset&& other) noexcept {
     l4_compound_entries = other.l4_compound_entries;
     l4_compound_count = other.l4_compound_count;
     eal_owned = other.eal_owned;
+    rl_actions = other.rl_actions;
+    rl_actions_capacity = other.rl_actions_capacity;
+    n_rl_actions = other.n_rl_actions;
     default_action = other.default_action;
     fragment_policy = other.fragment_policy;
     generation = other.generation;
@@ -161,6 +176,9 @@ Ruleset& Ruleset::operator=(Ruleset&& other) noexcept {
     other.l2_compound_entries = nullptr;
     other.l3_compound_entries = nullptr;
     other.l4_compound_entries = nullptr;
+    other.rl_actions = nullptr;
+    other.rl_actions_capacity = 0;
+    other.n_rl_actions = 0;
     other.eal_owned = false;
     other.eal_deleter = nullptr;
   }

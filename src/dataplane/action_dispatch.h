@@ -44,12 +44,16 @@
 #include <cstdint>
 
 #include <rte_config.h>
+#include <rte_cycles.h>
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 
 #include "src/action/action.h"
 #include "src/compiler/compiler.h"
 #include "src/dataplane/worker.h"
+#include "src/rl_arena/arena.h"
+#include "src/rl_arena/rl_arena.h"
 #include "src/ruleset/ruleset.h"
 
 namespace pktgate::dataplane {
@@ -364,17 +368,79 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       rte_pktmbuf_free(m);
       return;
 
-    case compiler::ActionVerb::kRateLimit:
-      // M9 plugs the real per-lcore token bucket. MVP stub = always
-      // allow, so the packet flows through to TX. §M7 plan line
-      // "RL stub → treat as ALLOW for MVP".
-      {
+    case compiler::ActionVerb::kRateLimit: {
+      // M9 C2 — real per-lcore token bucket consume.
+      //
+      // Contract:
+      //   * ctx->rl_arena is the process-lifetime arena singleton
+      //     (src/rl_arena/arena.cpp rl_arena_global()). Null in
+      //     test fixtures that don't exercise RL — fall through to a
+      //     defensive drop + dispatch_unreachable bump.
+      //   * action->rl_index is the slot index assigned at build
+      //     time (C3 wires this — C2 assumes `rl_index == slot` and
+      //     relies on the integration test to populate manually).
+      //   * rs.rl_actions[rl_index] carries {rule_id, rate, burst}.
+      //     Bounds guard: rl_index < rs.rl_actions_capacity AND
+      //     rs.rl_actions != nullptr. A misconfigured build that
+      //     left either invariant broken dispatches as unreachable.
+      //   * Hot path: NO control-plane lookup (no lookup_slot call,
+      //     no unordered_map read). Direct `rl_arena->get_row(slot)`
+      //     is a bounds-checked vector access (control-plane only
+      //     field `id_to_slot` is never touched).
+      //   * D1 sacred: `rl_consume` mutates a single per-lcore slot
+      //     `row.per_lcore[lcore_id]`. Zero atomics, zero RMW.
+      //   * D34: the math layer clamps `elapsed` at `tsc_hz` before
+      //     the multiply (see src/rl_arena/rl_arena.cpp) — worker
+      //     passes the cached `ctx->tsc_hz` populated at init.
+      //
+      // TODO(M9 C3): guarantee `rl_index == arena.alloc_slot(rule_id)`
+      // invariant from the compiler/builder. C2 test populates
+      // rl_actions manually and assumes the invariant holds.
+      if (ctx->rl_arena == nullptr ||
+          action->rl_index >= rs.rl_actions_capacity ||
+          rs.rl_actions == nullptr) {
+        ctx->dispatch_unreachable_total++;
+        rte_pktmbuf_free(m);
+        return;
+      }
+
+      const auto& rl = rs.rl_actions[action->rl_index];
+      auto& row = ctx->rl_arena->get_row(action->rl_index);
+      const unsigned lcore_id = rte_lcore_id();
+      // `rte_lcore_id()` returns LCORE_ID_ANY (0x7FFFFFFF) for threads
+      // not registered with EAL — any such caller (e.g. a mis-written
+      // test thread) would out-of-bounds index the per-lcore array.
+      // Drop defensively.
+      if (lcore_id >= rl_arena::kMaxLcores) {
+        ctx->dispatch_unreachable_total++;
+        rte_pktmbuf_free(m);
+        return;
+      }
+
+      // Divisor: active-lcore count from the Ruleset. Clamp to 1 so
+      // a degenerate `num_lcores == 0` (test fixtures) does not
+      // divide-by-zero. Production paths always have num_lcores >= 1.
+      const unsigned n_active = (rs.num_lcores == 0) ? 1u : rs.num_lcores;
+
+      const bool pass = rl_arena::rl_consume(
+          row.per_lcore[lcore_id],
+          /*now_tsc=*/rte_rdtsc(),
+          /*tsc_hz=*/ctx->tsc_hz,
+          /*pkt_len=*/rte_pktmbuf_pkt_len(m),
+          /*rate=*/rl.rate_bps,
+          /*burst=*/rl.burst_bytes,
+          /*n_lcores=*/n_active);
+
+      if (pass) {
         const std::uint16_t sent = tx_one(ctx, ctx->tx_port_id, m);
         if (sent == 0) {
           rte_pktmbuf_free(m);
         }
+      } else {
+        rte_pktmbuf_free(m);
       }
       return;
+    }
 
     case compiler::ActionVerb::kTag:
       // M7 C1 — D19 TAG semantics. Rewrite DSCP / PCP, then fall through

@@ -91,3 +91,14 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_rl_ctl
 )
+
+# M9 C2: U5.8 extension — TSAN runtime race-free harness. Two threads
+# consuming disjoint per_lcore[] slots of the same RlRow. D1 isolation
+# is asserted dynamically under dev-tsan (halts on race) and statically
+# under dev-asan (pass, same as the unit tier).
+pktgate_add_test(
+  NAME    unit.test_rl_arena_tsan
+  SOURCES test_rl_arena_tsan.cpp
+  LABELS  unit
+  LINK    pktgate_rl_ctl
+)

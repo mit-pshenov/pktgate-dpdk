@@ -196,7 +196,15 @@ if(NOT PKTGATE_FUZZ)
     src/ruleset/builder_eal.cpp
   )
   target_include_directories(pktgate_dp PUBLIC ${CMAKE_SOURCE_DIR})
-  target_link_libraries(pktgate_dp PUBLIC PkgConfig::DPDK pktgate_core)
+  # M9 C2: action_dispatch's kRateLimit verb arm references the
+  # RateLimitArena and the rl_consume math function. pktgate_rl_ctl
+  # (control-plane arena) transitively brings in pktgate_rl (math) via
+  # its PUBLIC link. U5.8 / U5.9 invariants still hold: those tests
+  # grep libpktgate_rl.a — NOT libpktgate_dp.a — so bringing
+  # unordered_map symbols into pktgate_dp does not violate the
+  # hot-path-zero-atomic invariant on the math archive.
+  target_link_libraries(pktgate_dp PUBLIC
+      PkgConfig::DPDK pktgate_core pktgate_rl_ctl)
   pktgate_apply_warnings(pktgate_dp)
   pktgate_apply_sanitizer(pktgate_dp)
 endif()

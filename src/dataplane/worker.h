@@ -27,6 +27,15 @@ struct rte_rcu_qsbr;
 #include "src/dataplane/classify_l4.h"  // ClassifyL4Verdict, L4TruncCtrs (M6 C0)
 #include "src/ruleset/ruleset.h"
 
+// M9 C2 — forward-declare the rate-limit arena class. The full
+// definition lives in src/rl_arena/arena.h (libpktgate_rl_ctl). Worker
+// keeps a pointer; action_dispatch dereferences it when handling the
+// kRateLimit verb. Pointer is stable for the process lifetime (arena
+// outlives every Ruleset — D10) so no per-burst refresh is needed.
+namespace pktgate::rl_arena {
+class RateLimitArena;
+}
+
 namespace pktgate::dataplane {
 
 // M7 C0: TX burst hook signature. Matches rte_eth_tx_burst so the
@@ -144,6 +153,24 @@ struct WorkerCtx {
   // implementation MAY use a different counter but spec allows the
   // shared counter so long as no overflow occurs).
   std::uint64_t redirect_dropped_total = 0;
+
+  // M9 C2 — rate-limit arena handle. Stable pointer for the entire
+  // worker lifetime; the arena lives outside the Ruleset (D10) and
+  // outlives every reload. action_dispatch reads
+  // `rl_arena->get_row(action->rl_index).per_lcore[lcore_id]` on the
+  // kRateLimit verb arm — per-lcore isolation guarantees D1 zero-
+  // atomics with no cross-thread sharing of bucket state.
+  //
+  // Null in unit-test WorkerCtx fixtures that do not exercise the
+  // RL path; action_dispatch guards the pointer and falls through to
+  // a defensive drop if the RL verb fires without an arena configured.
+  pktgate::rl_arena::RateLimitArena* rl_arena = nullptr;
+
+  // M9 C2 — cached TSC frequency. Populated once at worker init from
+  // `rte_get_tsc_hz()`; re-read per packet would be wasteful (some
+  // kernels implement the DPDK helper over a kernel call the first
+  // time). Used by action_dispatch::rl_consume.
+  std::uint64_t tsc_hz = 0;
 
   // M8 C4 — D12 TSAN-visible handshake.
   //

@@ -107,4 +107,31 @@ class RateLimitArena {
   std::unordered_map<std::uint64_t, std::uint16_t> id_to_slot_;
 };
 
+// ---- Process-wide singleton (M9 C2) --------------------------------------
+//
+// The arena must outlive every Ruleset — per D10 it lives OUTSIDE the
+// Ruleset so hot-reloads never destroy bucket state. M9 C2 picks the
+// "module-local static" singleton option documented in the M9 handoff
+// (§Pre-existing, option (a)) over a field on a ControlPlaneState
+// singleton (option (b)) because no such class exists yet in M8 —
+// reload.cpp uses free functions. When C3 / M10 introduce a richer
+// control-plane object, this accessor can become a thin wrapper over
+// `ControlPlaneState::instance().rl_arena()` without disturbing worker
+// call sites.
+//
+// Default size: 4096 slots (the design-doc prod target; dev budgets
+// are smaller but this is a cold allocation of ~128 * 64 * 4096 ≈
+// 32 MiB of row storage — acceptable on the dev VM, and the row
+// memory stays mapped-but-cold for unused slots). A future cycle can
+// replace the hardcoded constant by taking size from `sizing::Config`
+// through an init call.
+//
+// Thread-safety: the first call constructs the arena under C++11 local-
+// static once-init semantics. Subsequent calls return the same
+// reference. Concurrent control-plane callers (reload mutex holders)
+// mutate `id_to_slot_` / `slot_live_` under the reload_mutex funnel
+// (D35); workers never touch those control-plane fields (U5.9), only
+// `rows_[slot].per_lcore[lcore_id]` — which is D1 per-lcore-isolated.
+RateLimitArena& rl_arena_global();
+
 }  // namespace pktgate::rl_arena

@@ -35,6 +35,33 @@ struct rte_fib6;
 namespace pktgate::ruleset {
 
 // -------------------------------------------------------------------------
+// RlAction — per-rule rate-limit parameters (M9 C2).
+//
+// The hot path reads `rs.rl_actions[action->rl_index]` to recover the
+// rate + burst for a matched RL rule, then calls the arena's per-lcore
+// bucket math. `rule_id` is kept alongside so the M9 C4 GC diff can
+// walk `rs_old.rl_actions[*].rule_id` without cross-referencing the
+// action arena — keeps the D11 GC pass self-contained.
+//
+// Layout: 24 B. No alignment contract — the array is control-plane
+// storage; the hot path reads ONE entry per RL hit, well inside L1.
+//
+// Design anchors:
+//   * D10 — arena outside Ruleset; rl_actions IS inside Ruleset (it's
+//           the per-ruleset rate/burst config snapshot). The arena
+//           (bucket state) is the thing that must survive reload.
+//   * §4.4 — two-level mapping: `rl_actions[index] → {rate, burst,
+//           rule_id}`; `rl_arena: rule_id → per-lcore bucket row`.
+
+struct RlAction {
+  std::uint64_t rule_id     = 0;
+  std::uint64_t rate_bps    = 0;
+  std::uint64_t burst_bytes = 0;
+};
+
+static_assert(sizeof(RlAction) == 24, "RlAction layout drift (M9 C2)");
+
+// -------------------------------------------------------------------------
 // RuleCounter — per-rule per-lcore counter row (§4.3).
 //
 // Exactly one cache line (64 B). Each RuleCounter is written only by
@@ -120,6 +147,21 @@ struct Ruleset {
   // Set when `populate_ruleset_eal` opened the DPDK handles, so the
   // destructor knows whether to call rte_hash_free / rte_fib_free.
   bool eal_owned = false;
+
+  // ---- Rate-limit action arena (M9 C2) ----
+  //
+  // Per-rule rate/burst config indexed by `action::RuleAction::rl_index`.
+  // C2 ships the field + hot-path read; C3 wires the compiler to fill
+  // it (currently always zero-initialised by the builder — the M9 C2
+  // integration test populates it manually). Slot index is assigned
+  // by `rl_arena::RateLimitArena::alloc_slot(rule_id)` at publish time;
+  // C3's job is to pass that slot through CompiledAction → RuleAction.
+  //
+  // Lifetime: owned by the Ruleset, freed alongside the action arenas
+  // in ~Ruleset. The arena (bucket state) lives OUTSIDE (see D10).
+  RlAction* rl_actions = nullptr;
+  std::uint32_t rl_actions_capacity = 0;
+  std::uint32_t n_rl_actions = 0;
 
   // ---- Default behavior / fragment policy ----
   std::uint8_t default_action = 0;   // ALLOW or DROP

@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include <rte_cycles.h>  // M9 C2 — rte_get_tsc_hz for WorkerCtx cache
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
@@ -36,6 +37,7 @@
 #include "src/dataplane/worker.h"
 #include "src/eal/dynfield.h"
 #include "src/eal/port_init.h"
+#include "src/rl_arena/arena.h"  // M9 C2 — rl_arena_global()
 #include "src/ruleset/builder.h"
 #include "src/ruleset/builder_eal.h"
 #include "src/ruleset/ruleset.h"
@@ -449,6 +451,12 @@ int main(int argc, char* argv[]) {
   // a monotonic counter over the RTE_LCORE_FOREACH_WORKER walk.
   worker_ctx.qs = qs;
   worker_ctx.qsbr_thread_id = 0;
+  // M9 C2 — rate-limit arena + cached TSC frequency. Arena is the
+  // process-wide singleton (outlives every Ruleset per D10); tsc_hz
+  // is cached once to avoid the DPDK helper's first-call cost on
+  // each packet in the RL verb path.
+  worker_ctx.rl_arena = &pktgate::rl_arena::rl_arena_global();
+  worker_ctx.tsc_hz = rte_get_tsc_hz();
 
   unsigned worker_lcore = RTE_MAX_LCORE;
   unsigned count = 0;

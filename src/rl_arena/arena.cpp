@@ -90,4 +90,18 @@ bool RateLimitArena::slot_live(std::uint16_t slot) const {
   return slot_live_[slot] != 0u;
 }
 
+// M9 C2 — process-wide singleton accessor. Module-local static: first
+// call constructs, every subsequent call returns the same reference.
+// See arena.h for the option-(a)-vs-(b) rationale.
+//
+// The default size (4096) matches the design-doc production target
+// (`sizing::Config::rules_per_layer_max` prod column). Dev tests use
+// a subset of slots; row memory for unused slots stays zero-filled
+// and cold. A future cycle can replace this with a size-from-config
+// initialiser that runs before workers launch.
+RateLimitArena& rl_arena_global() {
+  static RateLimitArena instance(/*max_rules=*/4096);
+  return instance;
+}
+
 }  // namespace pktgate::rl_arena

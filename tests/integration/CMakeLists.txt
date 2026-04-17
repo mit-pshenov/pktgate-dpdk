@@ -31,3 +31,16 @@ pktgate_add_test(
   LABELS  "integration;needs-eal"
   LINK    pktgate_dp
 )
+
+# M9 C2 — hot-path integration of the rl_arena. Drives apply_action
+# through the real RateLimit verb arm with the arena singleton, and
+# asserts per-lcore isolation on the dispatch path. Links pktgate_dp
+# (DPDK-aware) + pktgate_rl_ctl (control-plane arena singleton) —
+# pktgate_dp already links pktgate_rl_ctl transitively because the
+# RateLimit verb path pulls the arena type in from action_dispatch.
+pktgate_add_test(
+  NAME    integration.test_rl_integration
+  SOURCES test_rl_integration.cpp
+  LABELS  "integration;needs-eal"
+  LINK    pktgate_dp pktgate_rl_ctl
+)
