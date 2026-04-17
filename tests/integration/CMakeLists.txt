@@ -44,3 +44,16 @@ pktgate_add_test(
   LABELS  "integration;needs-eal"
   LINK    pktgate_dp pktgate_rl_ctl
 )
+
+# M9 C3 — compile → build roundtrip for rate-limit rules. Tests the
+# full config → CompiledAction.rl_slot → RuleAction.rl_index +
+# Ruleset::rl_actions[slot] pipeline in lockstep; see errata §M7 C2b /
+# §M8 C5 for the D41 "silent pipeline gap" class this guards against.
+# No EAL required — build_ruleset (M2 zero-arg path) is DPDK-free and
+# the arena singleton has its own storage.
+pktgate_add_test(
+  NAME    integration.test_rl_compile_build
+  SOURCES test_rl_compile_build.cpp
+  LABELS  "integration"
+  LINK    pktgate_core pktgate_rl_ctl
+)

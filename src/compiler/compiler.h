@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -103,7 +104,48 @@ struct CompiledAction {
   std::uint8_t dscp{0};
   std::uint8_t pcp{0};
   std::uint16_t redirect_port{0xFFFF};
+
+  // M9 C3 (D10, D24, D41): rate-limit fields. When verb == kRateLimit,
+  // rl_slot is the slot index obtained from the RateLimitArena via the
+  // slot allocator passed to compile() and rl_rate_bps / rl_burst_bytes
+  // are copied from config::ActionRateLimit. The builder copies these
+  // three fields through TWO independent pipelines:
+  //
+  //   1. rl_slot → action::RuleAction.rl_index (hot-path lookup handle)
+  //   2. {rule_id, rl_rate_bps, rl_burst_bytes} →
+  //      Ruleset::rl_actions[rl_slot] (per-ruleset rate/burst snapshot)
+  //
+  // Default sentinel 0xFFFF matches rl_arena::kInvalidSlot; non-RL verbs
+  // ship the sentinel unchanged so the builder can skip the rl_actions
+  // population path for them. Same D41 silent-pipeline-gap class as
+  // M7 C2b (dscp/pcp/redirect_port) and M8 C5 (RCU reader) — the whole
+  // point of carrying all three fields is that compile → build cannot
+  // silently drop any of them.
+  std::uint16_t rl_slot{0xFFFF};
+  std::uint64_t rl_rate_bps{0};
+  std::uint64_t rl_burst_bytes{0};
 };
+
+// -------------------------------------------------------------------------
+// RlSlotAllocator — M9 C3 (D10, D24): compile-time slot allocation
+// interface.
+//
+// The compiler calls this once per RateLimit rule with the rule_id as
+// u64 and stores the returned slot in `CompiledAction.rl_slot`. The
+// callable is typically a thin lambda over
+// `rl_arena::rl_arena_global().alloc_slot(id)` — that's the only place
+// the arena is referenced. Keeping the dependency as a function-pointer-
+// style callable keeps the compiler TU DPDK-free and arena-free
+// (`grabli_m4c0_dpdk_free_core_library.md`).
+//
+// A default-constructed (empty) RlSlotAllocator is the "no allocator"
+// sentinel used by all non-RL callsites (tests that never exercise RL,
+// fuzzer entry point). The compiler treats an empty callable as
+// `kInvalidSlot` for every RL rule — callers that build a Ruleset from
+// such a CompileResult never dispatch RL, so the invalid slot never
+// reaches the hot path.
+using RlSlotAllocator =
+    std::function<std::uint16_t(std::uint64_t rule_id)>;
 
 // -------------------------------------------------------------------------
 // CompileOptions — optional knobs for the compile() function.

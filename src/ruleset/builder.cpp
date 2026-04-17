@@ -38,6 +38,18 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   rs.l3_actions = new action::RuleAction[cap]();
   rs.l4_actions = new action::RuleAction[cap]();
 
+  // ---- Rate-limit action arena (M9 C2 + M9 C3) ----
+  //
+  // Sized to `cap` (same capacity as l{2,3,4}_actions so every rule
+  // can in principle carry an RL verb). Allocated + zero-init'd here;
+  // M9 C3 populates entries on the fly during copy_actions below.
+  // C2 comment preserved for history: the hot path only dereferences
+  // entries whose `rl_index` the compiler set, and those are always
+  // below `n_rl_actions` (populated during copy_actions).
+  rs.rl_actions_capacity = cap;
+  rs.rl_actions = new RlAction[cap]();
+  rs.n_rl_actions = 0;
+
   // Copy compiled actions into arenas. The compiler produces a dense
   // vector per layer; we copy into the pre-allocated arena.
   //
@@ -46,9 +58,20 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   // hardcoded. Before the retrofit these three fields stayed at
   // zero / 0xFFFF regardless of config — making TAG a no-op and
   // REDIRECT a silent drop. mirror_port stays 0xFFFF (mirror is
-  // compile-rejected in MVP, D7) and rl_index stays 0 (RL is M9).
-  auto copy_actions = [](action::RuleAction* dst, std::uint32_t dst_cap,
-                         const std::vector<compiler::CompiledAction>& src)
+  // compile-rejected in MVP, D7).
+  //
+  // M9 C3 (D10, D24, D41): rl_index comes from CompiledAction.rl_slot
+  // (filled by object_compiler::compile via the RlSlotAllocator). For
+  // every RL verb we ALSO populate Ruleset::rl_actions[slot] with the
+  // rule_id + rate + burst snapshot — the hot path reads from there.
+  // The two pipelines (RuleAction.rl_index vs Ruleset::rl_actions[])
+  // MUST stay in lockstep; this is the D41 invariant that M7 C2b and
+  // M8 C5 both broke in different ways. The RL slot is also used to
+  // bump n_rl_actions (max-slot+1 instead of a simple count, so the
+  // array stays densely indexable up to the highest live slot).
+  auto copy_actions =
+      [&rs](action::RuleAction* dst, std::uint32_t dst_cap,
+            const std::vector<compiler::CompiledAction>& src)
       -> std::uint32_t {
     const auto n = static_cast<std::uint32_t>(
         src.size() < dst_cap ? src.size() : dst_cap);
@@ -65,7 +88,27 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       d.mirror_port = 0xFFFF;
       d.dscp = s.dscp;
       d.pcp = s.pcp;
-      d.rl_index = 0;
+      d.rl_index = s.rl_slot;
+
+      // D41 lockstep: for every kRateLimit rule, populate
+      // rs.rl_actions[slot] with the rule_id + rate + burst snapshot
+      // so the hot-path lookup `rs.rl_actions[action->rl_index]` hits
+      // real data. `slot < rs.rl_actions_capacity` is guaranteed by
+      // the allocator (cap is the same on both sides). Non-RL verbs
+      // keep the sentinel 0xFFFF; we skip them here so we never
+      // overwrite rl_actions[0] unintentionally.
+      if (s.verb == compiler::ActionVerb::kRateLimit &&
+          s.rl_slot < rs.rl_actions_capacity) {
+        rs.rl_actions[s.rl_slot].rule_id =
+            static_cast<std::uint64_t>(s.rule_id);
+        rs.rl_actions[s.rl_slot].rate_bps = s.rl_rate_bps;
+        rs.rl_actions[s.rl_slot].burst_bytes = s.rl_burst_bytes;
+        const std::uint32_t live_count =
+            static_cast<std::uint32_t>(s.rl_slot) + 1u;
+        if (live_count > rs.n_rl_actions) {
+          rs.n_rl_actions = live_count;
+        }
+      }
     }
     return n;
   };
@@ -73,19 +116,6 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   rs.n_l2_rules = copy_actions(rs.l2_actions, cap, cr.l2_actions);
   rs.n_l3_rules = copy_actions(rs.l3_actions, cap, cr.l3_actions);
   rs.n_l4_rules = copy_actions(rs.l4_actions, cap, cr.l4_actions);
-
-  // ---- Rate-limit action arena (M9 C2) ----
-  //
-  // Sized to `cap` (same capacity as l{2,3,4}_actions so every rule
-  // can in principle carry an RL verb). C2 ships allocation + zero-
-  // init; C3 fills `rl_actions[i] = {rule_id, rate, burst}` from
-  // `CompiledAction`. Value-initialised via new[](): rule_id=0 in
-  // every slot is safe — the hot path only dereferences entries
-  // whose `rl_index` the compiler set, and those are always below
-  // `n_rl_actions` (populated by C3).
-  rs.rl_actions_capacity = cap;
-  rs.rl_actions = new RlAction[cap]();
-  rs.n_rl_actions = 0;  // C3 will populate.
 
   // ---- Per-lcore counter rows (§4.3, D3) ----
   //
@@ -179,12 +209,36 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   rs.l4_actions = static_cast<action::RuleAction*>(
       alloc.allocate(action_bytes, action_align, socket_id, alloc.ctx));
 
+  // ---- Rate-limit action arena (M9 C2, D23 + M9 C3 D10/D24/D41) ----
+  //
+  // Allocator-aware build path mirrors the zero-arg overload above —
+  // cap-sized array, zero-initialised. Uses alloc.allocate so the
+  // deallocator path (free_fn) handles the release symmetrically.
+  // M9 C3 populates entries during copy_actions below.
+  rs.rl_actions_capacity = cap;
+  const auto rl_bytes = cap * sizeof(RlAction);
+  rs.rl_actions = static_cast<RlAction*>(
+      alloc.allocate(rl_bytes, alignof(RlAction), socket_id, alloc.ctx));
+  // Custom allocators may not zero memory; we rely on unused slots
+  // carrying rule_id=0, rate=0, burst=0 (D41 lockstep only populates
+  // slots for live RL verbs). Default + spy allocators do zero-fill;
+  // belt-and-braces memset guarantees the invariant under any
+  // allocator implementation.
+  if (rs.rl_actions != nullptr) {
+    std::memset(rs.rl_actions, 0, rl_bytes);
+  }
+  rs.n_rl_actions = 0;
+
   // Copy compiled actions into arenas.
   //
   // M7 C2b retrofit (D41): see copy_actions in the zero-arg overload
   // above — dscp / pcp / redirect_port now come from CompiledAction.
-  auto copy_actions = [](action::RuleAction* dst, std::uint32_t dst_cap,
-                         const std::vector<compiler::CompiledAction>& src)
+  // M9 C3 (D10, D24, D41): rl_index comes from CompiledAction.rl_slot;
+  // rs.rl_actions[slot] is populated in lockstep. See the zero-arg
+  // overload above for the full rationale.
+  auto copy_actions =
+      [&rs](action::RuleAction* dst, std::uint32_t dst_cap,
+            const std::vector<compiler::CompiledAction>& src)
       -> std::uint32_t {
     const auto n = static_cast<std::uint32_t>(
         src.size() < dst_cap ? src.size() : dst_cap);
@@ -201,7 +255,20 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       d.mirror_port = 0xFFFF;
       d.dscp = s.dscp;
       d.pcp = s.pcp;
-      d.rl_index = 0;
+      d.rl_index = s.rl_slot;
+
+      if (s.verb == compiler::ActionVerb::kRateLimit &&
+          s.rl_slot < rs.rl_actions_capacity) {
+        rs.rl_actions[s.rl_slot].rule_id =
+            static_cast<std::uint64_t>(s.rule_id);
+        rs.rl_actions[s.rl_slot].rate_bps = s.rl_rate_bps;
+        rs.rl_actions[s.rl_slot].burst_bytes = s.rl_burst_bytes;
+        const std::uint32_t live_count =
+            static_cast<std::uint32_t>(s.rl_slot) + 1u;
+        if (live_count > rs.n_rl_actions) {
+          rs.n_rl_actions = live_count;
+        }
+      }
     }
     return n;
   };
@@ -209,17 +276,6 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   rs.n_l2_rules = copy_actions(rs.l2_actions, cap, cr.l2_actions);
   rs.n_l3_rules = copy_actions(rs.l3_actions, cap, cr.l3_actions);
   rs.n_l4_rules = copy_actions(rs.l4_actions, cap, cr.l4_actions);
-
-  // ---- Rate-limit action arena (M9 C2, D23) ----
-  //
-  // Allocator-aware build path mirrors the zero-arg overload above —
-  // cap-sized array, zero-initialised, C3 fills. Uses alloc.allocate
-  // so the deallocator path (free_fn) handles the release symmetrically.
-  rs.rl_actions_capacity = cap;
-  const auto rl_bytes = cap * sizeof(RlAction);
-  rs.rl_actions = static_cast<RlAction*>(
-      alloc.allocate(rl_bytes, alignof(RlAction), socket_id, alloc.ctx));
-  rs.n_rl_actions = 0;
 
   // ---- Per-lcore counter rows (§4.3, D3, D23) ----
   const std::uint32_t total_slots = 3u * cap;

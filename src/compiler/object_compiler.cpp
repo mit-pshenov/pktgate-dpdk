@@ -73,6 +73,13 @@ struct ActionLowered {
   std::uint8_t dscp{0};
   std::uint8_t pcp{0};
   std::uint16_t redirect_port{0xFFFF};
+  // M9 C3 (D10, D24, D41): rate-limit payload. Filled for kRateLimit
+  // by resolve_action; the builder copies these through to
+  // Ruleset::rl_actions[] + RuleAction.rl_index. Default values match
+  // the "not a rate-limit verb" case so the compiler never lies about
+  // an RL rule by silently shipping zeros.
+  std::uint64_t rl_rate_bps{0};
+  std::uint64_t rl_burst_bytes{0};
 };
 
 static std::uint16_t resolve_role_idx(
@@ -99,6 +106,14 @@ static ActionLowered resolve_action(
           out.verb = ActionVerb::kDrop;
         } else if constexpr (std::is_same_v<T, config::ActionRateLimit>) {
           out.verb = ActionVerb::kRateLimit;
+          // M9 C3 (D41): carry rate / burst through the compiler TU so
+          // the builder can populate `Ruleset::rl_actions[slot]`
+          // without re-reading the config AST. This is the "left end"
+          // of the compiler→builder roundtrip — the "right end" is
+          // CompiledAction.rl_slot filled by the rl_alloc callable at
+          // the compile_layer call site below.
+          out.rl_rate_bps = a.bytes_per_sec;
+          out.rl_burst_bytes = a.burst_bytes;
         } else if constexpr (std::is_same_v<T, config::ActionTag>) {
           out.verb = ActionVerb::kTag;
           // ActionTag stores signed fields with -1 = "unset". The
@@ -130,7 +145,8 @@ static ActionLowered resolve_action(
 // compile — full pipeline.
 
 CompileResult compile(const config::Config& cfg,
-                      const CompileOptions& opts) {
+                      const CompileOptions& opts,
+                      const RlSlotAllocator& rl_alloc) {
   CompileResult result;
 
   // Phase 1: compile objects
@@ -153,9 +169,10 @@ CompileResult compile(const config::Config& cfg,
   const auto& roles = cfg.interface_roles;
 
   auto compile_layer =
-      [hw_enabled, &roles](const std::vector<config::Rule>& rules, Layer layer,
-         std::vector<CompiledAction>& actions,
-         std::vector<CompiledRuleEntry>& entries) {
+      [hw_enabled, &roles, &rl_alloc](
+          const std::vector<config::Rule>& rules, Layer layer,
+          std::vector<CompiledAction>& actions,
+          std::vector<CompiledRuleEntry>& entries) {
         std::uint16_t slot = 0;
 
         for (const auto& rule : rules) {
@@ -174,6 +191,29 @@ CompileResult compile(const config::Config& cfg,
             action.dscp = lowered.dscp;
             action.pcp = lowered.pcp;
             action.redirect_port = lowered.redirect_port;
+
+            // M9 C3 (D10, D24, D41): for kRateLimit verbs, obtain a
+            // slot via the caller-provided allocator. The allocator
+            // owns the bridge to `rl_arena::RateLimitArena::alloc_slot`
+            // — we never touch the arena here (keeps this TU DPDK-
+            // free). When the allocator is empty (default in non-RL
+            // callsites and tests), rl_slot stays at kInvalidSlot
+            // (0xFFFF) and rate/burst stay at 0; such a CompileResult
+            // must not be shipped to a worker that could hit this
+            // rule — it would dispatch-unreachable. The roundtrip
+            // test in C3 wires a real allocator; unit tests for
+            // unrelated verbs keep passing unchanged.
+            if (action.verb == ActionVerb::kRateLimit) {
+              action.rl_rate_bps = lowered.rl_rate_bps;
+              action.rl_burst_bytes = lowered.rl_burst_bytes;
+              if (rl_alloc) {
+                action.rl_slot = rl_alloc(
+                    static_cast<std::uint64_t>(rule.id));
+              }
+              // else: leave rl_slot at the CompiledAction default
+              // (0xFFFF == kInvalidSlot). Callers that care (reload
+              // deploy path) always wire an allocator.
+            }
           } else {
             action.verb = ActionVerb::kDrop;
           }

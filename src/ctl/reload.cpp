@@ -37,6 +37,7 @@
 #include "src/config/parser.h"
 #include "src/config/sizing.h"
 #include "src/config/validator.h"
+#include "src/rl_arena/arena.h"
 #include "src/runtime/arena_gc.h"
 #include "src/ruleset/builder.h"
 #include "src/ruleset/builder_eal.h"
@@ -379,7 +380,19 @@ DeployResult deploy_locked(std::string_view config_json) {
   }
 
   // ---- 3. Compile ------------------------------------------------------
-  compiler::CompileResult cr = compiler::compile(cfg);
+  //
+  // M9 C3 (D10, D24, D41): wire the process-wide RateLimit arena's
+  // slot allocator into the compiler. Every kRateLimit rule gets a
+  // stable slot (survives reload) recorded in CompiledAction.rl_slot;
+  // the builder below copies it into RuleAction.rl_index AND
+  // Ruleset::rl_actions[slot]. The allocator captures
+  // `rl_arena_global()` by reference; deploy_locked is called under
+  // `reload_mutex` (D35) so concurrent alloc_slot calls are impossible.
+  compiler::RlSlotAllocator rl_alloc =
+      [&](std::uint64_t rule_id) -> std::uint16_t {
+    return rl_arena::rl_arena_global().alloc_slot(rule_id);
+  };
+  compiler::CompileResult cr = compiler::compile(cfg, /*opts=*/{}, rl_alloc);
   if (cr.error) {
     out.ok = false;
     out.kind = DeployError::kCompile;
