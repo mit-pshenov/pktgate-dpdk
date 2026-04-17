@@ -181,7 +181,20 @@ void drain_pending_free_locked() {
       // THIS entry — the whole point of the pending_free queue is
       // that we arrive here AFTER rte_rcu_qsbr_check confirms the
       // readers have all reported quiescent.
-      if (e.rs != nullptr) pktgate::runtime::rl_arena_gc(e.rs);
+      //
+      // rs_new for the drain path = the CURRENT live ruleset (the
+      // one that replaced `e.rs` — possibly via several successful
+      // reloads since `e.rs` was parked). Rule_ids that SURVIVED
+      // into the current active ruleset must NOT have their arena
+      // slots freed — the rate-limit buckets they point at are live
+      // on the hot path. Reading `g_active` here is safe: the drain
+      // runs under reload_mutex (D35) so no concurrent exchange can
+      // race. On shutdown, g_active has already been set to nullptr
+      // by the caller's step 1 — the shutdown drain loop passes
+      // nullptr explicitly (separate call site below).
+      ruleset::Ruleset* const rs_new_live =
+          g_.g_active.load(std::memory_order_acquire);
+      if (e.rs != nullptr) pktgate::runtime::rl_arena_gc(e.rs, rs_new_live);
       do_free_ruleset_locked(e.rs);
       freed_any = true;
       // drop the slot (do not copy forward)
@@ -468,11 +481,20 @@ DeployResult deploy_locked(std::string_view config_json) {
   // D11 ordering invariant: synchronize has confirmed every worker
   // that observed rs_old has reported quiescent, so it is now safe
   // to walk rs_old's arena slots / zero counter rows / push slot
-  // indices back on the free list. M8 body is a no-op stub; M9 C5
-  // fills it. See src/runtime/arena_gc.h.
+  // indices back on the free list. M9 C4 fills the body; M8 C5
+  // wired this call site. See src/runtime/arena_gc.h.
+  //
+  // rs_new is the freshly-published ruleset — read back from
+  // g_active under the reload_mutex so we don't have to retain the
+  // unique_ptr we moved into the exchange above. Rule_ids shared
+  // between rs_old and rs_new must NOT have their arena slots
+  // freed; rule_ids only in rs_old are the GC targets.
   //
   // Null-guard: first-ever deploy has no predecessor; nothing to GC.
-  if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
+  ruleset::Ruleset* const rs_new_active =
+      g_.g_active.load(std::memory_order_acquire);
+  if (rs_old != nullptr)
+    pktgate::runtime::rl_arena_gc(rs_old, rs_new_active);
   do_free_ruleset_locked(rs_old);
 
   // ---- 9. Bookkeeping -------------------------------------------
@@ -537,8 +559,11 @@ void shutdown() {
       const int ok = wait_for_quiescent(qs, tok, deadline,
                                         g_.params.poll_interval);
       if (ok == 1) {
-        // D11 arena GC (stub; M9 fills). See deploy_locked step 8.
-        if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
+        // D11 arena GC (M9 C4 body). See deploy_locked step 8.
+        // Shutdown: rs_new == nullptr — process is going away, free
+        // every live rl_arena slot rs_old owns.
+        if (rs_old != nullptr)
+          pktgate::runtime::rl_arena_gc(rs_old, nullptr);
         do_free_ruleset_locked(rs_old);
       } else {
         // Deadline expired (worker died mid-flight, or somebody forgot
@@ -552,7 +577,9 @@ void shutdown() {
     } else {
       // No QSBR — caller guarantees no concurrent readers.
       // D11 arena GC fires regardless of the synchronize path.
-      if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
+      // Shutdown: rs_new == nullptr — free every live slot.
+      if (rs_old != nullptr)
+        pktgate::runtime::rl_arena_gc(rs_old, nullptr);
       do_free_ruleset_locked(rs_old);
     }
   }
@@ -560,9 +587,10 @@ void shutdown() {
   // C3 D36 — drain pending_free entries. After the synchronize above
   // every previously-queued token has necessarily expired (grace
   // period is cumulative), so we can free unconditionally.
+  // Shutdown drain: rs_new == nullptr — process is going away.
   for (std::size_t i = 0; i < g_.pending_depth; ++i) {
     auto* p = g_.pending_free[i].rs;
-    if (p != nullptr) pktgate::runtime::rl_arena_gc(p);
+    if (p != nullptr) pktgate::runtime::rl_arena_gc(p, nullptr);
     do_free_ruleset_locked(p);
     g_.pending_free[i] = PendingEntry{};
   }
@@ -640,10 +668,17 @@ DeployResult deploy_prebuilt(std::unique_ptr<ruleset::Ruleset> rs) {
     return out;
   }
 
-  // D11 arena GC (stub; M9 fills). See deploy_locked step 8.
+  // D11 arena GC (M9 C4 body). See deploy_locked step 8.
+  // rs_new = the freshly-published ruleset, read back from g_active
+  // (we moved the unique_ptr into the exchange above). Under
+  // reload_mutex the load is stable.
+  //
   // Null-guard: first-ever deploy has no predecessor and there is
   // nothing to GC; do_free_ruleset_locked tolerates nullptr too.
-  if (rs_old != nullptr) pktgate::runtime::rl_arena_gc(rs_old);
+  ruleset::Ruleset* const rs_new_active =
+      g_.g_active.load(std::memory_order_acquire);
+  if (rs_old != nullptr)
+    pktgate::runtime::rl_arena_gc(rs_old, rs_new_active);
   do_free_ruleset_locked(rs_old);
 
   ++g_.counters.success;

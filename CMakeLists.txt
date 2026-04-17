@@ -178,6 +178,25 @@ target_link_libraries(pktgate_rl_ctl PUBLIC pktgate_rl)
 pktgate_apply_warnings(pktgate_rl_ctl)
 pktgate_apply_sanitizer(pktgate_rl_ctl)
 
+# ---- libpktgate_runtime (M9 C4) — DPDK-free runtime helpers --------------
+#
+# Home for TUs that participate in the reload/runtime lifecycle but do
+# NOT require DPDK headers or EAL init. M9 C4 seeds this with arena_gc
+# (the D11 rl_arena GC body) so unit tests can exercise the GC against
+# the arena singleton without linking DPDK or running rte_eal_init.
+#
+# Layering: depends on pktgate_core (Ruleset definition) + pktgate_rl_ctl
+# (RateLimitArena singleton). Consumed by pktgate_dp (call sites in
+# src/ctl/reload.cpp invoke rl_arena_gc from inside the EAL-backed
+# reload pipeline).
+add_library(pktgate_runtime STATIC
+  src/runtime/arena_gc.cpp
+)
+target_include_directories(pktgate_runtime PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(pktgate_runtime PUBLIC pktgate_core pktgate_rl_ctl)
+pktgate_apply_warnings(pktgate_runtime)
+pktgate_apply_sanitizer(pktgate_runtime)
+
 # ---- libpktgate_dp (M3) — DPDK-dependent dataplane library ---------------
 #
 # Modules that require DPDK headers at compile time and rte_eal_init() at
@@ -192,7 +211,6 @@ if(NOT PKTGATE_FUZZ)
     src/ctl/cmd_socket.cpp
     src/ctl/reload.cpp
     src/ctl/telemetry_reload.cpp
-    src/runtime/arena_gc.cpp
     src/ruleset/builder_eal.cpp
   )
   target_include_directories(pktgate_dp PUBLIC ${CMAKE_SOURCE_DIR})
@@ -204,7 +222,7 @@ if(NOT PKTGATE_FUZZ)
   # unordered_map symbols into pktgate_dp does not violate the
   # hot-path-zero-atomic invariant on the math archive.
   target_link_libraries(pktgate_dp PUBLIC
-      PkgConfig::DPDK pktgate_core pktgate_rl_ctl)
+      PkgConfig::DPDK pktgate_core pktgate_rl_ctl pktgate_runtime)
   pktgate_apply_warnings(pktgate_dp)
   pktgate_apply_sanitizer(pktgate_dp)
 endif()

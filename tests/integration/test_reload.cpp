@@ -42,6 +42,8 @@
 #include "src/ctl/cmd_socket.h"
 #include "src/ctl/reload.h"
 #include "src/ctl/telemetry_reload.h"
+#include "src/rl_arena/arena.h"
+#include "src/rl_arena/rl_arena.h"
 #include "src/runtime/arena_gc.h"
 #include "src/ruleset/ruleset.h"
 
@@ -1439,11 +1441,15 @@ TEST_F(ReloadManagerFixture, ArenaGcHookCalled) {
   std::atomic<ruleset::Ruleset*>      last_seen{nullptr};
 
   runtime::set_arena_gc_hook_for_test(
-      [&](ruleset::Ruleset* rs) {
-        // Record pointer and bump. Must tolerate null (first-ever
-        // shutdown would pass nullptr; here we seed with rs1 so
-        // the hook always sees a non-null pointer).
-        last_seen.store(rs, std::memory_order_release);
+      [&](ruleset::Ruleset* rs_old, ruleset::Ruleset* /*rs_new*/) {
+        // Record rs_old pointer and bump. Must tolerate null (first-
+        // ever shutdown would pass nullptr; here we seed with rs1 so
+        // the hook always sees a non-null pointer). rs_new is
+        // intentionally ignored — ArenaGcHookCalled pins the ORDERING
+        // invariant (hook fires after synchronize, before delete) +
+        // the pass-through of rs_old; M9 C4 signature cascade added
+        // the second arg but this test doesn't need to inspect it.
+        last_seen.store(rs_old, std::memory_order_release);
         fire_count.fetch_add(1, std::memory_order_acq_rel);
       });
 
@@ -1542,6 +1548,170 @@ TEST_F(CmdSocketStormFixture, X1_3_ConcurrentTwoWay) {
   EXPECT_EQ(c.build_eal_error, 0u);
   EXPECT_EQ(c.timeout, 0u);
   EXPECT_EQ(c.internal_error, 0u);
+}
+
+// =========================================================================
+// M9 C4 — X1.14 rule_id lifecycle via reload.
+//
+// Integration-level counterpart to the U4.11 / U4.14 unit tests. Exercises
+// the full deploy_prebuilt pipeline (exchange → synchronize → rl_arena_gc
+// → delete rs_old) and asserts the arena singleton sees the right slot
+// transitions for both X1.14 variants:
+//
+//   (a) rule_id reuse mid-life: G0 publishes rule 42; traffic arms the
+//       bucket; G1 publishes rule 42 again with the SAME semantics. The
+//       slot survives (same index), the bucket state carries over (D24
+//       "survives reload" — rule was never removed).
+//
+//   (b) remove + reintroduce: G0 publishes rule 42; G1 publishes a
+//       ruleset WITHOUT rule 42 (the rl_arena_gc body frees the slot);
+//       G2 publishes rule 42 again. The slot may or may not be numerically
+//       the same (depends on the bitmap-low policy), but the bucket state
+//       starts fresh (tokens, dropped, last_refill_tsc all zero) — D11 +
+//       §9.4 step 5b.
+//
+// These tests construct bare Rulesets with manually-filled rl_actions[]
+// (same pattern as the unit test file) and drive deploy_prebuilt. The
+// real qsbr sync runs in wait_for_quiescent; the arena GC runs
+// immediately after the bounded check returns 1 in deploy_prebuilt's
+// success path. Under reload_mutex (D35) the arena mutations are
+// serialised with the test's control-plane inspection calls.
+//
+// Variant (a) also doubles as U4.13 integration ordering: the arena
+// observation proves the GC body runs against the PRIOR rs_old AFTER
+// the synchronize (if GC ran BEFORE synchronize, the test fixture
+// wouldn't be able to tell — but there's no worker thread pulling
+// stale pointers, so the ordering is enforced by the call site's
+// source position, not a race test. Contract assertion, as spec'd).
+// =========================================================================
+
+namespace {
+
+// Helper: make a Ruleset carrying `rl_actions[]` for the given rule_ids
+// (only that field is populated — enough for the arena GC pass to see
+// them). Same heap allocation pattern as the unit test: `new[]` →
+// ~Ruleset calls `delete[] rl_actions`.
+std::unique_ptr<ruleset::Ruleset> make_rs_with_rl_ids_unique(
+    const std::vector<std::uint64_t>& rule_ids) {
+  auto rs = std::make_unique<ruleset::Ruleset>();
+  if (rule_ids.empty()) return rs;
+
+  const std::uint32_t n = static_cast<std::uint32_t>(rule_ids.size());
+  rs->rl_actions = new ruleset::RlAction[n];
+  rs->rl_actions_capacity = n;
+  rs->n_rl_actions = n;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    rs->rl_actions[i] = ruleset::RlAction{
+        /*rule_id=*/rule_ids[i],
+        /*rate_bps=*/1'000'000ull,
+        /*burst_bytes=*/100'000ull,
+    };
+  }
+  return rs;
+}
+
+}  // namespace
+
+// X1.14 (a): rule_id present in G0 AND G1 — slot and bucket survive.
+TEST_F(ReloadManagerFixture, X1_14a_RuleIdReuseBucketCarriesOver) {
+  constexpr std::uint64_t kId = 0xC414'0A01ull;
+
+  auto& arena = rl_arena::rl_arena_global();
+  // Pre-scrub so a prior test doesn't leave stale state.
+  arena.free_slot(kId);
+
+  // G0: publish rule 42. We pre-alloc the slot to simulate the compile
+  // stage (the real pipeline does this inside compile()). The arena
+  // survives reload, so we allocate ONCE and let deploy_prebuilt
+  // transition rulesets above it.
+  const std::uint16_t s0 = arena.alloc_slot(kId);
+  ASSERT_NE(s0, rl_arena::kInvalidSlot);
+
+  auto rs0 = make_rs_with_rl_ids_unique({kId});
+  auto r0 = ctl::reload::deploy_prebuilt(std::move(rs0));
+  ASSERT_TRUE(r0.ok) << r0.error;
+
+  // Traffic arms the bucket — scribble per-lcore state.
+  arena.get_row(s0).per_lcore[3].tokens = 0xAAAA'BBBBull;
+  arena.get_row(s0).per_lcore[3].dropped = 5;
+  arena.get_row(s0).per_lcore[3].last_refill_tsc = 0xCAFEull;
+
+  // G1: publish rule 42 again (same id). alloc_slot is idempotent;
+  // we skip re-alloc and just publish a new Ruleset carrying the id.
+  auto rs1 = make_rs_with_rl_ids_unique({kId});
+  auto r1 = ctl::reload::deploy_prebuilt(std::move(rs1));
+  ASSERT_TRUE(r1.ok) << r1.error;
+
+  // Slot unchanged, bucket state intact — GC had nothing to remove.
+  EXPECT_TRUE(arena.lookup_slot(kId).has_value());
+  EXPECT_EQ(*arena.lookup_slot(kId), s0)
+      << "X1.14a: slot must survive across reload with unchanged rule set";
+  EXPECT_EQ(arena.get_row(s0).per_lcore[3].tokens, 0xAAAA'BBBBull)
+      << "X1.14a: bucket state must NOT be zeroed — rule was not removed";
+  EXPECT_EQ(arena.get_row(s0).per_lcore[3].dropped, 5u);
+  EXPECT_EQ(arena.get_row(s0).per_lcore[3].last_refill_tsc, 0xCAFEull);
+
+  // Cleanup so TearDown's shutdown() doesn't leak the slot into the
+  // next test's arena view.
+  arena.free_slot(kId);
+}
+
+// X1.14 (b): rule_id removed in G1, reintroduced in G2 — bucket fresh.
+TEST_F(ReloadManagerFixture, X1_14b_RemoveThenReintroduceFreshBucket) {
+  constexpr std::uint64_t kId = 0xC414'0B01ull;
+
+  auto& arena = rl_arena::rl_arena_global();
+  arena.free_slot(kId);
+
+  // G0: publish rule with the id.
+  const std::uint16_t s0 = arena.alloc_slot(kId);
+  ASSERT_NE(s0, rl_arena::kInvalidSlot);
+
+  auto rs0 = make_rs_with_rl_ids_unique({kId});
+  auto r0 = ctl::reload::deploy_prebuilt(std::move(rs0));
+  ASSERT_TRUE(r0.ok) << r0.error;
+
+  // Arm bucket.
+  arena.get_row(s0).per_lcore[2].tokens = 0xDEAD'BEEFull;
+  arena.get_row(s0).per_lcore[2].dropped = 9;
+  arena.get_row(s0).per_lcore[2].last_refill_tsc = 0x1111'2222ull;
+
+  // G1: publish EMPTY ruleset (no rl_actions at all). The GC body
+  // will diff {kId} \ {} and free the slot.
+  auto rs1 = make_rs_with_rl_ids_unique({});
+  auto r1 = ctl::reload::deploy_prebuilt(std::move(rs1));
+  ASSERT_TRUE(r1.ok) << r1.error;
+
+  // Immediately after G1: slot must be free, id must be absent. §9.4
+  // step 5b: the row must be zero (eager zero, NOT zero-on-next-alloc).
+  EXPECT_FALSE(arena.lookup_slot(kId).has_value())
+      << "X1.14b: removed rule_id must be free after GC";
+  EXPECT_FALSE(arena.slot_live(s0))
+      << "X1.14b: slot bitmap must be clear";
+  EXPECT_EQ(arena.get_row(s0).per_lcore[2].tokens, 0u)
+      << "X1.14b: per_lcore tokens must be zero (§9.4 step 5b eager)";
+  EXPECT_EQ(arena.get_row(s0).per_lcore[2].dropped, 0u);
+  EXPECT_EQ(arena.get_row(s0).per_lcore[2].last_refill_tsc, 0u);
+
+  // G2: reintroduce the rule_id.
+  const std::uint16_t s2 = arena.alloc_slot(kId);
+  ASSERT_NE(s2, rl_arena::kInvalidSlot);
+  // Slot equality is a lowest-free-index consequence, not a contract.
+  // We assert the FRESH bucket contract instead.
+  EXPECT_EQ(arena.get_row(s2).per_lcore[2].tokens, 0u);
+  EXPECT_EQ(arena.get_row(s2).per_lcore[2].dropped, 0u);
+
+  auto rs2 = make_rs_with_rl_ids_unique({kId});
+  auto r2 = ctl::reload::deploy_prebuilt(std::move(rs2));
+  ASSERT_TRUE(r2.ok) << r2.error;
+
+  EXPECT_TRUE(arena.lookup_slot(kId).has_value())
+      << "X1.14b: reintroduced rule_id must have a slot";
+  EXPECT_EQ(arena.get_row(s2).per_lcore[2].tokens, 0u)
+      << "X1.14b: bucket state must start fresh on reintroduction";
+
+  // Cleanup.
+  arena.free_slot(kId);
 }
 
 }  // namespace pktgate::test

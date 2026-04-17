@@ -102,3 +102,14 @@ pktgate_add_test(
   LABELS  unit
   LINK    pktgate_rl_ctl
 )
+
+# M9 C4: runtime::rl_arena_gc body (D11 GC + D24 slot release + D33
+# eager counter-row zeroing). Links pktgate_runtime (the DPDK-free
+# TU that owns arena_gc.cpp). No EAL — the GC body operates purely
+# on Ruleset::rl_actions + the arena singleton.
+pktgate_add_test(
+  NAME    unit.test_rl_arena_gc
+  SOURCES test_rl_arena_gc.cpp
+  LABELS  unit
+  LINK    pktgate_runtime
+)
