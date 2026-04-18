@@ -75,6 +75,19 @@ pktgate_add_test(
   LABELS  "unit;needs-eal"
   LINK    pktgate_dp
 )
+
+# D41 C2 — boot-path smoke (Candidate D from the D41 discovery report).
+# Separate binary from test_eal_unit so the inline EalFixture can use a
+# unique --file-prefix=pktgate_d41_smoke and not collide with the
+# pktgate_eal_unit /run/dpdk namespace. Links the same libs as
+# test_eal_unit (pktgate_dp → pktgate_rl_ctl transitively for the real
+# RlSlotAllocator wiring).
+pktgate_add_test(
+  NAME    unit.test_d41_eal_smoke
+  SOURCES test_d41_eal_smoke.cpp
+  LABELS  "unit;needs-eal"
+  LINK    pktgate_dp
+)
 # M8 C1: flip U6.43b — g_active now lives in the reload manager
 # (src/ctl/reload.{h,cpp}), not in main.cpp. Defined as a compile-time
 # flag so the test body at tests/unit/test_eal_unit.cpp U6.43b can
