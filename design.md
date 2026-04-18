@@ -331,7 +331,8 @@ struct L4CompoundEntry {
     uint16_t want_src_port;        // host order; ICMP: reused as code slot
     uint16_t action_idx;
     uint16_t _pad2;                // keeps sizeof a multiple of 4
-}; // 12 bytes
+}; // 10 bytes
+static_assert(sizeof(L4CompoundEntry) == 10, "L4CompoundEntry layout drift");
 
 struct alignas(64) Ruleset {
     // ---- L2 ----
@@ -378,11 +379,16 @@ struct alignas(64) Ruleset {
     // path indexes the per-lcore bucket row by .slot directly,
     // avoiding any per-packet hash lookup against id_to_slot.
     struct RlAction {
-        uint32_t rule_id;
-        uint32_t slot;                  // dense [0, n_slots) row index in rl_arena
-        uint64_t rate_bytes_per_sec;
-        uint64_t burst_bytes;
+        uint32_t rule_id = 0;
+        uint32_t slot = 0;              // dense [0, n_slots) row index in rl_arena
+        uint64_t rate_bytes_per_sec = 0;
+        uint64_t burst_bytes = 0;
     };
+    // RlAction is non-trivially-default-constructible due to per-field
+    // default initialisers (the `= 0` above); bulk initialisation must
+    // use `std::fill_n(rs.rl_actions, cap, RlAction{})` or aggregate
+    // init — never `memset`. Enforced by `-Werror=class-memaccess` on
+    // release builds (M13 C0 chronic-fix).
     RlAction*        rl_actions;        // indexed by rl_index
     uint32_t         n_rl_actions;
     RateLimitArena*  rl_arena;          // pointer to the process-wide arena
@@ -409,7 +415,7 @@ struct alignas(64) Ruleset {
 | `l2_compound` | 16 B | 4 096 | 64 KiB |
 | `l3_actions` | 20 B | 4 096 | ~80 KiB |
 | `l4_actions` | 20 B | 4 096 | ~80 KiB |
-| `l4_compound` | 16 B | 4 096 | 64 KiB |
+| `l4_compound` | 10 B | 4 096 | ~40 KiB |
 | `rte_hash l2_src_mac` | n/a | 4 096 | ~256 KiB |
 | `rte_hash l2_dst_mac` | n/a | 4 096 | ~256 KiB |
 | `rte_fib v4` | n/a | 16 384 prefixes | ~64 MiB worst case |
@@ -438,8 +444,8 @@ deployments). Dev VM target: same value, the array footprint is
 trivial. Defined in `include/pktgate/limits.h`.
 
 `MAX_BURST` (the per-port staging buffer depth) tracks the EAL
-burst size — typically 32, configurable per port at startup but
-constant at compile time once chosen.
+burst size — compile-time constant, default 32, tunable via a
+build-time define.
 
 **D28 — Port TX-queue symmetry invariant.** Each worker uses its
 own `ctx->qid` on *every* port it may send to — the primary egress
@@ -583,8 +589,8 @@ Additional per-lcore counters (`LcoreStats`):
   accepted as a single VLAN by the §5.2 fast path because the
   inner tag was either missing or unmatched. Distinct from
   `pkt_truncated_total[l2_vlan]` (which counts truncations under
-  the QinQ outer header). Helps operators decide whether to ship
-  full QinQ matching in a future phase.
+  the QinQ outer header). Helps operators quantify real-world
+  demand for full QinQ matching before committing to the feature.
 - `pkt_multiseg_drop_total` — D39, a multi-segment mbuf reached
   `classify_l2` despite the port-init guarantee that RX scatter
   is disabled. Always expected to be zero; non-zero indicates a
@@ -604,8 +610,21 @@ Additional per-lcore counters (`LcoreStats`):
   Previously folded silently into `rule_matches_total{action=drop}`
   which made drop storms indistinguishable from normal drops.
 
-All rows are written only by the owning lcore. Aggregation is the
-telemetry thread's job (§10).
+All `PerLcoreCounters` fields (every `RuleCounter` row and every
+`LcoreStats` scalar above) are written only by the owning lcore via
+the `relaxed_bump` helper in `src/dataplane/lcore_counter.h`, which
+expands to `__atomic_store_n(p, __atomic_load_n(p, __ATOMIC_RELAXED)
++ d, __ATOMIC_RELAXED)`. The telemetry thread (§10.1) reads via the
+matching `__atomic_load_n(p, __ATOMIC_RELAXED)` in
+`src/telemetry/snapshot.cpp`. Rationale: both sides must be atomic
+for the C++ memory model (and TSan) to treat the access as
+well-defined, but on x86-64 the single-writer RELAXED load+store
+pair emits plain `mov; add; mov` with NO `lock` prefix and NO
+cache-line ownership transfer — D1's "zero atomic RMW on the hot
+path" prohibition targets `lock xadd` / CAS / `fetch_add`, not this
+pattern. Counters never read cross-thread (pure per-lcore internal
+state) may stay plain `++`. Aggregation is the telemetry thread's
+job (§10).
 
 ### 4.4 Rate-limit arena (D1 / D10)
 
@@ -676,7 +695,13 @@ return PASS;
 ```
 
 Per-lcore bucket, cache-line isolated. Lazy refill via `rte_rdtsc`
-delta. **Zero atomics on the hot path.** A rule's aggregate rate is
+delta. **Zero atomics on the hot path.** (The `b.dropped++` above is
+pseudocode clarity — in the real apply_action RL case (§5.5) this
+is written as `relaxed_bump(&b.dropped)` per the §4.3 invariant, so
+the publisher thread's matching `__atomic_load_n(…, __ATOMIC_RELAXED)`
+has a well-defined pair. Semantically identical on x86-64; codegen
+is still `mov; inc; mov` with no `lock` prefix.) A rule's aggregate
+rate is
 split across active lcores as `rate / n_active_lcores` at publish
 time. Skewed RSS distributions therefore tolerate ~10–20 % aggregate
 error; for flood-protection rate-limit (which is what the customer
@@ -726,6 +751,13 @@ struct alignas(64) ControlPlaneState {
     RateLimitArena*                     rl_arena;
     rte_rcu_qsbr*                       qs;
     int                                 cp_socket_id;
+
+    // D1 Variant A divisor — number of dataplane lcores currently
+    // polling. Set once by the control thread at EAL bring-up
+    // (§6.1), read by the RL hot path (§5.5) and rl_arena refill
+    // (§4.4). Treated as read-only after init; if the worker count
+    // ever becomes dynamic this promotes to an acquire-load.
+    uint32_t                            n_active_lcores;
 
     // D35: single reload-path mutex. ALL entry points that call
     // deploy() (inotify, cmd_socket UDS reload verb, future push
@@ -1004,8 +1036,8 @@ static inline void classify_l2(WorkerCtx* ctx, const Ruleset* rs,
     // "unknown ethertype" by downstream logic. Bumps
     // qinq_outer_only_total whenever we exit with the outer tag
     // consumed but the inner ethertype is *another* VLAN type;
-    // operators use that counter to scope the demand for full
-    // QinQ matching in a future phase.
+    // operators use that counter to quantify real-world demand for
+    // full QinQ matching before committing to the feature.
     bool is_vlan_tpid =
         (etype == RTE_BE16(RTE_ETHER_TYPE_VLAN)) ||
         (etype == RTE_BE16(RTE_ETHER_TYPE_QINQ));   // 0x88A8
@@ -1480,7 +1512,7 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         // without updating this switch is a compile error; the
         // default arm exists only as a runtime backstop in case
         // a state-machine bug slips past the warning.
-        ctx->stats.dispatch_unreachable_total++;
+        relaxed_bump(&ctx->stats.dispatch_unreachable_total);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1545,10 +1577,11 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         // is therefore a conservative whole-ruleset property: easier
         // to reason about, easier to test, no per-packet cost.
         //
-        // Phase plan interaction: D7 says mirror does not ship in
-        // Phase 1 (compiler rejects verb=mirror at publish time).
-        // D26 governs HOW mirror ships when Phase 2 enables it, not
-        // whether.
+        // D7 currently rejects verb=mirror at publish-time (the
+        // compiler refuses any ruleset that carries a mirror rule).
+        // D26 governs the refcnt-mirror contract so that enabling
+        // mirror later is additive, not structural — the hot path
+        // already carries the correct strategy dispatch.
         rte_mbuf* clone = mirror_clone(m);  // strategy fixed at build
         if (likely(clone))
             stage_mirror(ctx, a->mirror_port, clone);
@@ -1610,7 +1643,7 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         b.tokens          = min(b.tokens + refill, rl.burst_bytes);
         b.last_refill_tsc = now;
         if (b.tokens < m->pkt_len) {
-            b.dropped++;
+            relaxed_bump(&b.dropped);
             counter_rl_drop(ctx, dyn->verdict_layer, a->rule_id);
             rte_pktmbuf_free(m);
             return;
@@ -1624,7 +1657,7 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         // catches new verbs at compile time; this default is the
         // runtime backstop. Free the mbuf and bump a counter so
         // the situation is observable in telemetry.
-        ctx->stats.dispatch_unreachable_total++;
+        relaxed_bump(&ctx->stats.dispatch_unreachable_total);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1642,7 +1675,7 @@ static inline void redirect_drain(WorkerCtx* ctx) {
         uint16_t sent = rte_eth_tx_burst(p, ctx->qid, s.buf, s.n);
         if (unlikely(sent < s.n)) {
             rte_pktmbuf_free_bulk(&s.buf[sent], s.n - sent);
-            ctx->stats.redirect_dropped_total += (s.n - sent);
+            relaxed_add(&ctx->stats.redirect_dropped_total, s.n - sent);
         }
         s.n = 0;
     }
@@ -1939,7 +1972,7 @@ there is no separate mirror pool.
 | Allocation | Size (production target) | Where |
 |---|---|---|
 | `WorkerCtx` | ~8 KiB (incl. TX stage buffers) | NUMA-local |
-| `PerLcoreCounters` (rules) | ~768 KiB at n_rules_total = 12 288 | NUMA-local |
+| `PerLcoreCounters` (rules) | ~768 KiB per lcore; ~N×768 KiB aggregate at N active dataplane lcores (n_rules_total = 12 288) | NUMA-local |
 | `LcoreStats` | ~256 B | NUMA-local |
 | Local prefetch scratch | stack | negligible |
 
@@ -2282,8 +2315,11 @@ channels ship in a given phase is a §14 question.
 
 - Dedicated telemetry thread (control plane, not pinned to a
   dataplane lcore).
-- Periodic snapshot: `snapshot += counters[lcore][rule]` for all
-  lcores × rules; snapshot interval configurable, default 1 s.
+- Periodic snapshot: for every (lcore, rule) pair the publisher
+  loads the counter with `__atomic_load_n(p, __ATOMIC_RELAXED)`
+  (matching the owning lcore's `relaxed_bump` store side per §4.3),
+  then accumulates into the snapshot. Snapshot interval
+  configurable, default 1 s.
 - Snapshot published to a lock-free ring buffer with `N` generations.
   Default `N = 4`. The minimum correct value is 2 (one generation
   being written by the telemetry thread, one being read by the
@@ -2295,10 +2331,36 @@ channels ship in a given phase is a §14 question.
 
 ### 10.2 Supported export channels (all defined by architecture)
 
-1. **Prometheus HTTP exporter**
-   - `/metrics` endpoint, OpenMetrics format, configurable port.
+1. **Prometheus HTTP exporter** (D42 — hand-rolled, not vendored)
+   - `/metrics` endpoint, OpenMetrics text format, configurable port.
    - Labels: `rule_id`, `layer`, `port`, `lcore`, `site`.
    - Own thread; no hot-path involvement.
+   - **Hand-rolled HTTP server, no third-party dependency** (no
+     cpp-httplib, no vendored HTTP blob). Rationale: scope is one
+     verb + one path, keeping the surface auditable vs. a 10 k-LoC
+     vendored framework on a high-trust GGSN-Gi position. Full
+     rationale in review-notes D42; see also the D-table entry in
+     `CLAUDE.md`.
+   - **Protocol subset**: HTTP/1.0 and HTTP/1.1 request lines
+     accepted; response always framed as HTTP/1.1 with
+     `Connection: close`. No keep-alive, no
+     `Transfer-Encoding: chunked`, no compression, no TLS, no auth.
+     HTTP/2.0+ → 505. Non-GET → 405. Path != `/metrics` → 404.
+     Malformed request line / body-bearing GET / explicit
+     `Transfer-Encoding` header → 400.
+   - **Request caps**: 8 KiB cap on request line; 8 KiB cap on total
+     header block. Oversized → 400 (or 414/431 at implementer
+     discretion).
+   - **Socket timeouts**: `SO_RCVTIMEO` = 5 s and `SO_SNDTIMEO` = 5 s
+     — bounds slowloris attacks and stuck readers/writers.
+   - **Bind**: `127.0.0.1:<sizing.prom_port>` (AF_INET only, default
+     `9090`). No IPv6 listen; loopback-only — operator firewalls at
+     their edge (kube-prometheus convention).
+   - **Concurrency**: single accept thread, sequential request
+     handling, no pool / reactor. Prometheus scrape rate ≈ 1 req
+     per 15 s; concurrency is unjustified complexity.
+   - **Response framing**: always `Content-Length`-terminated; socket
+     closed after the body. No chunked encoding.
 2. **sFlow v5 UDP exporter**
    - Embedded encoder (no libsflow dependency).
    - Samples carry truncated header, ingress port, timestamp,
@@ -2338,7 +2400,8 @@ pktgate_lcore_packets_total{lcore}                                counter
 pktgate_lcore_cycles_per_burst{lcore}                             histogram
 pktgate_lcore_idle_iters_total{lcore}                             counter
 pktgate_lcore_l4_skipped_ipv6_extheader_total{lcore}              counter
-pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total{lcore}      counter  # D27
+# D27 — aliased below as `pkt_frag_skipped_total{af="v6"}` (same bump site).
+pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total{lcore}      counter
 pktgate_lcore_tag_pcp_noop_untagged_total{lcore}                  counter
 pktgate_lcore_dispatch_unreachable_total{lcore}                   counter
 # D31 — per-stage truncation guards (§5.2 / §5.3 / §5.4).
@@ -2560,6 +2623,7 @@ pktgate-dpdk/
 ├── include/pktgate/
 │   ├── ruleset.h
 │   ├── action.h
+│   ├── limits.h                  ← N_PORTS_MAX, MAX_BURST (§4.2)
 │   └── version.h
 │
 ├── src/
@@ -2586,7 +2650,8 @@ pktgate-dpdk/
 │   │   ├── classify_l2.h
 │   │   ├── classify_l3.h
 │   │   ├── classify_l4.h
-│   │   └── action_dispatch.h
+│   │   ├── action_dispatch.h
+│   │   └── lcore_counter.h       ← relaxed_bump / relaxed_add (§4.3)
 │   ├── action/
 │   │   ├── mirror.{cpp,h}
 │   │   ├── ratelimit.{cpp,h}
@@ -2669,6 +2734,12 @@ users in the `[Service]` stanza; release units create only
 ## 14. Phase plan
 
 ### 14.1 Phase 1 (MVP) — exit criteria
+
+*Phase 1 implementation scope is tracked in `implementation-plan.md`;
+any divergence in the bullets below is indicative, not authoritative.
+Per the 2026-04-16 scope trim: M10 ships Prometheus-only (structured
+JSON logs deferred), M11 ships inotify-only (UDS command socket
+deferred).*
 
 **Architectural features that ship in Phase 1**:
 
