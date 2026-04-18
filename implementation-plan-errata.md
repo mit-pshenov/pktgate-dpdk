@@ -845,8 +845,23 @@ at M11 C1 HEAD; bisect traced to M10 C4, M10 C5's exit-gate claim
 retroactively falsified. Fix approved in this cycle; no push, no
 amend, no tag rewrite.*
 
+## §M13 — dev-debug gate matrix
+
+M13 gate matrix expanded from `{asan, tsan}` to
+`{debug, release, asan, ubsan, tsan}`. `scripts/run_all.sh`
+orchestrates the full matrix on the dev VM: clean `/run/dpdk`,
+configure, build, `ctest -j 1 -L "smoke|unit|functional|integration|chaos"`,
+chown back to `mit:mit`, one `===== MATRIX SUMMARY =====` line per
+preset. Fuzz preset remains out per plan §0.2 (libFuzzer has its
+own CI job; per-cycle gate stays green in seconds, not minutes).
+Effective from C0 (`e7ce43e`); C0 also carried the real fixes
+(release-build constexpr + ubsan alignment) that made `dev-release`
+and `dev-ubsan` green in the first place.
+
+*Origin: M13 C1 (2026-04-18).*
+
 ---
 
-*Last updated: 2026-04-17 (§M11 C1.5 TSAN race fix + M10 C5 exit-gate
-claim retroactively corrected). Add new items with date + origin
-cycle at append time.*
+*Last updated: 2026-04-18 (§M13 dev-debug gate matrix note; run_all.sh
+orchestrator landed). Add new items with date + origin cycle at
+append time.*
