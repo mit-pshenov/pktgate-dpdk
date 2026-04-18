@@ -24,7 +24,7 @@ handling, dual-stack). Schema compat с pktgate JSON — **дропнута
 |---|---|---|
 | `input.md` | Формализованные требования заказчика, F1-F7 / N1-N5 / constraints / non-goals / 16 expected deliverables | Авторитетно. Меняется только через явное согласование с заказчиком (через пользователя). |
 | `design.md` | Архитектурный док (17 секций + summary), написан Plan-агентом на Opus. **Содержит известные баги** — см. review-notes. | Читать вместе с review-notes. Не цитировать §4.1/§4.4/§5.3/§5.4/§9.2 как истину — там критические дефекты. |
-| `review-notes.md` | Мета-принципы (M1-M2), решения (D1-D42), pending (P10), batch revision plan (24 шага) | Источник истины по текущему состоянию дизайна. Каждое D-решение перекрывает соответствующий кусок design.md. |
+| `review-notes.md` | Мета-принципы (M1-M2), решения (D1-D42), batch revision plan (24 шага) | Источник истины по текущему состоянию дизайна. Каждое D-решение перекрывает соответствующий кусок design.md. |
 
 **Состояние design.md**: первая версия, прошла два ревью-прохода
 (§9 hot reload и §5 hot path). Ждёт batch revision, после которого
@@ -151,12 +151,13 @@ Q3/Q5/Q6/Q7/Q9 закрыты как prose clarifications в design.md
 
 ## Pending (требуют решения пользователя)
 
-- **P10** — compound-L3 primary key source (`src_subnet` vs `dst_subnet`). Полная формулировка в `review-notes.md §Pending items`.
+*Нет открытых P-item'ов на 2026-04-18. Phase 1 закрыт, все P1-P10 resolved.*
 
 **Resolved (formalised 2026-04-18):**
 - ~~P7~~ — rte_flow automatic topological promotion: архивирован как **post-MVP growth hook** under D4 clause 6. Не бенчится на e1000, выбор v2 vs v3 — эмпирическая задача на реальном HW/трафике, не архитектурная.
 - ~~P8~~ — IPv6 ext-headers MVP scope: **first-protocol-only** per user lean (b), shipped M5 C5 under D20.
 - ~~P9~~ — fragment policy default: **`l3_only`** per user lean, shipped M5 C3 under D17 (struct default `kL3Only`, parser fills same on missing field).
+- ~~P10~~ — compound-L3 primary key source: option (c) adopted 2026-04-15, `src_subnet` → `dst_subnet` rename landed в M5 C1c `de0ff83`. Src-prefix secondary deferred to v2.
 
 ## Non-goals (что **не** делаем)
 

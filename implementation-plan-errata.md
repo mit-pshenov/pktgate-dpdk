@@ -150,19 +150,6 @@ serves as M4's boot-path smoke.
 work same day → fix landed in C8 WIP (main.cpp `populate_ruleset_eal`
 call) + D41 amendment.*
 
-## Design.md bugs (NOT plan errata — migrate to design.md batch revision)
-
-This section tracks architectural doc bugs discovered during
-implementation. They don't belong in this file long-term (errata
-file is for `implementation-plan.md`), but dumping them here for
-now so they aren't lost before the next `design.md` revision.
-
-### L4CompoundEntry size mismatch (§4.1)
-`design.md` §4.1 says `L4CompoundEntry = 12 B` but the field list
-sums to **10 B**. Discovered in M2 C2 `dc8cecc` during static_assert.
-Resolution: fix doc to match fields (10 B) or add padding (12 B).
-*Origin: M2 C2, 2026-04-10. Should land in design.md batch revision.*
-
 ## §M5 — Classifier L3 (lines 356-399)
 
 ### C1 RED list — plan↔unit.md ID drift on D14/D31 IPv4 row
@@ -881,4 +868,7 @@ a known-flake for a future harness hardening cycle.
 
 ---
 
-*Last updated: 2026-04-18 (§M13 C2 systemd + flake note).*
+*Last updated: 2026-04-18 (§Design.md bugs section removed — sole entry
+L4CompoundEntry size mismatch closed in design.md Round-2 batch revision
+commit `b0a3928`, finding F1+F6; `static_assert(sizeof(L4CompoundEntry)
+== 10)` now lives in §4.1).*
