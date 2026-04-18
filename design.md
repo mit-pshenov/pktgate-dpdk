@@ -1481,8 +1481,8 @@ and expanded port lists at compile time. True `src_port` /
 `dst_port` *ranges* are not in the architecture's current L4 primary
 tables. Ranges can be supported either via a second-tier linear scan
 over "ranged L4 rules" or via ACL (`rte_acl`) — the architecture
-leaves both doors open; the phase plan (§14) currently treats ranges
-as a non-goal for the first shipping phase.
+leaves both doors open; §14 owns the decision on whether a given
+shipping phase enables one of the two strategies.
 
 ### 5.5 Action dispatch
 
