@@ -977,18 +977,19 @@ headers through `rte_pktmbuf_mtod[_offset]`, which linearly reads
 **the first mbuf segment only**. D31 length guards check
 `m->pkt_len`, which covers the full chain, so a chained mbuf with a
 header straddling a segment boundary would pass the guard but read
-undefined memory. Phase 1 closes this by enforcing
-`m->nb_segs == 1` at classifier entry and by refusing any port
-configuration where the RX mempool segment size cannot hold the
-largest admissible frame.
+undefined memory. D39 closes this structurally: the architecture
+requires `m->nb_segs == 1` at classifier entry and refuses any
+port configuration where the RX mempool segment size cannot hold
+the largest admissible frame.
 
 Runtime: `classify_l2` asserts `m->nb_segs == 1` under
 `RTE_ASSERT` in debug builds; release builds rely on the port-init
 guarantee (see §6.1). If the invariant is ever observed to fail in
 production (counter `pkt_multiseg_drop_total`), the packet is
-routed to `TERMINAL_DROP` — same path as truncation. Phase 2 may
-revisit this with `rte_pktmbuf_read` if jumbo / multi-seg becomes a
-real requirement.
+routed to `TERMINAL_DROP` — same path as truncation. Relaxing the
+single-segment requirement is a structural change (switching the
+classifier read path to `rte_pktmbuf_read` or equivalent) and
+would require reopening D39 before it could be considered.
 
 ### 5.2 Layer 2 classifier
 
