@@ -24,7 +24,7 @@ handling, dual-stack). Schema compat с pktgate JSON — **дропнута
 |---|---|---|
 | `input.md` | Формализованные требования заказчика, F1-F7 / N1-N5 / constraints / non-goals / 16 expected deliverables | Авторитетно. Меняется только через явное согласование с заказчиком (через пользователя). |
 | `design.md` | Архитектурный док (17 секций + summary), написан Plan-агентом на Opus. **Содержит известные баги** — см. review-notes. | Читать вместе с review-notes. Не цитировать §4.1/§4.4/§5.3/§5.4/§9.2 как истину — там критические дефекты. |
-| `review-notes.md` | Мета-принципы (M1-M2), решения (D1-D20), pending (P7-P9), batch revision plan (24 шага) | Источник истины по текущему состоянию дизайна. Каждое D-решение перекрывает соответствующий кусок design.md. |
+| `review-notes.md` | Мета-принципы (M1-M2), решения (D1-D42), pending (P10), batch revision plan (24 шага) | Источник истины по текущему состоянию дизайна. Каждое D-решение перекрывает соответствующий кусок design.md. |
 
 **Состояние design.md**: первая версия, прошла два ревью-прохода
 (§9 hot reload и §5 hot path). Ждёт batch revision, после которого
@@ -119,7 +119,7 @@ capability bits, queue count):
 | **D17** | `fragment_policy` config field (не хардкод drop) | Принят |
 | **D18** | Cycle budget §5.6 min/typ/max вместо только best case | Принят |
 | **D19** | Misc: fib_lookup single vs bulk-1, handle_idle spec, TAG semantics | Принят |
-| **D20** | IPv6 ext-headers MVP scope — pending (см. P8) | Зависит от P8 |
+| **D20** | IPv6 ext-headers MVP scope: first-protocol-only (P8 resolved per user lean (b)) | Принят, shipped M5 C5 |
 | **D21** | Fix NEXT_L4 cliff in §5.3 (verdict=NEXT_L4 must not skip L4) | Принят, critical bug fix |
 | **D22** | RuleAction sizing: 20 B + alignas(4), не 64 B | Принят (in-place, см. также 2-й внеш. ревью) |
 | **D23** | NUMA awareness в Ruleset/Workers — explicit | Принят |
@@ -151,9 +151,12 @@ Q3/Q5/Q6/Q7/Q9 закрыты как prose clarifications в design.md
 
 ## Pending (требуют решения пользователя)
 
-- **P7** — rte_flow automatic topological offload promotion: v2 или v3? (plan-level, не блокирует batch revision)
-- **P8** — IPv6 ext-headers scope в MVP: (a) до K=2 hops, (b) first-proto only, ext в v2. Мой lean: (b).
-- **P9** — fragment policy default: `drop` / `l3_only` / `allow`. Мой lean: `l3_only`.
+- **P10** — compound-L3 primary key source (`src_subnet` vs `dst_subnet`). Полная формулировка в `review-notes.md §Pending items`.
+
+**Resolved (formalised 2026-04-18):**
+- ~~P7~~ — rte_flow automatic topological promotion: архивирован как **post-MVP growth hook** under D4 clause 6. Не бенчится на e1000, выбор v2 vs v3 — эмпирическая задача на реальном HW/трафике, не архитектурная.
+- ~~P8~~ — IPv6 ext-headers MVP scope: **first-protocol-only** per user lean (b), shipped M5 C5 under D20.
+- ~~P9~~ — fragment policy default: **`l3_only`** per user lean, shipped M5 C3 under D17 (struct default `kL3Only`, parser fills same on missing field).
 
 ## Non-goals (что **не** делаем)
 

@@ -376,6 +376,19 @@ automatic promotion.
 | §9 (compilation pipeline) | Add tiering step: classify rules, program rte_flow for hw-tier at publish |
 | §14 (phase plan) | Offload deferred from MVP |
 
+**P7 resolution (2026-04-18).** Automatic topological promotion
+(P7: «v2 или v3») stays as **post-MVP growth hook**, not a
+pre-implementation decision. Rationale: dev VM (e1000) has no
+rte_flow capability bits at all, so the question cannot be
+benchmarked in sandbox; production NICs (E810/XL710/ConnectX-5/6)
+accept both phase assignments transparently thanks to the D4 clause-6
+architecture (operator-hint in MVP, automatic analysis layered on
+top later). Phase choice is a plan-discussion item to be revisited
+once the filter is deployed on real HW with real traffic — there it
+will be an empirical call based on rule-distribution patterns, not
+an architectural one. Until then `§14 Phase plan` in `design.md`
+v2 records it as a v2+ growth slot without committing v2 vs v3.
+
 ---
 
 ### D5 — HA / hot-standby: architectural compatibility requirements (v2+ implementation)
@@ -623,13 +636,6 @@ above — roughly 5-10 lines changed across §1.2, §3.1 F3, §3.3, §6.1.
 ---
 
 ## Pending items
-
-### P7 — rte_flow offload promotion strategy
-
-Sub-question of D4. MVP uses operator-hint `hw_offload_hint`. Should
-automatic topological analysis come in v2 or v3? Architectural hook
-(rule tiering + dual-path dataplane) is the same either way; the
-difference is compiler complexity. Defer to plan discussion.
 
 ### P10 — compound-L3 primary key source (src_subnet / dst_subnet)
 
@@ -1101,6 +1107,15 @@ recommended, included only for completeness / debugging).
 Schema field: top-level `fragment_policy: "l3_only" | "drop" | "allow"`,
 default `"l3_only"` if absent. Document in §3 (config) and
 in CONFIG.md / writer notes.
+
+**P9 resolution (2026-04-18).** Default value formally closed as
+`l3_only` per user lean. Previously tracked as open P9 in
+`CLAUDE.md §Pending`; shipped de-facto in M5 C3 via
+`config::FragmentPolicy::kL3Only` as struct default + parser fallback
+on missing field + u8-zero-init on `Ruleset.fragment_policy`
+(enum encoding `{kL3Only=0, kDrop=1, kAllow=2}` deliberately orders
+the default to zero). No separate D-number — this is a clause
+under D17, not a new decision.
 
 ### D18 — MEDIUM: cycle budget is best-case only
 
