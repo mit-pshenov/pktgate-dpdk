@@ -860,8 +860,25 @@ and `dev-ubsan` green in the first place.
 
 *Origin: M13 C1 (2026-04-18).*
 
+### M13 C2 — systemd skeleton + observed flake
+
+`systemd/pktgate-devvm.service` added as a dev-VM-only oneshot
+wrapper around `scripts/run_all.sh` (not enabled at boot, not a
+production unit). `systemd-analyze verify` clean.
+
+Observed flake during the C2 final matrix: `dev-tsan`
+`functional.test_f2_l4::test_f2_25_l4_icmpv6_match` reported
+`matched_packets=2` (expected 1) once when the test ran inside the
+full back-to-back matrix; 3/3 isolated reruns passed, and a clean
+full-preset re-run of `dev-tsan` went 43/43 green. Suspected cause
+is kernel IPv6 NDP contamination on the `dtap_*` interface when
+prior tests leave state behind — NM keyfile suppresses DHCP but
+does not disable kernel neighbour-discovery. Not a code regression
+(no `src/` or `tests/` change since C1 `aaf22a5`); tracked here as
+a known-flake for a future harness hardening cycle.
+
+*Origin: M13 C2 (2026-04-18).*
+
 ---
 
-*Last updated: 2026-04-18 (§M13 dev-debug gate matrix note; run_all.sh
-orchestrator landed). Add new items with date + origin cycle at
-append time.*
+*Last updated: 2026-04-18 (§M13 C2 systemd + flake note).*

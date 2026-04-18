@@ -1,0 +1,55 @@
+# pktgate-devvm.service — dev VM smoke unit (NOT production).
+#
+# Runs the full 5-preset ctest matrix (scripts/run_all.sh) as a
+# oneshot systemd unit on the dev VM only. This is explicitly a
+# **developer convenience** skeleton — it is not a production
+# deployment target. Production binary supervision lives in M12
+# (watchdog / HA, currently deferred per implementation-plan-errata
+# §Scope trim). Do not copy this unit to a customer host.
+#
+# What it does:
+#   - Runs as root because ctest drives DPDK EAL init, which needs
+#     sudo on the dev VM (VFIO + hugepages). run_all.sh itself calls
+#     `sudo` internally; executing the unit as root short-circuits
+#     the inner sudo without changing semantics.
+#   - Type=oneshot + RemainAfterExit=no: the unit completes when the
+#     matrix completes; no long-lived service state is kept.
+#   - WorkingDirectory pinned to the dev-VM layout (~mit/Dev/...).
+#     If the layout changes the unit breaks loudly at startup — that
+#     is the intended failure mode for a skeleton.
+#   - PKG_CONFIG_PATH carries the DPDK 25.11 meson-uninstalled .pc
+#     location (no system install — see memory vm_dpdk_layout.md).
+#
+# Install (dev VM only):
+#   sudo cp systemd/pktgate-devvm.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl start pktgate-devvm.service      # one-shot run
+#   sudo journalctl -u pktgate-devvm.service        # read output
+#
+# NOT enabled at boot by intent: the dev VM owner starts the unit
+# manually when they want the matrix; systemd is just a logging /
+# invocation convenience over `bash scripts/run_all.sh`.
+
+[Unit]
+Description=pktgate-dpdk dev VM 5-preset ctest matrix (scripts/run_all.sh)
+Documentation=file:///home/mit/Dev/pktgate-dpdk/implementation-plan-errata.md
+After=network.target dev-hugepages.mount
+ConditionPathExists=/home/mit/Dev/pktgate-dpdk/scripts/run_all.sh
+ConditionPathIsDirectory=/dev/hugepages
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=root
+Group=root
+WorkingDirectory=/home/mit/Dev/pktgate-dpdk
+Environment=PKG_CONFIG_PATH=/home/mit/Dev/dpdk-25.11/build/meson-uninstalled
+ExecStart=/home/mit/Dev/pktgate-dpdk/scripts/run_all.sh
+# Give the matrix enough wall time for the slowest preset (tsan).
+# 30 min is generous on the dev VM (current real time ~8-12 min).
+TimeoutStartSec=30min
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
