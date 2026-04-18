@@ -2442,6 +2442,52 @@ variants; open variants (через `std::any` и т.п.) — вне scope.
 
 Landed: D41 C1b.
 
+**Amendment 2026-04-18 (C3 — class closure).**
+
+D41 silent-pipeline-gap класс закрыт post-Phase-1 через трёхцикловую
+guard-серию:
+
+- **C1** (`6e976c8`) — compile-time tuple-projection guard на
+  `CompiledAction ↔ RuleAction` axis. `observable_fields()`
+  в `action.h` и `compiler.h` фиксируют allowlist полей; пара
+  `static_assert`'ов в `src/ruleset/builder.cpp` (arity fold +
+  per-element `is_same_v` fold) падает на любом structural drift'е.
+  Runtime roundtrip unit test `test_d41_guard.cpp` ловит wiring
+  drift (обе проекции обновили, но `copy_actions` забыли).
+- **C1b** (`2318371`) — `static_assert(always_false_v<T>)`
+  exhaustive pattern в `resolve_action` visitor'е. Добавление
+  arm'а в `config::RuleAction` variant без ветки в visitor'е
+  теперь fails at compile time (см. C1b amendment выше).
+- **C2** (`1bfb806`) — EAL boot-path smoke `test_d41_eal_smoke.cpp`.
+  Pipeline `parse → compile → build_ruleset → populate_ruleset_eal`
+  на minimal config, покрывающем все MVP-verb'ы; три invariant'а —
+  per-rule projection roundtrip post-EAL, positive-value checks,
+  Q6 lockstep `rs.rl_actions[slot]` vs `CompiledAction`. Закрывает
+  `main.cpp` call-graph orphan subclass (M4 C0b + M9 C5 прецеденты),
+  который compile-time guards структурно не видят.
+
+**Покрытые инстансы** (6 total, все pre-Phase-1, все fixed):
+M2 (`compile_l2/l4_rules` orphan), M4 C0b (`populate_ruleset_eal`
+orphan), M5 C3 (`fragment_policy` wiring), M7 C2b (dscp/pcp/
+redirect_port), M8 C5 (RCU reader cache), M9 C5 (RlSlotAllocator
+boot-path wiring).
+
+**Three-axis coverage** гарантирован:
+1. **Struct shape drift** (CompiledAction ↔ RuleAction field count
+   или types) — static_assert pair в builder.cpp.
+2. **Variant arm drift** (config::RuleAction новый arm без
+   visitor'а) — static_assert exhaustive в resolve_action.
+3. **Call-graph orphan** (main.cpp не вызывает populate_ruleset_eal
+   или ≠ wiring) — EAL boot-path smoke.
+
+Класс **закрыт**. Новые D41 инстансы не ожидаются по существующим
+lowering paths; каждое будущее расширение (новый CompiledAction
+field, новый config variant arm, новая boot-path stage) должно
+расширять guard'ы lockstep. См. `action.h` и `compiler.h` dead-
+carrier комментарии для re-add recipe.
+
+Landed: D41 C3.
+
 ### D42 — Control-plane HTTP is hand-rolled, not vendored
 
 **Decision.** All Phase 1 control-plane HTTP endpoints (starting with

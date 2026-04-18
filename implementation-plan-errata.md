@@ -866,9 +866,46 @@ a known-flake for a future harness hardening cycle.
 
 *Origin: M13 C2 (2026-04-18).*
 
+## §D41 closure — post-Phase-1 guard trilogy
+
+D41 silent-pipeline-gap класс закрыт post-Phase-1. Три цикла:
+
+- **C1** (`6e976c8`) — compile-time tuple-projection guard
+  (`observable_fields()` в `action.h` / `compiler.h`) + runtime
+  roundtrip unit test `test_d41_guard.cpp`.
+- **C1b** (`2318371`) — `resolve_action` visitor exhaustiveness
+  через `static_assert(always_false_v<T>)` (dependent-false idiom).
+- **C2** (`1bfb806`) — EAL boot-path smoke `test_d41_eal_smoke.cpp`;
+  per-rule projection roundtrip post-`populate_ruleset_eal` +
+  Q6 lockstep `rs.rl_actions[slot]` runtime assertion.
+
+Три-axis coverage: struct shape drift (static_assert pair),
+variant arm drift (static_assert exhaustive), call-graph orphan
+(EAL boot-path smoke).
+
+**Инстансы покрыто** (6, все pre-Phase-1, все fixed):
+M2 `compile_l2/l4_rules` orphan; M4 C0b `populate_ruleset_eal`
+orphan; M5 C3 `fragment_policy` wiring; M7 C2b dscp/pcp/
+redirect_port; M8 C5 RCU reader cache; M9 C5 RlSlotAllocator
+boot-path wiring.
+
+**Active regressions:** none. Full M13 matrix (5/5 presets) clean
+first-pass 45/45 на C2 закрытии. Каждое будущее расширение
+(новый CompiledAction field, новый `config::RuleAction` variant
+arm, новая boot-path stage) должно расширять guard'ы lockstep;
+dead-carrier re-add recipe в комментариях `src/action/action.h`
+и `src/compiler/compiler.h`.
+
+Canonical decision body: `review-notes.md §D41` + Amendment
+2026-04-18 (C3 — class closure).
+
+*Origin: post-Phase-1 debt, D41 supervisor brigade 2026-04-18.*
+
 ---
 
-*Last updated: 2026-04-18 (§Design.md bugs section removed — sole entry
-L4CompoundEntry size mismatch closed in design.md Round-2 batch revision
-commit `b0a3928`, finding F1+F6; `static_assert(sizeof(L4CompoundEntry)
-== 10)` now lives in §4.1).*
+*Last updated: 2026-04-18 (D41 class closure — C1/C1b/C2 guard
+trilogy landed; three-axis coverage struct-drift + variant-drift
++ orphan boot-path). Preceded by §Design.md bugs section removal —
+sole entry L4CompoundEntry size mismatch closed in design.md
+Round-2 batch revision commit `b0a3928`, finding F1+F6;
+`static_assert(sizeof(L4CompoundEntry) == 10)` now lives in §4.1.*
