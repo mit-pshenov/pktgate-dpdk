@@ -11,3 +11,6 @@ add_subdirectory(unit)
 add_subdirectory(placeholders)
 add_subdirectory(functional)
 add_subdirectory(integration)
+# M11 C3 — chaos tier (X1.1 inotify reload storm; concurrency sentinel
+# for the inotify watcher thread + debounce + reload funnel under TSAN).
+add_subdirectory(chaos)

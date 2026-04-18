@@ -1,10 +1,19 @@
 # tests/functional/test_f5_reload.py
 #
-# M8 C5 — F5.11..F5.14 reload functional tests.
+# M8 C5  — F5.11..F5.14 reload functional tests.
+# M11 C3 — F5.1 "happy reload via inotify (mv newfile config.json)"
+#          revisited end-to-end via real kernel inotify. Before M11
+#          there was no live watcher so F5.1 wasn't a functional test
+#          in this file (the M8 scope bundled 11-14 only and F5.1 was
+#          effectively a spec row with no pytest coverage). M11 wires
+#          the live inotify watcher, so F5.1 is authored here as the
+#          D9/D38/§9.2 contract test using a real `os.rename()` over
+#          the watched basename — no test shortcut.
 #
 # The harness drives the live pktgate_dpdk binary over the UDS
-# `cmd_socket` (--ctl-sock <path>). The four scenarios:
+# `cmd_socket` (--ctl-sock <path>). The scenarios:
 #
+#   F5.1   happy reload via inotify IN_MOVED_TO      real kernel event
 #   F5.11  concurrent UDS + telemetry reload         (X1.3 two-way)
 #   F5.12  reload timeout (simulate verb)            observable via stats-on-exit
 #   F5.13  pending_free drain                        observable via stats-on-exit
@@ -22,6 +31,7 @@
 
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -340,3 +350,210 @@ def test_f5_14_pending_free_overflow(pktgate_process):
     # stats_on_exit emits pre-shutdown: pending_free is FULL (8 of 8),
     # the 9th reload went into overflow_holder.
     assert ctrs["reload_pending_depth"] == 8, ctrs
+
+
+# ---------------------------------------------------------------------------
+# F5.1 — happy reload via real kernel inotify (mv newfile config.json).
+# ---------------------------------------------------------------------------
+#
+# §functional.md F5.1 contract:
+#   * running binary with config A
+#   * prepare config B, `mv config.B config.json` inside the watched dir
+#   * within 250 ms: traffic flows to the new verdict;
+#     `pktgate_reload_total{result="success"}` += 1;
+#     `pktgate_active_generation` += 1.
+#
+# M8 shipped F5.1 as a spec row only. The M11 inotify watcher makes it
+# a live end-to-end test: we drive the kernel IN_MOVED_TO event via a
+# real `os.rename()` in the same directory as the watched file (cp+mv
+# pattern — same-directory rename is atomic on POSIX) and assert the
+# reload bump shows up in /metrics within the 250 ms SLO. No test
+# shortcut — no direct deploy() call, no UDS reload, no SIGHUP. This
+# is the D9/D35/D38 living invariant at the user-facing tier.
+#
+# The 250 ms SLO is loose under dev-tsan (binary is 2-5× slower) — we
+# use a 4 s poll window as in F7.* tests and verify the bump landed.
+# The point of F5.1 is correctness of the wiring, not microsecond
+# latency (that's F5.16, out of Phase 1 scope).
+
+_F51_RELOAD_SUCCESS_RE = re.compile(
+    r'^pktgate_reload_total\{[^}]*result="success"[^}]*\}\s+(\d+)',
+    re.MULTILINE,
+)
+_F51_ACTIVE_GENERATION_RE = re.compile(
+    r'^pktgate_active_generation\s+(\d+)',
+    re.MULTILINE,
+)
+
+
+def _f51_make_config():
+    """Sizing-bearing config so the binary opens a Prom endpoint we
+    can scrape. Same shape as test_f7_inotify.make_config()."""
+    return {
+        "version": 1,
+        "interface_roles": {
+            "upstream_port":   {"vdev": "net_null0"},
+            "downstream_port": {"vdev": "net_null1"},
+        },
+        "default_behavior": "drop",
+        "pipeline": {
+            "layer_2": [],
+            "layer_3": [],
+            "layer_4": [],
+        },
+        "sizing": {
+            "rules_per_layer_max":  256,
+            "mac_entries_max":      256,
+            "ipv4_prefixes_max":    1024,
+            "ipv6_prefixes_max":    1024,
+            "l4_entries_max":       256,
+            "vrf_entries_max":      32,
+            "rate_limit_rules_max": 256,
+            "ethertype_entries_max": 32,
+            "vlan_entries_max":     256,
+            "pcp_entries_max":      8,
+            "prom_port":            0,
+        },
+    }
+
+
+def _f51_http_get(port, path="/metrics", timeout=5.0, host="127.0.0.1"):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect((host, port))
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+    chunks = []
+    while True:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    s.close()
+    data = b"".join(chunks)
+    sep = data.find(b"\r\n\r\n")
+    if sep < 0:
+        return (-1, b"")
+    first = data[:data.find(b"\r\n")].decode("latin-1", "replace")
+    parts = first.split(" ", 2)
+    status = int(parts[1]) if len(parts) >= 2 else -1
+    return (status, data[sep + 4:])
+
+
+def _f51_scrape(port):
+    status, body = _f51_http_get(port, "/metrics")
+    if status != 200:
+        return (None, None)
+    text = body.decode("utf-8", errors="replace")
+    m_r = _F51_RELOAD_SUCCESS_RE.search(text)
+    m_g = _F51_ACTIVE_GENERATION_RE.search(text)
+    return (int(m_r.group(1)) if m_r else 0,
+            int(m_g.group(1)) if m_g else 0)
+
+
+def _f51_wait_prom(proc, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for line in proc._collected_lines:
+            if '"event":"prom_endpoint_ready"' in line:
+                try:
+                    return int(json.loads(line).get("port"))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+        line = proc._read_line_nonblocking()
+        if line is not None:
+            proc._collected_lines.append(line)
+            continue
+        time.sleep(0.05)
+    return None
+
+
+def _f51_atomic_replace(target_path, new_cfg):
+    """Write `new_cfg` to a tmp in the same directory, then os.rename
+    it over `target_path`. This is the `mv newfile config.json`
+    pattern from the §F5.1 spec — emits IN_MOVED_TO on the watched
+    basename. Same-directory rename is atomic on POSIX."""
+    dir_ = os.path.dirname(target_path)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".pktgate_f5_1_", suffix=".json", dir=dir_,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(new_cfg, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, target_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def test_f5_1_happy_reload_via_inotify_moved_to(pktgate_process):
+    """F5.1: `mv newfile config.json` over the watched directory fires
+    exactly one reload. Contract: success counter += 1, active
+    generation += 1 within the 250 ms SLO (we allow a generous 4 s
+    poll window for dev-tsan cadence)."""
+    proc = pktgate_process(
+        _f51_make_config(),
+        eal_args=eal_args_for("f51"),
+        timeout=30,
+    )
+    proc.start()
+    assert proc.wait_ready(timeout=60), (
+        f"binary not ready. stdout={proc.stdout_text!r} "
+        f"stderr={proc.stderr_text!r}"
+    )
+
+    port = _f51_wait_prom(proc)
+    assert port is not None and port > 0, (
+        f"prom_endpoint_ready not observed. "
+        f"collected={proc._collected_lines!r}"
+    )
+    # Install cushion: let inotify_add_watch settle.
+    time.sleep(0.2)
+
+    config_path = proc._config_file.name
+    baseline_reload, baseline_gen = _f51_scrape(port)
+    assert baseline_reload is not None, (
+        "could not scrape /metrics for baseline reload counter"
+    )
+
+    # Prepare "config B" and `mv` it over the live config path. This
+    # is the D38 IN_MOVED_TO trigger — the ONLY path this test
+    # exercises. No UDS, no SIGHUP, no deploy() helper.
+    new_cfg = _f51_make_config()
+    new_cfg["sizing"]["rules_per_layer_max"] = 128  # distinguishable
+    _f51_atomic_replace(config_path, new_cfg)
+
+    # Poll for reload bump. 4 s window — tolerant of dev-tsan slowdown.
+    deadline = time.monotonic() + 4.0
+    reload_n, gen_n = baseline_reload, baseline_gen
+    while time.monotonic() < deadline:
+        reload_n, gen_n = _f51_scrape(port)
+        if reload_n is None:
+            time.sleep(0.05)
+            continue
+        if reload_n > baseline_reload and gen_n > baseline_gen:
+            break
+        time.sleep(0.05)
+
+    assert reload_n == baseline_reload + 1, (
+        f"F5.1: pktgate_reload_total{{result=success}} must bump by "
+        f"exactly 1 after `mv newfile config.json`. "
+        f"baseline={baseline_reload} final={reload_n}"
+    )
+    assert gen_n == baseline_gen + 1, (
+        f"F5.1: pktgate_active_generation must bump by exactly 1. "
+        f"baseline={baseline_gen} final={gen_n}"
+    )
+
+    proc.stop()
+    assert proc.returncode == 0, (
+        f"binary exited non-zero: rc={proc.returncode} "
+        f"stderr={proc.stderr_text!r}"
+    )

@@ -1,10 +1,24 @@
 // tests/unit/test_inotify_debounce.cpp
 //
 // M11 C0 — debounce timer unit tests (Ud.1 / Ud.2 / Ud.X1 / Ud.X2 / Ud.X3).
+// M11 C3 — X1.11 debounce-correctness boundary (two events exactly
+//          one window apart → two distinct fires, not coalesced).
 //
 // §9.3 spec: 150 ms debounce window. One trigger per quiescent window,
 // reset on each incoming event. Clock is injected for deterministic
 // unit tests; Ud.X3 exercises the default real-clock path.
+//
+// X1.11 (test-plan-drafts/chaos.md §X1.11 "Debounce correctness") is
+// implemented here as a unit-tier test rather than a chaos-tier
+// integration because the assertion ("exactly two rename events 150 ms
+// apart → 2 distinct reloads, not 1") is a PURE debouncer property —
+// clock arithmetic against the `window_` field. Putting it at the
+// unit tier makes it deterministic (no kernel/scheduler jitter) and
+// an order of magnitude cheaper than spinning the binary. The
+// functional tier already covers the integration path end-to-end
+// (F7.*) and the chaos tier covers the storm-coalesce invariant
+// (X1.1). X1.11's job is to pin the WINDOW-BOUNDARY edge case; the
+// unit tier is the right home for that.
 
 #include "src/ctl/inotify/debounce.h"
 
@@ -130,4 +144,40 @@ TEST(InotifyDebounce, Ud_X3_DefaultClockFallback) {
 
   EXPECT_TRUE(d.poll());
   EXPECT_FALSE(d.poll());  // one fire only per quiescent window
+}
+
+// Ud.X4 — X1.11 debounce correctness boundary: two events exactly one
+// window apart produce TWO distinct fires, not one coalesced fire.
+//
+// Scenario: feed(t0), then window elapses → poll returns TRUE.
+// Immediately after (still at t0+window) a second feed arrives.
+// Another full window later, poll returns TRUE again.
+//
+// This is the window-boundary edge case that chaos.md §X1.11 pins:
+// the debouncer must NOT silently absorb the second event because
+// "we just fired" — `pending_` was cleared at the first fire, so a
+// new feed() re-arms it cleanly.
+TEST(InotifyDebounce, Ud_X4_X1_11_BoundaryTwoEventsYieldTwoFires) {
+  auto t0 = t0_anchor();
+  MockClock clock{t0};
+  Debouncer d{kWindow, [&clock]() { return clock.get(); }};
+
+  // Event 1 at t0. First fire at t0 + 150 ms.
+  d.feed(t0);
+  EXPECT_FALSE(d.poll(t0 + std::chrono::milliseconds{149}));
+  EXPECT_TRUE(d.poll(t0 + std::chrono::milliseconds{150}));
+
+  // Event 2 arrives exactly at the boundary (t0 + 150 ms). This is
+  // the X1.11 setup: one window apart from event 1.
+  auto t1 = t0 + std::chrono::milliseconds{150};
+  d.feed(t1);
+
+  // Second fire requires another full window.
+  EXPECT_FALSE(d.poll(t1 + std::chrono::milliseconds{149}));
+  EXPECT_TRUE(d.poll(t1 + std::chrono::milliseconds{150}));
+
+  // No further feed → no further fire. Proves we got exactly 2,
+  // not 1 (coalesced) and not 3 (spurious).
+  EXPECT_FALSE(d.poll(t1 + std::chrono::milliseconds{500}));
+  EXPECT_FALSE(d.poll(t1 + std::chrono::seconds{10}));
 }
