@@ -82,9 +82,10 @@ TEST(RlArenaU5_1, PerLcoreIsolation) {
   // Slot 0 changed; slot 1 did not.
   EXPECT_EQ(std::memcmp(&row.per_lcore[1], &before_slot1, sizeof(TokenBucket)),
             0);
-  // Spot-check an adjacent-but-far slot too.
-  TokenBucket zero_bucket{};
-  zero_bucket.tokens = 1'000;
+  // Spot-check an adjacent-but-far slot too. M13 C0: dropped the unused
+  // `zero_bucket{}` fixture — the per-field EXPECT_EQ checks below are
+  // the actual assertion; `zero_bucket` was dead code that tripped
+  // dev-release -Werror=unused-but-set-variable.
   EXPECT_EQ(row.per_lcore[kMaxLcores - 1].tokens, 1'000u);
   EXPECT_EQ(row.per_lcore[kMaxLcores - 1].last_refill_tsc, 0u);
 }

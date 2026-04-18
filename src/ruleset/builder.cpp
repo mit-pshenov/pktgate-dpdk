@@ -11,6 +11,7 @@
 
 #include "src/ruleset/builder.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -222,10 +223,17 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
   // Custom allocators may not zero memory; we rely on unused slots
   // carrying rule_id=0, rate=0, burst=0 (D41 lockstep only populates
   // slots for live RL verbs). Default + spy allocators do zero-fill;
-  // belt-and-braces memset guarantees the invariant under any
+  // belt-and-braces fill_n guarantees the invariant under any
   // allocator implementation.
+  //
+  // M13 C0 — release build fix: `RlAction` has `= 0` default member
+  // initialisers on every field (see ruleset.h), making it formally
+  // non-trivially-default-constructible. GCC -O3 + -Werror=class-memaccess
+  // rejects memset of that type. std::fill_n with a value-initialised
+  // `RlAction{}` is the standards-blessed way to zero the array and
+  // compiles to the same vectorised store on every optimisation level.
   if (rs.rl_actions != nullptr) {
-    std::memset(rs.rl_actions, 0, rl_bytes);
+    std::fill_n(rs.rl_actions, cap, RlAction{});
   }
   rs.n_rl_actions = 0;
 

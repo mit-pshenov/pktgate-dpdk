@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include <rte_common.h>  // M13 C0 — RTE_CACHE_LINE_SIZE, RTE_ALIGN_CEIL (QSBR alignment fix)
 #include <rte_cycles.h>  // M9 C2 — rte_get_tsc_hz for WorkerCtx cache
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -373,9 +374,15 @@ int main(int argc, char* argv[]) {
   // cacheline-sized).
   const std::uint32_t qsbr_max_threads =
       static_cast<std::uint32_t>(n_workers + 1u);
-  size_t qsbr_sz = rte_rcu_qsbr_get_memsize(qsbr_max_threads);
-  void* qsbr_raw =
-      std::aligned_alloc(alignof(std::max_align_t), qsbr_sz);
+  // M13 C0 — `struct rte_rcu_qsbr` is `__rte_cache_aligned` (64 B) and
+  // its internal accessors use aligned loads/stores. `alignof(max_align_t)`
+  // on x86-64 is 16, which UBSan's alignment check correctly flags the
+  // moment rte_rcu_qsbr_thread_online touches the handle. Align to the
+  // DPDK cache line, and round size up to the same multiple (POSIX
+  // aligned_alloc requires `size % alignment == 0`).
+  size_t qsbr_sz_raw = rte_rcu_qsbr_get_memsize(qsbr_max_threads);
+  size_t qsbr_sz = RTE_ALIGN_CEIL(qsbr_sz_raw, RTE_CACHE_LINE_SIZE);
+  void* qsbr_raw = std::aligned_alloc(RTE_CACHE_LINE_SIZE, qsbr_sz);
   if (qsbr_raw == nullptr) {
     log_json("{\"error\":\"qsbr_alloc_failed\"}");
     rte_mempool_free(mp);
@@ -540,8 +547,15 @@ int main(int argc, char* argv[]) {
             s.rx_nombuf = es.rx_nombuf;
             ps.push_back(s);
 
+            // M13 C0 — `rte_eth_link_get_nowait` is declared
+            // warn_unused_result; GCC -O3 refuses a plain `(void)` cast.
+            // Treat a failing probe as "link unknown / down" (0). The
+            // zero-initialised `link` above already has link_status=0,
+            // so the fallback naturally degrades to "down".
             struct rte_eth_link link{};
-            (void)rte_eth_link_get_nowait(pid, &link);
+            if (rte_eth_link_get_nowait(pid, &link) != 0) {
+              link.link_status = 0;
+            }
             link_up.push_back(link.link_status ? 1u : 0u);
           }
 
