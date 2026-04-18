@@ -2417,6 +2417,31 @@ explicitly in the handoff alongside compile-side smoke.
 
 **Origin:** M4 C8 `populate_ruleset_eal()` orphan, 2026-04-13.
 
+**Amendment 2026-04-18 (C1b — visitor exhaustiveness).**
+
+`resolve_action` в `src/compiler/object_compiler.cpp` переведён с
+`if constexpr`-chain с catch-all `else { out.verb = ActionVerb::kDrop; }`
+на `static_assert(always_false_v<T>, ...)` exhaustive pattern с
+dependent-false идиомой. Добавление arm'а в `config::RuleAction`
+variant без соответствующей ветки в visitor'е теперь fails at compile
+time с ясным сообщением «D41 C1b guard: unhandled config::RuleAction
+variant arm — add a branch in resolve_action (object_compiler.cpp)
+when config::RuleAction gains a new variant member».
+
+Класс: тот же silent-lowering gap что C1 targets на
+CompiledAction → RuleAction axis, только C1b покрывает config →
+CompiledAction side (Caveat 2 из `scratch/d41-discovery-report.md`
+§2). До C1b любой седьмой arm в `RuleAction` variant'е silently
+lowered как `verb=kDrop`, payload сбрасывался в compiler TU без
+warning'а.
+
+**Anti-pattern**: `if constexpr`-else с дефолтным fallback в
+`std::visit`-over-variant visitor'ах запрещён в pktgate codebase.
+Правило распространяется на все будущие visitors над closed
+variants; open variants (через `std::any` и т.п.) — вне scope.
+
+Landed: D41 C1b.
+
 ### D42 — Control-plane HTTP is hand-rolled, not vendored
 
 **Decision.** All Phase 1 control-plane HTTP endpoints (starting with

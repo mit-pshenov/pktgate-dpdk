@@ -20,6 +20,25 @@
 
 namespace pktgate::compiler {
 
+namespace {
+
+// D41 C1b — dependent-false sentinel for exhaustive `if constexpr`
+// chains over closed variants. Using a plain `static_assert(false, …)`
+// in the final `else` branch of a generic lambda would fire at
+// template-definition time (i.e. unconditionally, even when every
+// `if constexpr` arm matches a real variant member). Making the
+// predicate depend on `T` defers the failure to instantiation, so
+// it only fires if a future `config::RuleAction` variant arm lands
+// without a matching branch in `resolve_action`.
+//
+// Anti-pattern fixed: the previous `else { out.verb = ActionVerb::
+// kDrop; }` fallback silently lowered any unknown variant payload
+// to DROP. See review-notes §D41 Amendment 2026-04-18 (C1b).
+template <typename T>
+inline constexpr bool always_false_v = false;
+
+}  // namespace
+
 // -------------------------------------------------------------------------
 // compile_objects — expand named object definitions.
 
@@ -133,7 +152,11 @@ static ActionLowered resolve_action(
           out.verb = ActionVerb::kMirror;
           // Mirror is compile-error-rejected below; no payload lowered.
         } else {
-          out.verb = ActionVerb::kDrop;  // exhaustive variant
+          static_assert(always_false_v<T>,
+                        "D41 C1b guard: unhandled config::RuleAction "
+                        "variant arm — add a branch in resolve_action "
+                        "(object_compiler.cpp) when config::RuleAction "
+                        "gains a new variant member");
         }
       },
       action);
