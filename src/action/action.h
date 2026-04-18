@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <tuple>
 
 namespace pktgate::action {
 
@@ -38,5 +39,45 @@ struct alignas(4) RuleAction {
 
 static_assert(sizeof(RuleAction) == 20, "RuleAction layout drift (D22)");
 static_assert(alignof(RuleAction) == 4, "RuleAction alignment drift (D22)");
+
+// -------------------------------------------------------------------------
+// D41 compile-time guard — observable-field projection (post-Phase 1).
+//
+// Allowlist of RuleAction fields that MUST be lowered through the
+// compiler -> builder pipeline. A parallel projection of the same
+// shape/types lives on compiler::CompiledAction (see
+// src/compiler/compiler.h); the builder TU pairs them via two
+// static_asserts (arity fold + per-element is_same_v fold) so any
+// drift between the two structs fails at compile time.
+//
+// Fields deliberately EXCLUDED from the allowlist:
+//
+//   * next_layer — excluded: dead carrier, re-add if a dataplane
+//     consumer appears. Zero readers in src/dataplane/; layer
+//     sequencing is driven by classify_l{2,3,4} Disposition returns.
+//   * flags      — excluded: dead carrier. Zero readers anywhere
+//     in the tree; reserved stub space for future attribute bits.
+//   * mirror_port — excluded: mirror is compile-rejected (D7); sentinel
+//     is correct for MVP. If D7 ever relaxes and mirror enters the
+//     MVP, re-add to both projections in lockstep and add lowering
+//     in builder::copy_actions.
+//
+// Types and element count MUST match compiler::observable_fields() —
+// drift triggers `D41 guard: ...` static_assert failures at the TU
+// that pairs the two projections (src/ruleset/builder.cpp).
+// See also scratch/d41-discovery-report.md §3 (Candidate B) and
+// review-notes.md §D41.
+constexpr auto observable_fields(const RuleAction& ra) {
+  return std::tuple{
+      ra.rule_id,
+      ra.counter_slot,
+      ra.verb,
+      ra.execution_tier,
+      ra.redirect_port,
+      ra.dscp,
+      ra.pcp,
+      ra.rl_index,
+  };
+}
 
 }  // namespace pktgate::action

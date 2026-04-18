@@ -53,6 +53,20 @@ pktgate_add_test(
   LINK    pktgate_core
 )
 
+# D41 C1 — observable_fields tuple-projection guard: runtime roundtrip
+# unit test. Links pktgate_rl_ctl so the RateLimit branch can wire a
+# real RlSlotAllocator against the process-wide arena singleton. The
+# compile-time half lives as static_asserts in src/ruleset/builder.cpp
+# (inside pktgate_core) and fires at every configure/build regardless
+# of this test — the unit test is the runtime half of the D41 C1
+# atomic commit. No EAL.
+pktgate_add_test(
+  NAME    unit.test_d41_guard
+  SOURCES test_d41_guard.cpp
+  LABELS  unit
+  LINK    pktgate_core pktgate_rl_ctl
+)
+
 # M3 C4: EAL-needing unit tests. Separate binary because EAL can only
 # be initialized once per process. Links pktgate_dp (which includes DPDK).
 pktgate_add_test(

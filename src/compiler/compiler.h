@@ -22,6 +22,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -125,6 +126,40 @@ struct CompiledAction {
   std::uint64_t rl_rate_bps{0};
   std::uint64_t rl_burst_bytes{0};
 };
+
+// -------------------------------------------------------------------------
+// D41 compile-time guard — observable-field projection (post-Phase 1).
+//
+// Parallel projection to action::observable_fields(). Each element MUST
+// match the corresponding RuleAction projection in both order AND type
+// (per-element is_same_v). Casts here normalise namespace / enum /
+// signedness drift:
+//
+//   * CompiledAction::rule_id is int32_t (parser-validated positive);
+//     RuleAction::rule_id is uint32_t. Cast up to uint32_t.
+//   * ActionVerb / ExecutionTier are enum class with uint8_t underlying;
+//     RuleAction::{verb,execution_tier} are raw uint8_t. Cast to the
+//     underlying type via static_cast<uint8_t>.
+//   * rl_slot (compiler side) and rl_index (action side) are the same
+//     16-bit slot index under two names — the namespace drift is noted
+//     in scratch/d41-discovery-report.md §1.1 and is not a defect.
+//
+// Fields excluded: dscp/pcp carry through directly; next_layer, flags,
+// mirror_port do not appear on CompiledAction and are dead carriers /
+// MVP-reject sentinels on the action side — see the matching comment
+// in src/action/action.h.
+constexpr auto observable_fields(const CompiledAction& ca) {
+  return std::tuple{
+      static_cast<std::uint32_t>(ca.rule_id),
+      ca.counter_slot,
+      static_cast<std::uint8_t>(ca.verb),
+      static_cast<std::uint8_t>(ca.execution_tier),
+      ca.redirect_port,
+      ca.dscp,
+      ca.pcp,
+      ca.rl_slot,
+  };
+}
 
 // -------------------------------------------------------------------------
 // RlSlotAllocator — M9 C3 (D10, D24): compile-time slot allocation

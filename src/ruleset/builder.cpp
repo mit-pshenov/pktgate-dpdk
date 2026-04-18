@@ -15,8 +15,67 @@
 #include <atomic>
 #include <cstring>
 #include <new>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+#include "src/action/action.h"
+#include "src/compiler/compiler.h"
 
 namespace pktgate::ruleset {
+
+// -------------------------------------------------------------------------
+// D41 compile-time guard — observable-field drift detector.
+//
+// The two projection functions live with their respective structs
+// (action::observable_fields in src/action/action.h,
+//  compiler::observable_fields in src/compiler/compiler.h). This TU
+// is where both headers meet and the drift check fires.
+//
+// Two static_asserts:
+//
+//   1. Arity fold — tuple_size equality. Catches "count drift":
+//      adding a field to one projection without adding to the other.
+//   2. Type fold — per-element is_same_v via std::index_sequence.
+//      Catches "type drift": element order swap, width change, or
+//      any static_cast shape mismatch between the two projections.
+//
+// Runtime wiring drift (both projections grow in lockstep but the
+// builder's copy_actions forgets to lower the new field) passes this
+// static check and is caught by the runtime roundtrip unit test in
+// tests/unit/test_d41_guard.cpp. Both halves ship together as the
+// "D41 C1 atomic commit" invariant (handoff §C1).
+//
+// See: review-notes.md §D41, scratch/d41-discovery-report.md §3
+// (Candidate B approved), scratch/d41-supervisor-handoff.md §C1.
+namespace {
+
+using ActionObservableTuple =
+    decltype(action::observable_fields(std::declval<action::RuleAction>()));
+using CompiledObservableTuple =
+    decltype(compiler::observable_fields(
+        std::declval<compiler::CompiledAction>()));
+
+static_assert(
+    std::tuple_size_v<ActionObservableTuple> ==
+        std::tuple_size_v<CompiledObservableTuple>,
+    "D41 guard: observable-field count drift between "
+    "action::RuleAction and compiler::CompiledAction projections");
+
+template <std::size_t... Is>
+constexpr bool observable_types_equal(std::index_sequence<Is...>) {
+  return (std::is_same_v<std::tuple_element_t<Is, ActionObservableTuple>,
+                         std::tuple_element_t<Is, CompiledObservableTuple>> &&
+          ...);
+}
+
+static_assert(
+    observable_types_equal(std::make_index_sequence<
+                           std::tuple_size_v<ActionObservableTuple>>{}),
+    "D41 guard: observable-field type drift between "
+    "action::RuleAction and compiler::CompiledAction projections");
+
+}  // namespace
 
 // Process-wide generation counter. Monotonically incrementing, never
 // wraps in practice (2^64 builds). std::memory_order_relaxed is fine —
