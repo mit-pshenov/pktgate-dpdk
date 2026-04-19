@@ -180,3 +180,17 @@ set_tests_properties(functional.test_f3_ratelimit PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 300
 )
+
+# M14 C2 — F14.1..F14.4 + F14.boot_smoke: main.cpp port resolution
+# via the C1 resolver + D41 boot-path guard. No taps, no NM keyfile;
+# pure control-plane wiring tests using net_null vdevs. 5 sub-tests
+# each boot a fresh EAL instance → 120 s is comfortable.
+add_test(
+  NAME functional.test_f14_main_resolver
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f14_main_resolver.py"
+)
+set_tests_properties(functional.test_f14_main_resolver PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 120
+)
