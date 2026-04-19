@@ -218,8 +218,12 @@ set_tests_properties(functional.test_f14_tap_exit PROPERTIES
 # creates the configured UDS socket inode at /run/pktgate/. Pure
 # control-plane — no TAP / NM keyfile / NDP surface. Data-plane vhost
 # exercise lands in M15 C3 (testpmd pair) and C4 (peer crash chaos).
-# Requires root (creates /run/pktgate/ and sockets). 1 sub-test × EAL
-# cold start + boot → 60 s is comfortable.
+# Requires root (creates /run/pktgate/ and sockets).
+#
+# M15 C2 — same file extended with F15.2 (SIGTERM unlink), F15.2b
+# (normal-exit unlink; D41 twin of F15.2), F15.3 (stale-socket guard
+# on boot). 4 sub-tests each boot a fresh EAL instance → 240 s
+# timeout.
 add_test(
   NAME functional.test_f15_vhost_boot
   COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f15_vhost_boot.py"
@@ -227,5 +231,5 @@ add_test(
 set_tests_properties(functional.test_f15_vhost_boot PROPERTIES
   LABELS "functional"
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
-  TIMEOUT 60
+  TIMEOUT 240
 )
