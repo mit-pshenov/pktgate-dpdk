@@ -211,3 +211,21 @@ set_tests_properties(functional.test_f14_tap_exit PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 180
 )
+
+# M15 C1 — F15.1 vhost boot smoke. net_null upstream + net_vhost
+# downstream (server mode); asserts pktgate reaches ready without a
+# peer, emits a port_resolved event naming the vhost port id, and
+# creates the configured UDS socket inode at /run/pktgate/. Pure
+# control-plane — no TAP / NM keyfile / NDP surface. Data-plane vhost
+# exercise lands in M15 C3 (testpmd pair) and C4 (peer crash chaos).
+# Requires root (creates /run/pktgate/ and sockets). 1 sub-test × EAL
+# cold start + boot → 60 s is comfortable.
+add_test(
+  NAME functional.test_f15_vhost_boot
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f15_vhost_boot.py"
+)
+set_tests_properties(functional.test_f15_vhost_boot PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 60
+)

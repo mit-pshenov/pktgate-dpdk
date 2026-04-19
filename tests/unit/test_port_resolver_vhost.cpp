@@ -88,15 +88,6 @@ PortLookupFn lookup_from(std::map<std::string, std::uint16_t> table) {
   };
 }
 
-PortQueueProbeFn probe_from(std::map<std::uint16_t, std::uint16_t> table) {
-  return [t = std::move(table)](std::uint16_t port_id)
-             -> std::optional<std::uint16_t> {
-    auto it = t.find(port_id);
-    if (it == t.end()) return std::nullopt;
-    return it->second;
-  };
-}
-
 PortQueueProbeFn probe_all(std::uint16_t caps) {
   return [caps](std::uint16_t /*port_id*/)
              -> std::optional<std::uint16_t> { return caps; };

@@ -212,6 +212,19 @@ pktgate_add_test(
   LINK    pktgate_ports_ctl pktgate_core
 )
 
+# M15 C1: D44 vhost profile coverage against the M14 C1 resolver
+# (U15.1..U15.3). Same harness pattern as unit.test_port_resolver —
+# zero resolver LOC expected to change; these tests pin the existing
+# comma-strip + D28-generalised logic against `net_vhost` vdev specs
+# so any future regression on the VdevSelector arm surfaces at the
+# unit tier rather than at M15 functional / M15 integration tiers.
+pktgate_add_test(
+  NAME    unit.test_port_resolver_vhost
+  SOURCES test_port_resolver_vhost.cpp
+  LABELS  unit
+  LINK    pktgate_ports_ctl pktgate_core
+)
+
 # M11 C0: inotify event-mask filter (Ud.3a / Ud.3b / Ud.3c / Ud.4).
 # Pure function, header-only lib surface — no kernel, no thread, no
 # DPDK. Links pktgate_inotify_ctl so the archive is exercised by the

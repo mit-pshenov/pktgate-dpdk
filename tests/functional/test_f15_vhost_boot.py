@@ -37,9 +37,19 @@ import time
 import pytest
 
 
-DPDK_DRIVER_DIR = os.environ.get(
-    "DPDK_DRIVER_DIR", "/home/mit/Dev/dpdk-25.11/build/drivers/"
-)
+# EAL driver-dir is **opt-in** for F15.1. Rationale: the dev VM's
+# `/etc/ld.so.conf.d/dpdk-dev.conf` already exposes DPDK PMDs at
+# `/home/mit/Dev/dpdk-25.11/build/drivers/` via ldconfig (memory
+# `vm_dpdk_layout.md`). Explicitly passing `-d <dir>` plus ldconfig
+# hits EAL twice per PMD `.so`, which on the post-2026-04-19 dual
+# install (build-tree + `/usr/local/lib64/dpdk/pmds-*/`) causes
+# per-driver tailq double-registration (`VFIO_CDX_RESOURCE_LIST
+# tailq is already registered` → panic in `tailqinitfn_cdx_vfio_
+# tailq`). F15.1 relies on ldconfig. If the operator overrides
+# the behaviour (e.g. to run this test against a DPDK install
+# outside the ldconfig path), they can set PKTGATE_DPDK_DRIVER_DIR
+# and the EAL argv picks it up explicitly.
+DPDK_DRIVER_DIR = os.environ.get("PKTGATE_DPDK_DRIVER_DIR", "").strip()
 
 _RUNTIME_DIR = "/run/pktgate"
 _SOCK_NAME = "vhost-m15.sock"
@@ -93,17 +103,21 @@ def _rm_stale():
 
 def _eal_args(file_prefix: str, sock_path: str):
     """EAL argv: net_null upstream + net_vhost downstream (server mode)."""
-    return [
+    argv = [
         "--no-pci",
         "--no-huge",
         "-m", "512",       # FIB DIR24_8 baseline (~128 MB)
-        "-d", DPDK_DRIVER_DIR,
+    ]
+    if DPDK_DRIVER_DIR:
+        argv += ["-d", DPDK_DRIVER_DIR]
+    argv += [
         "--vdev", "net_null0",
         "--vdev", f"net_vhost0,iface={sock_path},queues=1",
         "-l", "0,1",
         "--log-level", "lib.*:error",
         "--file-prefix", file_prefix,
     ]
+    return argv
 
 
 def _config():
@@ -207,12 +221,22 @@ def test_pktgate_boots_with_vhost_downstream(
     # during rte_eal_init, strictly before the ready emit.
     assert os.path.exists(sock_path), (
         f"vhost socket {sock_path} not created by DPDK net_vhost. "
-        f"stdout={proc.stdout_text!r}"
     )
     st = os.stat(sock_path)
     assert stat.S_ISSOCK(st.st_mode), (
         f"{sock_path} exists but is not a socket inode: "
         f"mode=0o{st.st_mode:o}"
+    )
+
+    # Tear the binary down so `proc.stdout_text` is populated with the
+    # full captured output (the PktgateProcess harness only snapshots
+    # stdout_text on wait_ready timeout or on wait_exit; successful
+    # wait_ready leaves the rolling buffer in-place until stop()).
+    proc.stop()
+
+    assert proc.returncode == 0, (
+        f"unclean exit after SIGTERM: rc={proc.returncode} "
+        f"stdout={proc.stdout_text!r}"
     )
 
     # port_resolved event names the vhost role with a concrete port id.
@@ -227,11 +251,4 @@ def test_pktgate_boots_with_vhost_downstream(
     assert vhost_port_id == 1, (
         f"downstream_port expected to resolve to port 1 (second --vdev), "
         f"got {vhost_port_id}. resolved={resolved!r}"
-    )
-
-    proc.stop()
-
-    assert proc.returncode == 0, (
-        f"unclean exit after SIGTERM: rc={proc.returncode} "
-        f"stdout={proc.stdout_text!r}"
     )
