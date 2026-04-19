@@ -2705,6 +2705,19 @@ for C2, D33 lockstep for C3, TAP profile smoke for C4) lives in
 `scratch/` is not checked in; the handoff is ephemeral
 scaffolding, while D43 itself is the durable decision record.
 
+**Implementation footprint.** M14 C1 lands the resolver as a new
+DPDK-free static library `libpktgate_ports_ctl.a`
+(`src/ctl/port_resolver.{h,cpp}`); the two DPDK contact points
+(`rte_eth_dev_get_port_by_name`, `rte_eth_dev_info_get`) are
+threaded as `std::function` callbacks so the unit suite
+(`tests/unit/test_port_resolver.cpp`, U14.1..U14.5) drives the
+full resolution + D28-generalised queue-symmetry path without
+EAL. Production wiring lands in M14 C2 main.cpp; counter rows
+ship in M14 C3 with the §10.3 five-fold lockstep. Lib name added
+to `scripts/check-counter-consistency.sh` `is_allowlisted()`
+case per the D33 dual-allowlist rule (memory
+`grabli_d33_manifest_dual_allowlist.md`).
+
 ### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
 
 Not standalone decisions; one-paragraph prose fixes surfaced by

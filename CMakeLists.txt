@@ -178,6 +178,32 @@ target_link_libraries(pktgate_rl_ctl PUBLIC pktgate_rl)
 pktgate_apply_warnings(pktgate_rl_ctl)
 pktgate_apply_sanitizer(pktgate_rl_ctl)
 
+# ---- libpktgate_ports_ctl (M14 C1) — D43 DPDK-free port resolver ---------
+#
+# Maps `Config.interface_roles` (sum-type {pci|vdev|name}) to runtime
+# `uint16_t` DPDK port ids and enforces D28's TX-queue symmetry
+# invariant for any registered port (generalised from pci-only to all
+# PMD families per D43). The library is DPDK-free end-to-end: the two
+# DPDK contact points (`rte_eth_dev_get_port_by_name` and
+# `rte_eth_dev_info_get`) are injected as `std::function` callbacks so
+# unit tests run under dev-* presets without `rte_eal_init`.
+#
+# Layering mirrors pktgate_rl (math) ↔ pktgate_rl_ctl (control-plane
+# arena): the resolver is control-plane only — production wiring lives
+# in main.cpp (M14 C2) where the lambdas wrap the real DPDK calls. No
+# new counter is introduced in C1 (no D33 src/-side allowlist update
+# needed); the lib name itself is added to the
+# scripts/check-counter-consistency.sh `is_allowlisted()` case so a
+# future review-notes / design.md prose mention does not trigger a
+# false-positive DRIFT.
+add_library(pktgate_ports_ctl STATIC
+  src/ctl/port_resolver.cpp
+)
+target_include_directories(pktgate_ports_ctl PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(pktgate_ports_ctl PUBLIC pktgate_core)
+pktgate_apply_warnings(pktgate_ports_ctl)
+pktgate_apply_sanitizer(pktgate_ports_ctl)
+
 # ---- libpktgate_telemetry (M10 C0) — DPDK-free control-plane telemetry ---
 #
 # Hosts the Prometheus OpenMetrics encoder (C0), snapshot ring (C1),

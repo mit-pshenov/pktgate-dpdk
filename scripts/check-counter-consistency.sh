@@ -214,6 +214,9 @@ echo "pass2: ok — 3 compiler counter families verified, ${deferred_count} defe
 #                             libpktgate_runtime.a).
 #   pktgate_telemetry      — lib name (M10 control-plane telemetry,
 #                             libpktgate_telemetry.a; cited in D42).
+#   pktgate_ports_ctl      — lib name (M14 C1 D43 port resolver,
+#                             libpktgate_ports_ctl.a; cited in D43
+#                             prose / handoff).
 #   pktgate_uid            — the daemon's own-uid variable (§10.7 / D38).
 #   pktgate_gid            — the daemon's own-gid variable (§10.7 / D38).
 #   pktgate_test           — auxiliary Q9 test user account name.
@@ -223,6 +226,7 @@ is_allowlisted() {
     pktgate_dpdk|pktgate_dpdk_test_*|pktgate_dpdk_fuzz_*|\
     pktgate_core|pktgate_dp|\
     pktgate_rl|pktgate_rl_ctl|pktgate_runtime|pktgate_telemetry|\
+    pktgate_ports_ctl|\
     pktgate_uid|pktgate_gid|\
     pktgate_test|pktgate_test2)
       return 0

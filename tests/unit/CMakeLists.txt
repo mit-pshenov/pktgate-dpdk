@@ -200,6 +200,18 @@ pktgate_add_test(
   LINK    pktgate_telemetry
 )
 
+# M14 C1: D43 port resolver unit suite (U14.1..U14.5). DPDK-free —
+# tests inject lookup/probe callbacks via std::function and never
+# touch EAL. Links pktgate_ports_ctl plus pktgate_core (Config /
+# parser, used to drive the resolver through the real parse path
+# per the M14 handoff anti-creep rule).
+pktgate_add_test(
+  NAME    unit.test_port_resolver
+  SOURCES test_port_resolver.cpp
+  LABELS  unit
+  LINK    pktgate_ports_ctl pktgate_core
+)
+
 # M11 C0: inotify event-mask filter (Ud.3a / Ud.3b / Ud.3c / Ud.4).
 # Pure function, header-only lib surface — no kernel, no thread, no
 # DPDK. Links pktgate_inotify_ctl so the archive is exercised by the
