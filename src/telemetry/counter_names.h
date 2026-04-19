@@ -114,6 +114,13 @@ inline constexpr CounterName kPortTxDroppedTotal{
     "pktgate_port_tx_dropped_total", MetricType::Counter};
 inline constexpr CounterName kPortLinkUp{
     "pktgate_port_link_up", MetricType::Gauge};
+// M14 C3 — D43 per-port backpressure counters emitted by pktgate's
+// own tx_one() / redirect_drain() wrappers. PMD-agnostic. D1-clean:
+// per-lcore bumps via relaxed_bump aggregated at publisher tick.
+inline constexpr CounterName kTxDroppedTotal{
+    "pktgate_tx_dropped_total", MetricType::Counter};
+inline constexpr CounterName kTxBurstShortTotal{
+    "pktgate_tx_burst_short_total", MetricType::Counter};
 
 // --- Per-lcore family -------------------------------------------------
 inline constexpr CounterName kLcorePacketsTotal{
@@ -191,7 +198,7 @@ inline constexpr CounterName kLogDroppedTotal{
 //
 // Order is exposition-stable (mirrors §10.3 prose order). Grepping for
 // a name in source returns a single hit in this header.
-inline constexpr std::array<CounterName, 37> kAllCounterNames{
+inline constexpr std::array<CounterName, 39> kAllCounterNames{
     // Rule-match family
     kRulePacketsTotal,
     kRuleBytesTotal,
@@ -205,6 +212,9 @@ inline constexpr std::array<CounterName, 37> kAllCounterNames{
     kPortRxDroppedTotal,
     kPortTxDroppedTotal,
     kPortLinkUp,
+    // M14 C3 — D43 per-port backpressure (pktgate's own tx wrappers).
+    kTxDroppedTotal,
+    kTxBurstShortTotal,
     // Per-lcore family
     kLcorePacketsTotal,
     kLcoreCyclesPerBurst,

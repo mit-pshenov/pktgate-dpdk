@@ -733,6 +733,13 @@ int main(int argc, char* argv[]) {
               &worker_ctx.tag_pcp_noop_untagged_total;
           view.redirect_dropped_total = &worker_ctx.redirect_dropped_total;
 
+          // M14 C3 — D43 per-port backpressure counter arrays. Point
+          // at the fixed-size WorkerCtx arrays (size RTE_MAX_ETHPORTS).
+          view.tx_dropped_per_port       = worker_ctx.tx_dropped_per_port;
+          view.tx_dropped_per_port_count = RTE_MAX_ETHPORTS;
+          view.tx_burst_short_per_port       = worker_ctx.tx_burst_short_per_port;
+          view.tx_burst_short_per_port_count = RTE_MAX_ETHPORTS;
+
           // Walk the currently-active ruleset to build RuleIdent spans
           // + ActiveRuleCounts. The manager's active_ruleset() acquire-
           // loads under RCU; the pointer is valid for the duration of
@@ -852,6 +859,25 @@ int main(int argc, char* argv[]) {
                 body += format_gauge("pktgate_port_link_up",
                                      lbls,
                                      static_cast<std::int64_t>(up));
+                // M14 C3 — D43 per-port backpressure (pktgate's own
+                // tx wrappers). Emitted inside the per_port loop so
+                // `{port="N"}` label stays consistent across the
+                // whole per-port family. Index-guarded against
+                // shorter rollup vectors (tx_*_per_port is grown to
+                // max count across views, which can be < or >
+                // snap.per_port.size()).
+                const std::uint64_t tx_drop =
+                    pid < snap.tx_dropped_per_port.size()
+                        ? snap.tx_dropped_per_port[pid]
+                        : 0u;
+                body += format_counter("pktgate_tx_dropped_total",
+                                       lbls, tx_drop);
+                const std::uint64_t tx_short =
+                    pid < snap.tx_burst_short_per_port.size()
+                        ? snap.tx_burst_short_per_port[pid]
+                        : 0u;
+                body += format_counter("pktgate_tx_burst_short_total",
+                                       lbls, tx_short);
               }
 
               // ---- Per-rule family ---------------------------------

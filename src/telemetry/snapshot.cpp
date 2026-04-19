@@ -159,6 +159,33 @@ Snapshot build_snapshot(std::uint64_t generation,
         relaxed_load_u64(view.tag_pcp_noop_untagged_total);
     out.redirect_dropped_total +=
         relaxed_load_u64(view.redirect_dropped_total);
+
+    // M14 C3 — D43 per-port backpressure. Grow the rollup vectors to
+    // the max count seen across views and element-wise sum each
+    // port's counter. Null pointer contributes 0 (count-guarded).
+    if (view.tx_dropped_per_port != nullptr &&
+        view.tx_dropped_per_port_count > 0) {
+      if (out.tx_dropped_per_port.size() < view.tx_dropped_per_port_count) {
+        out.tx_dropped_per_port.resize(view.tx_dropped_per_port_count, 0u);
+      }
+      for (std::uint32_t i = 0; i < view.tx_dropped_per_port_count; ++i) {
+        out.tx_dropped_per_port[i] +=
+            relaxed_load_bucket(view.tx_dropped_per_port, i);
+      }
+    }
+    if (view.tx_burst_short_per_port != nullptr &&
+        view.tx_burst_short_per_port_count > 0) {
+      if (out.tx_burst_short_per_port.size() <
+          view.tx_burst_short_per_port_count) {
+        out.tx_burst_short_per_port.resize(
+            view.tx_burst_short_per_port_count, 0u);
+      }
+      for (std::uint32_t i = 0; i < view.tx_burst_short_per_port_count;
+           ++i) {
+        out.tx_burst_short_per_port[i] +=
+            relaxed_load_bucket(view.tx_burst_short_per_port, i);
+      }
+    }
   }
 
   // -- Per-rule sums ----------------------------------------------
@@ -304,6 +331,14 @@ std::set<std::string> snapshot_metric_names(const Snapshot& snap) {
   // C5 — publisher liveness gauge (F8.13 / D3). Always surfaced; the
   // publisher always stamps `publisher_generation_gauge = generation`.
   names.insert("pktgate_publisher_generation");
+
+  // M14 C3 — D43 per-port backpressure counter families. Always
+  // surfaced as base names (presence contract — per-port label
+  // cardinality is 0 when no view exposes the arrays; a zero-width
+  // snapshot still routes the name through D33). Mirrors the
+  // handling of port_link_up / lcore scalar counters above.
+  names.insert("pktgate_tx_dropped_total");
+  names.insert("pktgate_tx_burst_short_total");
 
   return names;
 }

@@ -105,8 +105,20 @@ inline void redirect_drain(WorkerCtx* ctx) {
       for (std::uint16_t i = sent; i < s.count; ++i) {
         rte_pktmbuf_free(s.pkts[i]);
       }
-      relaxed_add(&ctx->redirect_dropped_total,
-                  static_cast<std::uint64_t>(s.count - sent));
+      const std::uint64_t unsent =
+          static_cast<std::uint64_t>(s.count - sent);
+      relaxed_add(&ctx->redirect_dropped_total, unsent);
+      // M14 C3 — D43 per-port backpressure. Every unsent mbuf counts
+      // against the destination port; redirect_drain's dst port is
+      // `p` regardless of ctx->tx_port_id. Bump tx_dropped by the
+      // whole unsent count; bump tx_burst_short only if the burst
+      // was PARTIALLY accepted (sent > 0) — a fully-rejected burst
+      // looks to the operator like a hard outage, not short-burst
+      // backpressure.
+      relaxed_add(&ctx->tx_dropped_per_port[p], unsent);
+      if (sent > 0) {
+        relaxed_bump_bucket(ctx->tx_burst_short_per_port, p);
+      }
     }
     s.count = 0;
   }
@@ -274,9 +286,25 @@ inline std::uint16_t tx_one(WorkerCtx* ctx, std::uint16_t port_id,
   // ctx->tx_burst_fn lets unit tests inject a spy without reaching
   // the PMD. Production sets it to rte_eth_tx_burst at init time.
   if (ctx->tx_burst_fn == nullptr) {
+    // M14 C3 — D43: even the defensive no-hook path counts as a port
+    // drop for the caller-requested destination. Guard port_id
+    // against stray RuleAction sentinels (0xFFFF) + belt-and-braces
+    // bounds check on the fixed-size bucket array.
+    if (port_id < RTE_MAX_ETHPORTS) {
+      relaxed_bump_bucket(ctx->tx_dropped_per_port, port_id);
+    }
     return 0;  // defensive — treat as TX failure, caller frees.
   }
-  return ctx->tx_burst_fn(port_id, ctx->queue_id, &m, 1);
+  const std::uint16_t sent =
+      ctx->tx_burst_fn(port_id, ctx->queue_id, &m, 1);
+  if (sent == 0 && port_id < RTE_MAX_ETHPORTS) {
+    // M14 C3 — D43 per-port backpressure: single-packet send failed.
+    // tx_burst_short is NOT bumped here (short-burst needs sent > 0,
+    // by definition nb_pkts == 1 → sent ∈ {0, 1}; zero is a full
+    // drop, not a short burst).
+    relaxed_bump_bucket(ctx->tx_dropped_per_port, port_id);
+  }
+  return sent;
 }
 
 // -------------------------------------------------------------------------

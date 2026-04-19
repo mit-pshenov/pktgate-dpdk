@@ -154,6 +154,39 @@ struct WorkerCtx {
   // shared counter so long as no overflow occurs).
   std::uint64_t redirect_dropped_total = 0;
 
+  // M14 C3 — D43 per-port backpressure counters emitted by pktgate's
+  // own tx wrappers (tx_one() + redirect_drain() in action_dispatch.h).
+  // PMD-agnostic: these see every TX drop the driver returns on ANY
+  // backend (pci / TAP / vhost / memif), where per-driver xstats
+  // differ wildly.
+  //
+  //   tx_dropped_per_port[p]       — bumped whenever rte_eth_tx_burst
+  //                                  (or the unit-test spy) returns
+  //                                  fewer packets than requested.
+  //                                  tx_one: +1 when sent == 0.
+  //                                  redirect_drain: += (count - sent).
+  //   tx_burst_short_per_port[p]   — bumped once per redirect_drain
+  //                                  call that was partially accepted
+  //                                  (sent > 0 && sent < count). This
+  //                                  is the "short burst" signal the
+  //                                  operator uses to detect
+  //                                  backpressure onset (a single
+  //                                  dropped packet should not by
+  //                                  itself trip an alert).
+  //
+  // Per-lcore, indexed by dst port_id. RTE_MAX_ETHPORTS slots keeps
+  // the array addressable by any legal port id without a bounds
+  // branch per bump; sparse in practice (only ports actually targeted
+  // by ALLOW/TAG/REDIRECT ever see non-zero counts). Memory cost:
+  // 32 × 8 B × 2 arrays = 512 B per WorkerCtx.
+  //
+  // D1 hot-path invariant: bumped via relaxed_bump_bucket / relaxed_add
+  // helpers in src/dataplane/lcore_counter.h; lowers to mov/inc/mov
+  // on x86-64 with no `lock` prefix. Single-writer per lcore; no
+  // cross-CPU RMW, so D1 zero-atomics is preserved.
+  std::uint64_t tx_dropped_per_port[RTE_MAX_ETHPORTS]     = {};
+  std::uint64_t tx_burst_short_per_port[RTE_MAX_ETHPORTS] = {};
+
   // M9 C2 — rate-limit arena handle. Stable pointer for the entire
   // worker lifetime; the arena lives outside the Ruleset (D10) and
   // outlives every reload. action_dispatch reads

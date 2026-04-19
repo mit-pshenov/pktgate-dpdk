@@ -119,6 +119,21 @@ struct LcoreCounterView {
   // C4 — D16 REDIRECT drop counter.
   const std::uint64_t* redirect_dropped_total = nullptr;
 
+  // M14 C3 — D43 per-port backpressure counter arrays emitted by
+  // pktgate's own tx wrappers. Pointer + count mirror the pattern
+  // used by the truncation / fragment bucket arrays. Null-friendly
+  // (a fixture not exercising the tx path contributes 0 and no
+  // port-dimension entries).
+  //
+  // Expected count in production: RTE_MAX_ETHPORTS. Smaller counts
+  // are valid (unit-test fixtures with a handful of synthetic
+  // ports). The aggregator resizes Snapshot::tx_dropped_per_port
+  // to max(count across all views) and element-wise sums into it.
+  const std::uint64_t* tx_dropped_per_port       = nullptr;
+  std::uint32_t        tx_dropped_per_port_count = 0;
+  const std::uint64_t* tx_burst_short_per_port       = nullptr;
+  std::uint32_t        tx_burst_short_per_port_count = 0;
+
   // Per-rule counter row for this lcore: layout matches
   // `Ruleset::counter_row(lcore_id)`. `n_slots` is
   // `rs.counter_slots_per_lcore`. Null allowed for fakes that only
@@ -261,6 +276,15 @@ struct Snapshot {
   // `pktgate_port_link_up{port="N"}`. Publisher fills this from
   // `rte_eth_link_get_nowait` alongside `rte_eth_stats_get`.
   std::vector<std::uint8_t> per_port_link_up;
+
+  // M14 C3 — D43 per-port backpressure rollups. Sum of
+  // LcoreCounterView::tx_{dropped,burst_short}_per_port[i] across
+  // every lcore view. Length = max count observed across views (the
+  // aggregator grows the vectors as it walks views). Indexed by
+  // port_id; encoder emits `pktgate_tx_{dropped,burst_short}_total
+  // {port="N"}` per entry.
+  std::vector<std::uint64_t> tx_dropped_per_port;
+  std::vector<std::uint64_t> tx_burst_short_per_port;
 
   // C4 — reload + active-ruleset surface.
   ReloadState      reload{};
