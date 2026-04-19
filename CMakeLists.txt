@@ -289,8 +289,13 @@ if(NOT PKTGATE_FUZZ)
   # which main.cpp wires into the boot sequence (Phase 6b). Must be
   # linked alongside pktgate_dp. pktgate_telemetry stays DPDK-free;
   # the DPDK-facing BuildFn/BodyFn lambdas live here in main.cpp.
+  # M14 C2: pktgate_ports_ctl owns the D43 port resolver consumed in
+  # main.cpp Phase 5b (see `src/main.cpp` `auto resolve_res = ...`).
+  # The lib is DPDK-free; the lookup/probe lambdas in main.cpp wrap
+  # the real `rte_eth_*` calls.
   target_link_libraries(pktgate_dpdk PRIVATE pktgate_dp pktgate_telemetry
-                                             pktgate_inotify_ctl)
+                                             pktgate_inotify_ctl
+                                             pktgate_ports_ctl)
   pktgate_apply_warnings(pktgate_dpdk)
   pktgate_apply_sanitizer(pktgate_dpdk)
 endif()

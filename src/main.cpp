@@ -12,9 +12,12 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <optional>      // M14 C2 — port resolver lookup return type
 #include <sstream>
 #include <string>
+#include <string_view>   // M14 C2 — port resolver lookup callback param
 #include <utility>
+#include <variant>       // M14 C2 — PortResolveResult discrimination
 #include <vector>
 
 #include <rte_common.h>  // M13 C0 — RTE_CACHE_LINE_SIZE, RTE_ALIGN_CEIL (QSBR alignment fix)
@@ -33,6 +36,7 @@
 #include "src/config/validator.h"
 #include "src/ctl/bootstrap.h"
 #include "src/ctl/cmd_socket.h"
+#include "src/ctl/port_resolver.h"  // M14 C2 — D43 port resolver wiring
 #include "src/ctl/reload.h"
 #include "src/ctl/telemetry_reload.h"
 #include "src/dataplane/worker.h"
@@ -461,6 +465,124 @@ int main(int argc, char* argv[]) {
              ctl_sock_path + "\"}");
   }
 
+  // ---- Phase 5b: D43 port-role resolution (M14 C2) ----
+  //
+  // Replaces the legacy hardcoded `worker_ctx.port_id = port_ids[0];
+  // worker_ctx.tx_port_id = port_ids[1];` positional assignment with
+  // the C1 `pktgate::ctl::resolve_ports` helper. The resolver maps
+  // every entry in `cfg.interface_roles` to a live DPDK port id via
+  // injected lambdas over `rte_eth_dev_get_port_by_name` and
+  // `rte_eth_dev_info_get` (D28 generalised — kInsufficientTxQueues
+  // fires for any PMD, not just pci).
+  //
+  // Roles convention: `upstream_port` is the ingress and
+  // `downstream_port` is the egress, matching every existing config
+  // fixture across `tests/functional/`, `tests/integration/`, and
+  // `tests/unit/test_*.cpp`.
+  //
+  // Failure modes — emit a structured diagnostic and exit non-zero
+  // BEFORE any worker launches:
+  //   * kPortNotRegistered     — declared role's port name not in EAL
+  //                              registry (vdev not on cmdline,
+  //                              pci not bound, name mismatch).
+  //   * kInsufficientTxQueues  — port's nb_tx_queues < n_workers (D28).
+  //   * kUnresolvedRoleSelector → only fires when `lookup_role` is
+  //                              called for a role missing from
+  //                              interface_roles (the two required
+  //                              roles below).
+  //
+  // Boot-path observables (D41 guard, F14.boot_smoke):
+  //   {"event":"port_resolved","role":"<name>","port_id":N}
+  //     emitted per resolved role.
+  //   {"event":"worker_ports","port_id":U,"tx_port_id":D}
+  //     emitted once after worker_ctx is wired (Phase 6b.pre below)
+  //     so functional tests can verify tx_port_id round-trips through
+  //     the live binary, not via a directly-constructed WorkerCtx.
+  std::uint16_t resolved_upstream_port = 0;
+  std::uint16_t resolved_downstream_port = 0;
+  {
+    auto lookup_fn = [](std::string_view name)
+        -> std::optional<std::uint16_t> {
+      // rte_eth_dev_get_port_by_name takes a NUL-terminated string and
+      // writes the port id on success. The string_view we receive may
+      // not be NUL-terminated (it comes from the resolver after vdev
+      // arg-string trimming), so allocate a std::string for the call.
+      std::string nm{name};
+      std::uint16_t pid = 0;
+      if (rte_eth_dev_get_port_by_name(nm.c_str(), &pid) != 0) {
+        return std::nullopt;
+      }
+      return pid;
+    };
+    auto probe_fn = [](std::uint16_t port_id)
+        -> std::optional<std::uint16_t> {
+      struct rte_eth_dev_info info{};
+      if (rte_eth_dev_info_get(port_id, &info) != 0) {
+        return std::nullopt;
+      }
+      // max_tx_queues is the cap; the resolver compares against
+      // n_workers and surfaces kInsufficientTxQueues on shortfall.
+      return info.max_tx_queues;
+    };
+
+    auto resolve_res = pktgate::ctl::resolve_ports(
+        cfg, n_workers_u, lookup_fn, probe_fn);
+    if (std::holds_alternative<pktgate::ctl::PortResolveError>(resolve_res)) {
+      const auto& err =
+          std::get<pktgate::ctl::PortResolveError>(resolve_res);
+      log_json(std::string{"{\"error\":\"port_resolve_failed\""
+                           ",\"kind\":"} +
+               std::to_string(static_cast<int>(err.kind)) +
+               ",\"role\":\"" + err.role_name +
+               "\",\"message\":\"" + err.message + "\"}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+    const auto& resolved =
+        std::get<pktgate::ctl::PortResolveOk>(resolve_res);
+
+    // Emit a per-role diagnostic so the F14 boot-smoke (D41 guard) can
+    // assert role → port_id round-trip directly off stdout. The
+    // iteration order of `unordered_map` is unspecified; the assertion
+    // payload doesn't depend on order, only on values.
+    for (const auto& [role_name, pid] : resolved.by_role) {
+      log_json(std::string{"{\"event\":\"port_resolved\""
+                           ",\"role\":\""} +
+               role_name + "\",\"port_id\":" +
+               std::to_string(pid) + "}");
+    }
+
+    // The two roles the dataplane MUST have. Every existing fixture
+    // and the in-tree integration tests declare these names; missing
+    // either is a config error and we surface it the same way the
+    // resolver surfaces a missing port.
+    auto upstream = pktgate::ctl::lookup_role(resolved, "upstream_port");
+    if (std::holds_alternative<pktgate::ctl::PortResolveError>(upstream)) {
+      const auto& err =
+          std::get<pktgate::ctl::PortResolveError>(upstream);
+      log_json(std::string{"{\"error\":\"port_resolve_role_missing\""
+                           ",\"role\":\""} +
+               err.role_name + "\",\"message\":\"" + err.message + "\"}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+    auto downstream = pktgate::ctl::lookup_role(resolved, "downstream_port");
+    if (std::holds_alternative<pktgate::ctl::PortResolveError>(downstream)) {
+      const auto& err =
+          std::get<pktgate::ctl::PortResolveError>(downstream);
+      log_json(std::string{"{\"error\":\"port_resolve_role_missing\""
+                           ",\"role\":\""} +
+               err.role_name + "\",\"message\":\"" + err.message + "\"}");
+      rte_mempool_free(mp);
+      rte_eal_cleanup();
+      return 1;
+    }
+    resolved_upstream_port = std::get<std::uint16_t>(upstream);
+    resolved_downstream_port = std::get<std::uint16_t>(downstream);
+  }
+
   // ---- Phase 6b.pre: WorkerCtx setup ----
   //
   // M10 C4 reorder: declare + initialise worker_ctx BEFORE the telemetry
@@ -469,10 +591,17 @@ int main(int argc, char* argv[]) {
   // worker thread doesn't observe worker_ctx until the rte_eal_remote_launch
   // call below (Phase 7); the publisher only reads via relaxed atomic
   // loads, which are safe against uninitialised-but-zeroed worker state.
+  //
+  // M14 C2 — port_id / tx_port_id come from the D43 resolver above,
+  // not from positional `port_ids[0]` / `port_ids[1]`. The
+  // `worker_ports` log line below is the D41 boot-path observable
+  // verifying the resolver's result actually lands on the worker (an
+  // orphaned-resolver-call regression — M9 C5 class — would show as
+  // worker_ports.tx_port_id reverting to 1 even though the
+  // `port_resolved` line above named a different port id).
   pktgate::dataplane::WorkerCtx worker_ctx{};
-  worker_ctx.port_id = port_ids[0];
-  // M7 C0: egress port for ALLOW / TAG / TERMINAL_PASS-allow.
-  worker_ctx.tx_port_id = port_ids[1];
+  worker_ctx.port_id = resolved_upstream_port;
+  worker_ctx.tx_port_id = resolved_downstream_port;
   worker_ctx.queue_id = 0;
   worker_ctx.running = &pktgate::ctl::g_running;
   // M8 C1: the reload manager now owns the Ruleset; fetch the live
@@ -494,6 +623,18 @@ int main(int argc, char* argv[]) {
   // each packet in the RL verb path.
   worker_ctx.rl_arena = &pktgate::rl_arena::rl_arena_global();
   worker_ctx.tsc_hz = rte_get_tsc_hz();
+
+  // M14 C2 — D41 boot-path observable. Emit AFTER worker_ctx is fully
+  // wired (so what we log is what the worker will see) and BEFORE the
+  // worker is launched (so the event is visible on stdout even if a
+  // later step fails). Functional test F14.boot_smoke parses this line
+  // to assert tx_port_id round-trips through the live binary, not via
+  // a directly-constructed WorkerCtx.
+  log_json(std::string{"{\"event\":\"worker_ports\""
+                       ",\"port_id\":"} +
+           std::to_string(worker_ctx.port_id) +
+           ",\"tx_port_id\":" +
+           std::to_string(worker_ctx.tx_port_id) + "}");
 
   // ---- Phase 6b: telemetry (snapshot publisher + /metrics HTTP) ----
   //
