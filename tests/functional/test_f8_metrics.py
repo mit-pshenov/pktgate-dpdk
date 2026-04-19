@@ -44,6 +44,9 @@ F8_2_CANONICAL_NAMES = [
     "pktgate_port_rx_dropped_total",
     "pktgate_port_tx_dropped_total",
     "pktgate_port_link_up",
+    # M14 C3 — D43 per-port backpressure (pktgate's own tx wrappers).
+    "pktgate_tx_dropped_total",
+    "pktgate_tx_burst_short_total",
     # Per-lcore family
     "pktgate_lcore_packets_total",
     "pktgate_lcore_cycles_per_burst",

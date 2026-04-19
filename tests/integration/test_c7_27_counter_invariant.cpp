@@ -109,7 +109,9 @@ using ::pktgate::telemetry::Snapshot;
 // the static source of truth and this list is the runtime mirror. If
 // §10.3 changes, BOTH must be updated in lockstep (D33 invariant).
 //
-// 37 entries as of 2026-04-17 (M10 C5 added pktgate_publisher_generation).
+// 39 entries as of 2026-04-19 (M14 C3 added pktgate_tx_dropped_total{port}
+// + pktgate_tx_burst_short_total{port} — D43 per-port backpressure
+// signals emitted by pktgate's own tx_one() / redirect_drain() wrappers).
 // =========================================================================
 const std::vector<std::string>& canonical_manifest() {
   static const std::vector<std::string> names = {
@@ -127,6 +129,11 @@ const std::vector<std::string>& canonical_manifest() {
       "pktgate_port_rx_dropped_total",
       "pktgate_port_tx_dropped_total",
       "pktgate_port_link_up",
+
+      // M14 C3 — D43 per-port backpressure (labels: port). Emitted by
+      // pktgate's own tx_one() / redirect_drain() wrappers, PMD-agnostic.
+      "pktgate_tx_dropped_total",
+      "pktgate_tx_burst_short_total",
 
       // Per-lcore family (label: lcore, where, af, policy)
       "pktgate_lcore_packets_total",
@@ -288,6 +295,12 @@ struct AdvCountersStorage {
   std::uint64_t dispatch_unreachable_total  = 0;  // D25 presence-only
   std::uint64_t tag_pcp_noop_untagged_total = 7;  // adversarial bump
   std::uint64_t redirect_dropped_total      = 3;  // adversarial bump
+
+  // M14 C3 — D43 per-port backpressure. 2 ports × per-lcore scalars.
+  // Adversarial bumps so the names round-trip non-zero through the
+  // snapshot aggregator; Snapshot exposes a sum vector of length 2.
+  std::array<std::uint64_t, 2> tx_dropped_per_port{2u, 0u};
+  std::array<std::uint64_t, 2> tx_burst_short_per_port{0u, 1u};
 };
 
 Snapshot build_adversarial_snapshot() {
@@ -338,6 +351,13 @@ Snapshot build_adversarial_snapshot() {
   view.dispatch_unreachable_total        = &s.dispatch_unreachable_total;
   view.tag_pcp_noop_untagged_total       = &s.tag_pcp_noop_untagged_total;
   view.redirect_dropped_total            = &s.redirect_dropped_total;
+  // M14 C3 — per-port backpressure counters.
+  view.tx_dropped_per_port       = s.tx_dropped_per_port.data();
+  view.tx_dropped_per_port_count =
+      static_cast<std::uint32_t>(s.tx_dropped_per_port.size());
+  view.tx_burst_short_per_port       = s.tx_burst_short_per_port.data();
+  view.tx_burst_short_per_port_count =
+      static_cast<std::uint32_t>(s.tx_burst_short_per_port.size());
   view.counter_row                       = s.lcore0_row.data();
   view.n_slots = static_cast<std::uint32_t>(s.lcore0_row.size());
 
@@ -415,9 +435,9 @@ TEST(C7_27_CounterInvariant, EveryCanonicalNameHasProducerOrIsJustifiedZero) {
   // consistency.sh Pass 1 output. If this firecheck fails, the manifest
   // and §10.3 have drifted — not the C7.27 concern; re-sync the two
   // first.
-  ASSERT_EQ(canon.size(), 37u)
-      << "manifest size drift vs §10.3 Pass 1 count (37 as of 2026-04-17 "
-         "post-M10 C5). "
+  ASSERT_EQ(canon.size(), 39u)
+      << "manifest size drift vs §10.3 Pass 1 count (39 as of 2026-04-19 "
+         "post-M14 C3). "
          "Either §10.3 grew a new metric or the manifest shrank. Fix "
          "both this TU and check-counter-consistency.sh in lockstep "
          "(D33). Expected justified-zero additions belong in `jz`, not "
@@ -479,6 +499,9 @@ TEST(C7_27_CounterInvariant, ScalarFamilyWired) {
   EXPECT_TRUE(observed.count("pktgate_port_tx_bytes_total") > 0);
   EXPECT_TRUE(observed.count("pktgate_port_rx_dropped_total") > 0);
   EXPECT_TRUE(observed.count("pktgate_port_tx_dropped_total") > 0);
+  // M14 C3 — D43 per-port backpressure counters.
+  EXPECT_TRUE(observed.count("pktgate_tx_dropped_total") > 0);
+  EXPECT_TRUE(observed.count("pktgate_tx_burst_short_total") > 0);
 }
 
 // =========================================================================

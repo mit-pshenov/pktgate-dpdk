@@ -274,4 +274,98 @@ TEST(SnapshotSum, NullViewPointersTolerated) {
   EXPECT_EQ(snap.per_rule.size(), 0u);
 }
 
+// ---------------------------------------------------------------
+// M14 C3 — D43 per-port backpressure counters.
+//
+// The per-port counter families `pktgate_tx_dropped_total{port}` and
+// `pktgate_tx_burst_short_total{port}` are bumped by pktgate's own
+// `tx_one()` / `redirect_drain()` wrappers in src/dataplane/
+// action_dispatch.h. They are per-lcore scalars indexed by port_id,
+// aggregated across lcores at publisher tick.
+//
+// U14.6 — tx_dropped_per_port round-trips through build_snapshot:
+//         LcoreCounterView exposes a pointer+count; Snapshot has a
+//         parallel std::vector<uint64_t> filled by element-wise sum.
+// U14.7 — same contract for tx_burst_short_per_port.
+// ---------------------------------------------------------------
+
+TEST(SnapshotSum, U14_6_TxDroppedPerPortAggregated) {
+  // Two lcores, four ports each. Per-lcore storage mimics the
+  // std::array<uint64_t, RTE_MAX_ETHPORTS> field the WorkerCtx will
+  // own in GREEN. Tests use a narrower 4-slot view to keep the
+  // aggregate arithmetic easy to read.
+  constexpr std::uint32_t kPorts = 4;
+
+  std::array<std::uint64_t, kPorts> tx_dropped_lcore0{0, 5, 0, 10};
+  std::array<std::uint64_t, kPorts> tx_dropped_lcore1{1, 0, 3, 20};
+
+  LcoreCounterView v0{};
+  v0.tx_dropped_per_port       = tx_dropped_lcore0.data();
+  v0.tx_dropped_per_port_count = kPorts;
+
+  LcoreCounterView v1{};
+  v1.tx_dropped_per_port       = tx_dropped_lcore1.data();
+  v1.tx_dropped_per_port_count = kPorts;
+
+  std::array<LcoreCounterView, 2> views{v0, v1};
+
+  Snapshot snap =
+      build_snapshot(/*generation=*/7, views, /*per_rule_ids=*/{},
+                     /*port_stats=*/{});
+
+  ASSERT_EQ(snap.tx_dropped_per_port.size(), kPorts)
+      << "Snapshot must expose a parallel tx_dropped_per_port vector";
+  EXPECT_EQ(snap.tx_dropped_per_port[0], 1u);   // 0 + 1
+  EXPECT_EQ(snap.tx_dropped_per_port[1], 5u);   // 5 + 0
+  EXPECT_EQ(snap.tx_dropped_per_port[2], 3u);   // 0 + 3
+  EXPECT_EQ(snap.tx_dropped_per_port[3], 30u);  // 10 + 20
+}
+
+TEST(SnapshotSum, U14_7_TxBurstShortPerPortAggregated) {
+  constexpr std::uint32_t kPorts = 3;
+
+  std::array<std::uint64_t, kPorts> burst_short_lcore0{2, 0, 7};
+  std::array<std::uint64_t, kPorts> burst_short_lcore1{3, 4, 0};
+
+  LcoreCounterView v0{};
+  v0.tx_burst_short_per_port       = burst_short_lcore0.data();
+  v0.tx_burst_short_per_port_count = kPorts;
+
+  LcoreCounterView v1{};
+  v1.tx_burst_short_per_port       = burst_short_lcore1.data();
+  v1.tx_burst_short_per_port_count = kPorts;
+
+  std::array<LcoreCounterView, 2> views{v0, v1};
+
+  Snapshot snap =
+      build_snapshot(/*generation=*/8, views, /*per_rule_ids=*/{},
+                     /*port_stats=*/{});
+
+  ASSERT_EQ(snap.tx_burst_short_per_port.size(), kPorts);
+  EXPECT_EQ(snap.tx_burst_short_per_port[0], 5u);   // 2 + 3
+  EXPECT_EQ(snap.tx_burst_short_per_port[1], 4u);   // 0 + 4
+  EXPECT_EQ(snap.tx_burst_short_per_port[2], 7u);   // 7 + 0
+}
+
+// Defensive — null pointer on the new view fields contributes zero
+// without growing the aggregate vector past counts actually seen.
+TEST(SnapshotSum, U14_6_7_NullTxPerPortToleratedAndSurfaceNames) {
+  LcoreCounterView view{};  // all nullptr
+  std::array<LcoreCounterView, 1> views{view};
+
+  Snapshot snap = build_snapshot(/*generation=*/1, views, {}, {});
+
+  // Zero-sized when no view exposes per-port counter pointers.
+  EXPECT_EQ(snap.tx_dropped_per_port.size(), 0u);
+  EXPECT_EQ(snap.tx_burst_short_per_port.size(), 0u);
+
+  // Base names must still surface through snapshot_metric_names() so
+  // D33 routes them even with zero-valued ports.
+  auto names = ::pktgate::telemetry::snapshot_metric_names(snap);
+  EXPECT_TRUE(names.count("pktgate_tx_dropped_total") > 0)
+      << "pktgate_tx_dropped_total missing from snapshot_metric_names";
+  EXPECT_TRUE(names.count("pktgate_tx_burst_short_total") > 0)
+      << "pktgate_tx_burst_short_total missing from snapshot_metric_names";
+}
+
 }  // namespace
