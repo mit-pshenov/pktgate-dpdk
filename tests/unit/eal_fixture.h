@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include <rte_eal.h>
@@ -25,19 +28,30 @@ class EalFixture : public ::testing::Test {
     // 64 MB budget failed rte_fib_create with rte_errno=12 (ENOMEM)
     // as soon as U4.2 tried to open an L3 FIB. 512 MB is cheap on the
     // dev VM and leaves plenty of headroom for sanitizer presets.
-    const char* argv[] = {
+    //
+    // EAL `-d <path>` is **opt-in** via PKTGATE_DPDK_DRIVER_DIR: the dev
+    // VM's ldconfig already exposes the build-tree PMDs and passing `-d`
+    // on top hits EAL's tailq double-registration panic on the dual
+    // install (memory `vm_dpdk_layout.md`, 2026-04-19 infra fixup).
+    std::vector<const char*> argv{
         "test_eal_unit",
         "--no-pci",
         "--no-huge",
         "-m", "512",
         "--log-level", "lib.*:error",
-        "-d", DPDK_DRIVER_DIR,
-        "--vdev", "net_null0",
-        "--file-prefix", "pktgate_eal_unit",
     };
-    int argc = sizeof(argv) / sizeof(argv[0]);
+    const char* drv = std::getenv("PKTGATE_DPDK_DRIVER_DIR");
+    if (drv != nullptr && drv[0] != '\0') {
+      argv.push_back("-d");
+      argv.push_back(drv);
+    }
+    argv.push_back("--vdev");
+    argv.push_back("net_null0");
+    argv.push_back("--file-prefix");
+    argv.push_back("pktgate_eal_unit");
 
-    int ret = rte_eal_init(argc, const_cast<char**>(argv));
+    int argc = static_cast<int>(argv.size());
+    int ret = rte_eal_init(argc, const_cast<char**>(argv.data()));
     ASSERT_GE(ret, 0) << "rte_eal_init failed";
 
     s_initialized = true;
@@ -47,10 +61,6 @@ class EalFixture : public ::testing::Test {
     // rte_eal_cleanup() can only be called once and DPDK 25.11
     // may not fully support it in test contexts. Skip cleanup.
   }
-
-  // Default DPDK driver directory for the dev VM.
-  static constexpr const char* DPDK_DRIVER_DIR =
-      "/home/mit/Dev/dpdk-25.11/build/drivers/";
 
  private:
   static inline bool s_initialized = false;

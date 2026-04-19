@@ -66,18 +66,25 @@ class IntegrationEalFixture : public ::testing::Test {
   static void SetUpTestSuite() {
     if (s_initialized) return;
 
-    const char* argv[] = {
+    // EAL `-d <path>` opt-in via PKTGATE_DPDK_DRIVER_DIR (2026-04-19
+    // dual-install fixup, memory `vm_dpdk_layout.md`).
+    std::vector<const char*> argv{
         "test_reload",
         "--no-pci",
         "--no-huge",
         "-m", "512",
         "--log-level", "lib.*:error",
-        "-d", DPDK_DRIVER_DIR,
-        "--file-prefix", "pktgate_integration",
     };
-    int argc = sizeof(argv) / sizeof(argv[0]);
+    const char* drv = std::getenv("PKTGATE_DPDK_DRIVER_DIR");
+    if (drv != nullptr && drv[0] != '\0') {
+      argv.push_back("-d");
+      argv.push_back(drv);
+    }
+    argv.push_back("--file-prefix");
+    argv.push_back("pktgate_integration");
 
-    int ret = rte_eal_init(argc, const_cast<char**>(argv));
+    int argc = static_cast<int>(argv.size());
+    int ret = rte_eal_init(argc, const_cast<char**>(argv.data()));
     ASSERT_GE(ret, 0) << "rte_eal_init failed";
 
     s_initialized = true;
@@ -87,9 +94,6 @@ class IntegrationEalFixture : public ::testing::Test {
     // rte_eal_cleanup() intentionally skipped — DPDK 25.11 does not
     // cleanly support re-init within the same process.
   }
-
-  static constexpr const char* DPDK_DRIVER_DIR =
-      "/home/mit/Dev/dpdk-25.11/build/drivers/";
 
  private:
   static inline bool s_initialized = false;

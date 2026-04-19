@@ -20,6 +20,59 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# EAL driver-directory opt-in helper — shared across functional + chaos tests
+# ---------------------------------------------------------------------------
+#
+# The dev VM runs a dual DPDK 25.11 install (2026-04-19 onward, memory
+# `vm_dpdk_layout.md`): build-tree at `/home/mit/Dev/dpdk-25.11/build/drivers/`
+# AND `/usr/local/lib64/dpdk/pmds-*/`. `/etc/ld.so.conf.d/dpdk-dev.conf`
+# already exposes the build-tree PMDs via ldconfig; explicitly passing
+# `-d <path>` on top of that double-loads every PMD `.so` and trips EAL's
+# tailq double-registration panic:
+#
+#   EAL: VFIO_CDX_RESOURCE_LIST tailq is already registered
+#   EAL: PANIC in tailqinitfn_cdx_vfio_tailq()
+#
+# Policy: `-d` is **opt-in** via PKTGATE_DPDK_DRIVER_DIR. Default: empty →
+# rely on ldconfig. Operators pointing at a non-ldconfig DPDK install set
+# the env and the argv picks it up explicitly.
+#
+# `pktgate_eal_driver_args()` returns `["-d", path]` or `[]`. Shared by
+# PktgateProcess (below) and by tests that build their own subprocess
+# cmdline (test_f2_l2, test_f2_l4, test_f3_action, test_f4_l3,
+# test_f8_qinq_counter, test_f14_tap_exit).
+def pktgate_eal_driver_args():
+    path = os.environ.get("PKTGATE_DPDK_DRIVER_DIR", "").strip()
+    if path:
+        return ["-d", path]
+    return []
+
+
+def _strip_legacy_driver_flag(eal_args):
+    """Remove any inline `-d <path>` pair that predates the opt-in helper.
+
+    Historical test modules hard-coded `"-d", DPDK_DRIVER_DIR` directly in
+    their EAL argv templates (pre-2026-04-19 single-install layout). The
+    fixup keeps those hard-codes for backwards reference but strips them
+    here so the run-time argv obeys the opt-in policy. If
+    PKTGATE_DPDK_DRIVER_DIR is set, the caller gets the env-driven path
+    back (via `pktgate_eal_driver_args()` prepended below); otherwise
+    nothing is injected and EAL uses ldconfig.
+    """
+    if not eal_args:
+        return list(eal_args or [])
+    out = []
+    i = 0
+    while i < len(eal_args):
+        if eal_args[i] == "-d" and i + 1 < len(eal_args):
+            i += 2  # drop the pair
+            continue
+        out.append(eal_args[i])
+        i += 1
+    return out
+
+
+# ---------------------------------------------------------------------------
 # M4 C8 — NetworkManager unmanaged-devices fixture for F2 L2 tests
 # ---------------------------------------------------------------------------
 #
@@ -128,7 +181,14 @@ class PktgateProcess:
 
     def __init__(self, config_dict, eal_args=None, extra_args=None, timeout=10):
         self.config_dict = config_dict
-        self.eal_args = eal_args or []
+        # Normalise EAL argv: strip any hard-coded `-d <path>` pair and
+        # re-inject it only when the operator opts in via
+        # PKTGATE_DPDK_DRIVER_DIR. Rationale in the module-level comment
+        # next to `pktgate_eal_driver_args()`.
+        self.eal_args = (
+            pktgate_eal_driver_args()
+            + _strip_legacy_driver_flag(eal_args or [])
+        )
         self.extra_args = extra_args or []
         self.timeout = timeout
         self.process = None

@@ -37,19 +37,11 @@ import time
 import pytest
 
 
-# EAL driver-dir is **opt-in** for F15.1. Rationale: the dev VM's
-# `/etc/ld.so.conf.d/dpdk-dev.conf` already exposes DPDK PMDs at
-# `/home/mit/Dev/dpdk-25.11/build/drivers/` via ldconfig (memory
-# `vm_dpdk_layout.md`). Explicitly passing `-d <dir>` plus ldconfig
-# hits EAL twice per PMD `.so`, which on the post-2026-04-19 dual
-# install (build-tree + `/usr/local/lib64/dpdk/pmds-*/`) causes
-# per-driver tailq double-registration (`VFIO_CDX_RESOURCE_LIST
-# tailq is already registered` → panic in `tailqinitfn_cdx_vfio_
-# tailq`). F15.1 relies on ldconfig. If the operator overrides
-# the behaviour (e.g. to run this test against a DPDK install
-# outside the ldconfig path), they can set PKTGATE_DPDK_DRIVER_DIR
-# and the EAL argv picks it up explicitly.
-DPDK_DRIVER_DIR = os.environ.get("PKTGATE_DPDK_DRIVER_DIR", "").strip()
+# EAL driver-dir is **opt-in** via PKTGATE_DPDK_DRIVER_DIR. The shared
+# PktgateProcess factory (conftest.py) injects `-d <path>` from that env
+# and strips any legacy hard-coded `-d` pair, so this file does not need
+# to splice the flag itself — see the `pktgate_eal_driver_args()` helper
+# comment in conftest.py for the dual-install rationale.
 
 _RUNTIME_DIR = "/run/pktgate"
 _SOCK_NAME = "vhost-m15.sock"
@@ -102,22 +94,22 @@ def _rm_stale():
 # ---------------------------------------------------------------------------
 
 def _eal_args(file_prefix: str, sock_path: str):
-    """EAL argv: net_null upstream + net_vhost downstream (server mode)."""
-    argv = [
+    """EAL argv: net_null upstream + net_vhost downstream (server mode).
+
+    Note: no `-d` here — conftest.py injects it from PKTGATE_DPDK_DRIVER_DIR
+    when set (the default dev VM relies on ldconfig). See the shared helper
+    comment in conftest.py for rationale.
+    """
+    return [
         "--no-pci",
         "--no-huge",
         "-m", "512",       # FIB DIR24_8 baseline (~128 MB)
-    ]
-    if DPDK_DRIVER_DIR:
-        argv += ["-d", DPDK_DRIVER_DIR]
-    argv += [
         "--vdev", "net_null0",
         "--vdev", f"net_vhost0,iface={sock_path},queues=1",
         "-l", "0,1",
         "--log-level", "lib.*:error",
         "--file-prefix", file_prefix,
     ]
-    return argv
 
 
 def _config():

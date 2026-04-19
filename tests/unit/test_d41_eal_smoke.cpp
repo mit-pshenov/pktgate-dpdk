@@ -53,6 +53,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <tuple>
 #include <vector>
 
@@ -91,19 +92,28 @@ class D41EalSmokeFixture : public ::testing::Test {
   static void SetUpTestSuite() {
     if (s_initialized) return;
 
-    const char* argv[] = {
+    // EAL `-d <path>` is opt-in via PKTGATE_DPDK_DRIVER_DIR --- same
+    // dual-install rationale as tests/unit/eal_fixture.h (2026-04-19
+    // infra fixup, memory `vm_dpdk_layout.md`).
+    std::vector<const char*> argv{
         "test_d41_eal_smoke",
         "--no-pci",
         "--no-huge",
         "-m", "512",
         "--log-level", "lib.*:error",
-        "-d", "/home/mit/Dev/dpdk-25.11/build/drivers/",
-        "--vdev", "net_null0",
-        "--file-prefix", "pktgate_d41_smoke",
     };
-    int argc = sizeof(argv) / sizeof(argv[0]);
+    const char* drv = std::getenv("PKTGATE_DPDK_DRIVER_DIR");
+    if (drv != nullptr && drv[0] != '\0') {
+      argv.push_back("-d");
+      argv.push_back(drv);
+    }
+    argv.push_back("--vdev");
+    argv.push_back("net_null0");
+    argv.push_back("--file-prefix");
+    argv.push_back("pktgate_d41_smoke");
 
-    int ret = rte_eal_init(argc, const_cast<char**>(argv));
+    int argc = static_cast<int>(argv.size());
+    int ret = rte_eal_init(argc, const_cast<char**>(argv.data()));
     ASSERT_GE(ret, 0) << "rte_eal_init failed";
 
     s_initialized = true;

@@ -42,8 +42,14 @@ scapy_conf.verb = 0  # suppress scapy output
 pytestmark = pytest.mark.usefixtures("nm_unmanaged_tap")
 
 
-DPDK_DRIVER_DIR = os.environ.get(
-    "DPDK_DRIVER_DIR", "/home/mit/Dev/dpdk-25.11/build/drivers/"
+# EAL `-d <path>` opt-in: default empty, rely on the dev VM's ldconfig
+# exposure of the build-tree DPDK PMDs (memory `vm_dpdk_layout.md`).
+# Set PKTGATE_DPDK_DRIVER_DIR to force an explicit directory; see the
+# shared helper comment in conftest.py for the dual-install rationale.
+_DPDK_DRIVER_DIR_ARGS = (
+    ["-d", os.environ["PKTGATE_DPDK_DRIVER_DIR"].strip()]
+    if os.environ.get("PKTGATE_DPDK_DRIVER_DIR", "").strip()
+    else []
 )
 
 _INGRESS_IFACE = "dtap_f4_rx"
@@ -54,7 +60,7 @@ _EAL_ARGS_TEMPLATE = [
     "--no-pci",
     "--no-huge",
     "-m", "512",
-    "-d", DPDK_DRIVER_DIR,
+    *_DPDK_DRIVER_DIR_ARGS,
     "--vdev", f"net_tap0,iface={_INGRESS_IFACE}",
     "--vdev", f"net_tap1,iface={_EGRESS_IFACE}",
     "-l", "0,1",
