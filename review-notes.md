@@ -2581,6 +2581,130 @@ C0-C2 close. `scratch/` is not checked in; the draft is
 ephemeral scaffolding for C3, while D42 itself is the durable
 decision record.
 
+### D43 — Exit port abstraction
+
+**Decision.** Egress port references in pktgate are PMD-agnostic
+end-to-end. `tx_port_id`, `redirect_port`, and `mirror_port` all
+denote `uint16_t` DPDK port indices resolved through the
+`interface_roles` surface, and the hot path drives them via
+`rte_eth_*` — identical code for a pci-bound physical NIC, a
+`net_tap` vdev, a `net_vhost` vdev, `net_memif`, or
+`net_af_packet`. Backend technology is a **deployment profile**,
+not code that pktgate owns.
+
+**Canonical profiles.** Three operator-visible profiles share
+the same schema path and the same runtime code:
+
+- *dev / test* — `net_tap` (kernel-visible netdev, consumable by
+  `tcpdump`, AF_PACKET, XDP, DPDK `net_af_packet`). CI-friendly,
+  works on any Linux host with `ip tuntap` — the default
+  deployment for functional tests and dev VM soak. Ships M14.
+- *prod DPI hand-off* — `net_vhost` backend paired with a
+  consumer's `net_virtio_user` frontend (or a QEMU virtio-net
+  VM). Zero-copy shared-memory transport, 40 Gbps-ready. Ships
+  M15.
+- *staging observability* — `net_tap` with the `remote=` option
+  (operator `tcpdump -i` on a production interface). Ships
+  alongside M16 mirror work (same vdev family, distinct use
+  case).
+
+**Config schema.** `interface_roles` is a sum type
+`{pci | vdev | name}`. The parser landed this in M1 C7
+(`src/config/parser.cpp:780-839`, `src/config/model.h:47-65`):
+each role value is exactly one of `{"pci": "<BDF>"}`,
+`{"vdev": "<DPDK vdev spec>"}`, or `{"name": "<EAL port name>"}`,
+and mixed-keys entries are rejected with a diagnostic listing
+every offending key. M14 wires **runtime resolution** against
+the DPDK port registry; no parser or schema change is required.
+
+**EAL argv construction — option (A) committed.** The operator
+passes `--vdev=...` on the EAL command line; the config `vdev`
+entry is declarative of intent and is matched at init against
+the already-registered port by name. Auto-construction of EAL
+argv from the config (option B) is a follow-up with its own
+tradeoffs (pre-EAL config parse, argv mutation, interaction
+with `--file-prefix`) and is **not required for M14**. This
+keeps the M14 wiring strictly to port-registry lookup.
+
+**Validator invariants — D28 generalised, not replaced.** The
+TX-queue symmetry invariant (D28) — every egress port must
+expose at least `n_workers` TX queues so each worker owns its
+own `ctx->qid` on every port it transmits to — is carried
+forward verbatim; D43 only **generalises** the scope from
+pci-bound NICs to any DPDK-registered port regardless of PMD
+family. The init-time resolver additionally rejects any
+`interface_roles` entry whose declared port cannot be found in
+the DPDK port registry (name miss → immediate fail-stop with a
+diagnostic naming the role and the expected port).
+
+**Telemetry — two backend-agnostic counter families.** §10.3
+gains two per-port-labelled counters, both operator-visible
+backpressure signals that apply identically to pci / TAP / vhost
+egress:
+
+- `pktgate_tx_dropped_total{port}` — packets that
+  `rte_eth_tx_burst` could not hand off after all retries (TX
+  ring full, driver OOM, link down). Per-lcore count aggregated
+  at publisher tick.
+- `pktgate_tx_burst_short_total{port}` — bursts where
+  `rte_eth_tx_burst` returned fewer packets accepted than
+  requested (partial drain; typically the leading indicator
+  before the dropped-total counter climbs).
+
+Both counters are **D1-clean**: per-lcore increments via the
+existing `relaxed_bump` helpers in
+`src/dataplane/lcore_counter.h`, aggregated once per publisher
+tick. These are the **first per-port-labelled** counter family
+in the codebase; M14 C3 writer is obligated to land the
+five-fold lockstep (D33) — §10.3 row + Snapshot field + BodyFn
+emit + `snapshot_metric_names()` + `kAllCounterNames` + C7.27
+manifest + `scripts/check-counter-consistency.sh`
+`is_allowlisted()` case if a new `libpktgate_*.a` is
+introduced — and verify that the Snapshot / BodyFn shape can
+express `{port=N}` labels. If a minimal encoder extension is
+required (one additional label dimension), C3 lands it
+lockstep; broader label-set generalisation is out of scope
+(M10 C5 minimal-safe refactor discipline).
+
+**Rationale.** DPDK's `rte_eth_*` API already abstracts
+transports identically — the cost of supporting multiple
+profiles in pktgate code is near-zero. Single-choice happens at
+deployment, not at compile time: TAP is the CI / test baseline
+(runs on any Linux host, no PMD binding required), vhost is the
+production perf profile on a narrower testbed, physical NICs
+are the line-rate site deployment. Refusing to hard-wire a
+specific backend preserves that flexibility without adding
+architectural surface.
+
+**Scope.** Applies to every egress-port reference in the data
+plane: `tx_port_id` (primary egress), `redirect_port` (D16
+REDIRECT staging), `mirror_port` (D7 mirror — M16). Does **not**
+apply to:
+
+- Ingress port — same abstract runtime (`rte_eth_rx_burst` is
+  equally PMD-agnostic), but M14 does not rewrite ingress
+  classification or the RX-side config surface. Ingress
+  deployment shape is unchanged.
+- Hot reload of `interface_roles` — port rebinding at runtime
+  is scope creep (would reshape §9.2 reload semantics). M14
+  resolves roles at init; rule reload remains orthogonal and
+  unchanged.
+- MIRROR action verb itself — D7 / M16, separate decision with
+  its own MUTATING_VERBS gate.
+
+**Non-overlap with adjacent decisions.** D42 governs
+control-plane HTTP framing (hand-rolled exporter) — D43 governs
+data-plane egress abstraction. No overlap. D28's pci-only queue
+symmetry invariant is generalised here (any DPDK port), not
+replaced — both are in force.
+
+**Origin.** Consultant session 2026-04-19 preceding M14
+dispatch. Operational plan (C0-C4 cycles, D41 boot-path guard
+for C2, D33 lockstep for C3, TAP profile smoke for C4) lives in
+`scratch/m14-supervisor-handoff.md` pending cycle close.
+`scratch/` is not checked in; the handoff is ephemeral
+scaffolding, while D43 itself is the durable decision record.
+
 ### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
 
 Not standalone decisions; one-paragraph prose fixes surfaced by
@@ -2620,13 +2744,14 @@ the test-architect brigade.
   the flag is undefined; the validator rejects
   `cmd_socket.test_allow_uids` as `unknown field` in release.
 
-*Last updated: 2026-04-17 (D42 — control-plane HTTP hand-rolled,
-not vendored; decided pre-M10 C3 dispatch). Previously 2026-04-13
-(D41 amendment — boot-path wiring clause added after M4 C8
-populate_ruleset_eal orphan); 2026-04-12 (D41 added after M2 silent
-gap caught in M3 C6 — compile_l2/l4_rules unit-tested in isolation
-but never wired into top-level compile(); retrofit scheduled as
-M4 C0).*
+*Last updated: 2026-04-19 (D43 — exit port abstraction; Phase 2
+M14 C0). Previously 2026-04-17 (D42 — control-plane HTTP
+hand-rolled, not vendored; decided pre-M10 C3 dispatch);
+2026-04-13 (D41 amendment — boot-path wiring clause added after
+M4 C8 populate_ruleset_eal orphan); 2026-04-12 (D41 added after
+M2 silent gap caught in M3 C6 — compile_l2/l4_rules unit-tested
+in isolation but never wired into top-level compile(); retrofit
+scheduled as M4 C0).*
 
 *Previously: 2026-04-11 (D31–D38 + full five-lawyer triage,
 single batch commit after the embarrassing D30 fix; D39/D40 +

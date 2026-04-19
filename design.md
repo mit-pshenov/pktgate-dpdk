@@ -224,6 +224,16 @@ are reused.
     - `name` — DPDK-reported port name (rare, mostly for diagnostics).
   The compiler validates that exactly one key is present and that
   the resulting port resolves at EAL init.
+  The sum type **abstracts the deployment profile**: any
+  DPDK-registered port — pci-bound physical NIC, TAP / vhost / memif
+  vdev, `net_af_packet`, `net_null` — is a valid egress target.
+  Technology choice (pci vs vdev) is a per-host deployment decision,
+  not a code surface in pktgate; the runtime resolver runs at init
+  time, matches each role by name against DPDK's port registry, and
+  rejects roles whose port is absent with a diagnostic naming the
+  role. The hot path consumes `uint16_t` port indices through
+  `rte_eth_*` and is PMD-agnostic by construction (see §4 intro and
+  D43 in `review-notes.md`).
 - **`sizing`** may be inlined or loaded from a separate file via
   `--sizing-config <file>`. All capacity arrays are sized from it at
   startup. No compile-time ceilings — only a hard compile-time
@@ -269,6 +279,21 @@ are reused.
 - HA (D5): `interface_roles` + `--standby` CLI; see §6, §11.
 
 ## 4. Data structures
+
+**Exit port is PMD-agnostic end-to-end.** Every egress-port reference
+in the data structures below — `tx_port_id` on the WorkerCtx,
+`RuleAction::redirect_port`, `RuleAction::mirror_port` — is a
+`uint16_t` DPDK port index. The hot path drives these indices
+through `rte_eth_tx_burst` and the rest of the `rte_eth_*` surface,
+which treats a pci-bound physical NIC, a `net_tap` vdev, a
+`net_vhost` vdev, `net_memif`, and `net_af_packet` identically.
+Backend technology is a **deployment profile** (canonical profiles
+documented in §14) rather than anything the runtime branches on.
+Role → `port_id` resolution runs once at init, driven by the
+`interface_roles` sum type (§3a.1); this is the only place where
+the PMD family matters, and even there the check is a uniform
+name-lookup against the DPDK port registry. See D43 in
+`review-notes.md` for rationale and scope.
 
 ### 4.1 `Ruleset` — the immutable compiled artifact
 
@@ -2396,6 +2421,12 @@ pktgate_port_tx_bytes_total{port}                                 counter
 pktgate_port_rx_dropped_total{port,reason="nombuf|noqueue|err"}   counter
 pktgate_port_tx_dropped_total{port}                               counter
 pktgate_port_link_up{port}                                        gauge (0/1)
+# D43 — per-port backpressure signals emitted by pktgate's own
+# tx_one() wrapper, PMD-agnostic (pci / TAP / vhost / memif).
+# D1-clean: per-lcore bumps via relaxed_bump aggregated at the
+# publisher tick.
+pktgate_tx_dropped_total{port}                                    counter
+pktgate_tx_burst_short_total{port}                                counter
 
 pktgate_lcore_packets_total{lcore}                                counter
 pktgate_lcore_cycles_per_burst{lcore}                             histogram
