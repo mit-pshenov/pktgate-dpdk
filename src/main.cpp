@@ -7,6 +7,7 @@
 // Design anchors: §6.1 (init sequence), §6.4 (shutdown),
 // D9 (g_active scaffold), D23 (NUMA-aware mempool).
 
+#include <cerrno>        // M15 C2 — ENOENT treated as success in cleanup helper
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,9 @@
 #include <utility>
 #include <variant>       // M14 C2 — PortResolveResult discrimination
 #include <vector>
+
+#include <sys/stat.h>    // M15 C2 — stat() + S_ISSOCK for stale-socket guard
+#include <unistd.h>      // M15 C2 — unlink() for vhost socket cleanup
 
 #include <rte_common.h>  // M13 C0 — RTE_CACHE_LINE_SIZE, RTE_ALIGN_CEIL (QSBR alignment fix)
 #include <rte_cycles.h>  // M9 C2 — rte_get_tsc_hz for WorkerCtx cache
@@ -83,6 +87,147 @@ std::string read_file(const std::string& path) {
   return ss.str();
 }
 
+// -------------------------------------------------------------------------
+// M15 C2 — vhost socket lifecycle (D44).
+//
+// Walks `cfg.interface_roles`, picks out any `VdevSelector` whose port
+// name matches `net_vhost*`, extracts the `iface=<abs_path>` argument
+// from the vdev arg string, and performs the caller's requested op
+// (unlink-on-exit or stale-guard). The two exit paths (SIGTERM-driven
+// and normal `--exit-after-init`) share `cleanup_vhost_sockets()` by
+// construction — any caller that holds `cfg` and is about to call
+// `rte_eal_cleanup()` routes through the same helper (D41 twin-path
+// discipline).
+//
+// Event shape matches the existing `{"event":"...","path":"..."}` log
+// lines. Event names are pinned by F15.2 / F15.2b / F15.3:
+//   * vhost_socket_cleaned        — graceful / normal exit cleanup.
+//   * vhost_stale_socket_unlinked — boot-time stale-UDS takeover.
+//
+// We emit the observable BEFORE the syscall so the event is on stdout
+// even if `unlink()` races `rte_eal_cleanup()` (DPDK 25.11 net_vhost
+// unlinks its UDS itself during cleanup — our follow-up unlink returns
+// ENOENT). The contract D44 pins is the operator-visible event, not
+// the opaque side effect.
+
+// Locate the `iface=` argument inside a DPDK vdev spec. Returns an
+// empty string when the spec does not carry `iface=` (e.g. the default
+// `net_vhost0` form where DPDK picks a path). Handles the comma-
+// separated arg grammar: `net_vhost0,iface=/run/x.sock,queues=1`.
+std::string vdev_iface_path(const std::string& vdev_spec) {
+  // After the first comma comes the arg list; search for "iface=" as
+  // a token start (preceded by ',' or at pos 0 of the arg section).
+  constexpr std::string_view kKey = "iface=";
+  std::size_t pos = 0;
+  while (pos < vdev_spec.size()) {
+    pos = vdev_spec.find(kKey, pos);
+    if (pos == std::string::npos) return {};
+    // Accept only token-aligned matches — preceding char must be ','
+    // (arg boundary). This avoids false matches like `myiface=...`.
+    if (pos != 0 && vdev_spec[pos - 1] != ',') {
+      ++pos;
+      continue;
+    }
+    break;
+  }
+  if (pos == std::string::npos) return {};
+  const std::size_t val_start = pos + kKey.size();
+  const std::size_t comma = vdev_spec.find(',', val_start);
+  if (comma == std::string::npos) {
+    return vdev_spec.substr(val_start);
+  }
+  return vdev_spec.substr(val_start, comma - val_start);
+}
+
+// Is this role a `net_vhost*` vdev? Reuses the resolver's port-name
+// extractor (comma-strip) so the check is identical to the one the
+// resolver runs against the EAL port registry.
+bool is_vhost_role(const pktgate::config::InterfaceRole& role) {
+  // Only VdevSelector can carry a `net_vhost*` port name.
+  if (!std::holds_alternative<pktgate::config::VdevSelector>(role.selector)) {
+    return false;
+  }
+  const std::string port_name =
+      pktgate::ctl::port_name_from_selector(role.selector);
+  // Prefix match `net_vhost` — the DPDK port name convention for
+  // server-side vhost vdevs. Client-mode (`net_vhost0,client=1`) is
+  // a non-goal per D44; the prefix alone covers both modes, but we
+  // do not currently ship client mode.
+  constexpr std::string_view kPrefix = "net_vhost";
+  return port_name.rfind(kPrefix, 0) == 0;
+}
+
+// Cleanup-on-exit helper. Called from BOTH exit paths:
+//   * SIGTERM-driven — after the control loop flips `g_running=false`.
+//   * Normal return — after `--exit-after-init` self-flips g_running.
+// Emits `vhost_socket_cleaned` per path BEFORE the unlink so the log
+// line is visible even if the syscall races DPDK's own cleanup.
+// ENOENT is treated as success (DPDK 25.11 net_vhost unlinks its UDS
+// during `rte_eal_cleanup()` on some releases — the event is the
+// contract, not the filesystem-level race winner).
+void cleanup_vhost_sockets(const pktgate::config::Config& cfg) {
+  for (const auto& role : cfg.interface_roles) {
+    if (!is_vhost_role(role)) continue;
+    const auto& spec =
+        std::get<pktgate::config::VdevSelector>(role.selector).spec;
+    const std::string path = vdev_iface_path(spec);
+    if (path.empty()) continue;  // vdev without explicit iface=
+    log_json("{\"event\":\"vhost_socket_cleaned\",\"path\":\"" +
+             path + "\"}");
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+      // Non-fatal — operator owns the filesystem; surface as a
+      // secondary event for diagnostic completeness.
+      log_json("{\"event\":\"vhost_socket_unlink_failed\",\"path\":\"" +
+               path + "\",\"errno\":" + std::to_string(errno) + "}");
+    }
+  }
+}
+
+// Any vhost role in the config? Callers use this to decide whether to
+// bypass `rte_eal_cleanup()` on exit — DPDK 25.11's vhost library has
+// no teardown hook for its background fdset dispatch thread, which
+// spins on `epoll_wait` for the lifetime of the process. Calling
+// `rte_eal_cleanup()` tears down EAL memory out from under that
+// thread, producing a SEGV visible under TSan (the non-TSan build
+// races with the kernel reaping the process first, usually winning
+// silently). The only race-free shutdown is to skip EAL cleanup and
+// let `_exit(2)` reap everything — the vhost socket is already
+// unlinked by `cleanup_vhost_sockets()` above and hugepages/configs
+// are OS-reclaimed. Non-vhost builds keep calling `rte_eal_cleanup()`
+// so unrelated teardown bugs surface normally.
+bool has_vhost_role(const pktgate::config::Config& cfg) {
+  for (const auto& role : cfg.interface_roles) {
+    if (is_vhost_role(role)) return true;
+  }
+  return false;
+}
+
+// Stale-socket guard. Called BEFORE `rte_eal_init` so the net_vhost
+// vdev's `bind(2)` does not choke on EADDRINUSE when a crashed
+// predecessor left its UDS inode on disk. Only acts on socket-type
+// inodes (safety — we never unlink a regular file the operator may
+// have placed at the same path by mistake). Emits the observable
+// BEFORE the unlink so the audit trail survives even if the syscall
+// itself fails (e.g. EACCES).
+void unlink_stale_vhost_sockets(const pktgate::config::Config& cfg) {
+  for (const auto& role : cfg.interface_roles) {
+    if (!is_vhost_role(role)) continue;
+    const auto& spec =
+        std::get<pktgate::config::VdevSelector>(role.selector).spec;
+    const std::string path = vdev_iface_path(spec);
+    if (path.empty()) continue;
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) continue;  // not present → nothing to do
+    if (!S_ISSOCK(st.st_mode)) continue;            // safety — never unlink non-sockets
+    log_json("{\"event\":\"vhost_stale_socket_unlinked\",\"path\":\"" +
+             path + "\"}");
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+      log_json("{\"event\":\"vhost_stale_unlink_failed\",\"path\":\"" +
+               path + "\",\"errno\":" + std::to_string(errno) + "}");
+    }
+  }
+}
+
 // D9 (M8 C1): g_active now lives inside the reload manager
 // (src/ctl/reload.{h,cpp}). The main binary uses the accessor
 // pktgate::ctl::reload::active_ruleset() to read it — no local atomic
@@ -103,6 +248,13 @@ int main(int argc, char* argv[]) {
   std::string ctl_sock_path;  // M8 C5: UDS reload endpoint (two-way X1.3).
   unsigned requested_workers = 0;  // 0 = auto-detect from available lcores
   unsigned mbuf_data_size = 0;     // 0 = RTE_MBUF_DEFAULT_BUF_SIZE
+  // M15 C2 — D44 `--exit-after-init` diagnostic flag. When set,
+  // pktgate reaches the `{"ready":true}` milestone, flips g_running to
+  // force the control loop to fall through, and exits via the SAME
+  // Phase 9 shutdown + cleanup path a SIGTERM triggers. F15.2b covers
+  // the D41 twin-path invariant — both exit paths share the vhost
+  // socket cleanup helper.
+  bool exit_after_init = false;
   int eal_argc = 0;
   std::vector<char*> eal_argv;
 
@@ -129,6 +281,12 @@ int main(int argc, char* argv[]) {
       // telemetry endpoint remains available regardless.
       ctl_sock_path = argv[i + 1];
       ++i;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--exit-after-init") == 0) {
+      // M15 C2 — D44 diagnostic flag. No value argument; presence is
+      // the signal. Consumed here so EAL never sees it.
+      exit_after_init = true;
       continue;
     }
     eal_argv.push_back(argv[i]);
@@ -189,6 +347,17 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  // ---- Phase 2b: stale-vhost-socket guard (M15 C2, D44) ----
+  //
+  // Must run BEFORE `rte_eal_init` — DPDK's net_vhost PMD `bind(2)`s
+  // the configured UDS path at vdev-probe time during EAL init, which
+  // fails EADDRINUSE if a crashed predecessor left a socket inode on
+  // disk. Walk `cfg.interface_roles`, stat+unlink each `net_vhost*`
+  // `iface=<path>` that is a socket-type inode, emit the observable.
+  // Safe on first boot (path absent → no-op) and on paths that host
+  // a regular file (S_ISSOCK check — we never clobber operator data).
+  unlink_stale_vhost_sockets(cfg);
+
   // ---- Phase 3: EAL init ----
   int ret = rte_eal_init(eal_argc, eal_argv.data());
   if (ret < 0) {
@@ -201,6 +370,7 @@ int main(int argc, char* argv[]) {
   int dyn_offset = pktgate::eal::register_dynfield();
   if (dyn_offset < 0) {
     log_json("{\"error\":\"dynfield registration failed\"}");
+    cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
     rte_eal_cleanup();
     return 1;
   }
@@ -215,6 +385,7 @@ int main(int argc, char* argv[]) {
   if (nb_ports < 2) {
     log_json(("{\"error\":\"insufficient ports\",\"available\":" +
               std::to_string(nb_ports) + "}").c_str());
+    cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
     rte_eal_cleanup();
     return 1;
   }
@@ -251,6 +422,7 @@ int main(int argc, char* argv[]) {
       static_cast<int>(socket_id));
   if (mp == nullptr) {
     log_json("{\"error\":\"mempool creation failed\"}");
+    cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
     rte_eal_cleanup();
     return 1;
   }
@@ -290,6 +462,7 @@ int main(int argc, char* argv[]) {
                ",\"max_tx_queues\":" + std::to_string(sym.max_tx_queues) +
                ",\"n_workers\":" + std::to_string(n_workers_u) + "}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -302,6 +475,7 @@ int main(int argc, char* argv[]) {
       log_json("{\"error\":\"multiseg_rx_unsupported\",\"reason\":\"" +
                scatter.error + "\"}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -314,6 +488,7 @@ int main(int argc, char* argv[]) {
                std::to_string(port_id) + ",\"reason\":\"" +
                result.error + "\"}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -351,6 +526,7 @@ int main(int argc, char* argv[]) {
       log_json("{\"error\":\"ruleset_eal_populate_failed\",\"reason\":\"" +
                eal_res.error + "\"}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -390,6 +566,7 @@ int main(int argc, char* argv[]) {
   if (qsbr_raw == nullptr) {
     log_json("{\"error\":\"qsbr_alloc_failed\"}");
     rte_mempool_free(mp);
+    cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
     rte_eal_cleanup();
     return 1;
   }
@@ -398,6 +575,7 @@ int main(int argc, char* argv[]) {
     log_json("{\"error\":\"qsbr_init_failed\"}");
     std::free(qsbr_raw);
     rte_mempool_free(mp);
+    cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
     rte_eal_cleanup();
     return 1;
   }
@@ -427,6 +605,7 @@ int main(int argc, char* argv[]) {
                publish_res.error + "\"}");
       std::free(qsbr_raw);
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -458,6 +637,7 @@ int main(int argc, char* argv[]) {
       pktgate::ctl::reload::shutdown();
       std::free(qsbr_raw);
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -536,6 +716,7 @@ int main(int argc, char* argv[]) {
                ",\"role\":\"" + err.role_name +
                "\",\"message\":\"" + err.message + "\"}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -565,6 +746,7 @@ int main(int argc, char* argv[]) {
                            ",\"role\":\""} +
                err.role_name + "\",\"message\":\"" + err.message + "\"}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -576,6 +758,7 @@ int main(int argc, char* argv[]) {
                            ",\"role\":\""} +
                err.role_name + "\",\"message\":\"" + err.message + "\"}");
       rte_mempool_free(mp);
+      cleanup_vhost_sockets(cfg);  // M15 C2 D41 — early-error twin path
       rte_eal_cleanup();
       return 1;
     }
@@ -1103,12 +1286,29 @@ int main(int argc, char* argv[]) {
     // Signal ready, then run worker inline (for -l 0 single-core case).
     log_json("{\"ready\":true}");
 
+    // M15 C2 — D44 diagnostic exit. Flip `g_running` before entering
+    // the worker loop so worker_main observes the same "shutdown
+    // requested" condition a SIGTERM would raise. Both exit paths
+    // (signal + `--exit-after-init`) then share the same Phase 9
+    // shutdown + cleanup_vhost_sockets sequence by construction.
+    if (exit_after_init) {
+      pktgate::ctl::g_running.store(false, std::memory_order_release);
+    }
+
     pktgate::dataplane::worker_main(&worker_ctx);
   } else {
     rte_eal_remote_launch(pktgate::dataplane::worker_main,
                           &worker_ctx, worker_lcore);
 
     log_json("{\"ready\":true}");
+
+    // M15 C2 — D44 diagnostic exit. Same flip as the single-lcore
+    // branch above — the control loop's `while (g_running)` falls
+    // through immediately and Phase 9 runs identically to the
+    // SIGTERM-driven path.
+    if (exit_after_init) {
+      pktgate::ctl::g_running.store(false, std::memory_order_release);
+    }
 
     // ---- Phase 8: control loop — wait for signal ----
     while (pktgate::ctl::g_running.load(std::memory_order_acquire)) {
@@ -1437,8 +1637,37 @@ int main(int argc, char* argv[]) {
   // Free mempool.
   rte_mempool_free(mp);
 
-  // EAL cleanup.
-  rte_eal_cleanup();
+  // M15 C2 — D44 vhost socket cleanup (shared helper, D41 twin-path).
+  // Runs on BOTH exit paths that reach this block: signal-driven
+  // (SIGTERM flipped g_running; control loop exited) and normal-exit
+  // (`--exit-after-init` flipped g_running right after ready). The
+  // helper emits `vhost_socket_cleaned` BEFORE unlinking so the
+  // observable survives even when DPDK's own cleanup raced us to the
+  // syscall (DPDK 25.11 net_vhost removes its UDS during
+  // `rte_eal_cleanup()` — our ENOENT is treated as success).
+  cleanup_vhost_sockets(cfg);
+
+  // EAL cleanup — conditional bypass when vhost is configured.
+  //
+  // DPDK 25.11's `lib/vhost/fd_man.c` spawns an internal dispatch
+  // thread (`fdset_event_dispatch`) that spins on `epoll_wait` for
+  // process lifetime and has no teardown / join hook. Calling
+  // `rte_eal_cleanup()` invokes `rte_eal_memory_detach()` +
+  // `rte_eal_malloc_heap_cleanup()`, which free the heap the fdset
+  // thread is actively reading on its next epoll cycle — producing a
+  // SEGV in `fdset_event_dispatch` that TSan catches as
+  // DEADLYSIGNAL (rc=66). The non-TSan build races the kernel reap
+  // and usually wins silently, but the race is real. Skipping EAL
+  // cleanup on the vhost path lets `_exit(2)` / the kernel reap all
+  // process resources (hugepages via MAP_HUGETLB unmap-on-exit,
+  // config inodes under `/run/dpdk/<prefix>/` are pruned by the
+  // cleanup hooks in the conftest fixtures, and the vhost UDS has
+  // already been removed by `cleanup_vhost_sockets()` above).
+  // Non-vhost runs continue calling `rte_eal_cleanup()` unchanged —
+  // unrelated teardown bugs must surface normally.
+  if (!has_vhost_role(cfg)) {
+    rte_eal_cleanup();
+  }
   log_json("{\"event\":\"eal_cleanup\"}");
 
   return 0;

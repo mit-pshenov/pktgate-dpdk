@@ -36,6 +36,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <rte_common.h>   // M15 C2 — RTE_CACHE_LINE_SIZE, RTE_ALIGN_CEIL (QSBR alignment fix per M13 C0 precedent)
 #include <rte_eal.h>
 #include <rte_rcu_qsbr.h>
 
@@ -134,7 +135,12 @@ TEST_F(ReloadSmokeTest, QsbrBringUpAndSynchronize) {
   size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreads);
   ASSERT_GT(sz, 0u) << "rte_rcu_qsbr_get_memsize returned 0";
 
-  void* raw = std::aligned_alloc(alignof(std::max_align_t), sz);
+  // M15 C2 — struct rte_rcu_qsbr is __rte_cache_aligned (64B); UBSan
+  // alignment check fails at alignof(max_align_t)==16. M13 C0 precedent
+  // (main.cpp): align to RTE_CACHE_LINE_SIZE, round size up to the
+  // same multiple (POSIX aligned_alloc requires size % alignment == 0).
+  sz = RTE_ALIGN_CEIL(sz, RTE_CACHE_LINE_SIZE);
+  void* raw = std::aligned_alloc(RTE_CACHE_LINE_SIZE, sz);
   ASSERT_NE(raw, nullptr) << "aligned_alloc failed";
   auto* qs = static_cast<struct rte_rcu_qsbr*>(raw);
 
@@ -485,9 +491,11 @@ class ReloadC2Fixture : public IntegrationEalFixture {
   void SetUp() override {
     // One QSBR variable per fixture instance — aligned_alloc is fine,
     // DPDK doesn't require rte_malloc for QSBR storage.
+    // M15 C2 — cache-line align per M13 C0 precedent (UBSan fix).
     size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreadsC2);
     ASSERT_GT(sz, 0u);
-    qs_raw_ = std::aligned_alloc(alignof(std::max_align_t), sz);
+    sz = RTE_ALIGN_CEIL(sz, RTE_CACHE_LINE_SIZE);
+    qs_raw_ = std::aligned_alloc(RTE_CACHE_LINE_SIZE, sz);
     ASSERT_NE(qs_raw_, nullptr);
     qs_ = static_cast<struct rte_rcu_qsbr*>(qs_raw_);
     ASSERT_EQ(rte_rcu_qsbr_init(qs_, kMaxThreadsC2), 0);
@@ -1318,9 +1326,11 @@ class ReloadShutdownFixture : public IntegrationEalFixture {
 TEST_F(ReloadShutdownFixture, ShutdownDrainsAndUnregistersCleanly) {
   // Bring up a QSBR handle local to this test — keep it independent
   // of the C2 fixture's qs so the two do not collide.
+  // M15 C2 — cache-line align per M13 C0 precedent (UBSan fix).
   size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreadsSD);
   ASSERT_GT(sz, 0u);
-  void* qs_raw = std::aligned_alloc(alignof(std::max_align_t), sz);
+  sz = RTE_ALIGN_CEIL(sz, RTE_CACHE_LINE_SIZE);
+  void* qs_raw = std::aligned_alloc(RTE_CACHE_LINE_SIZE, sz);
   ASSERT_NE(qs_raw, nullptr);
   auto* qs = static_cast<struct rte_rcu_qsbr*>(qs_raw);
   ASSERT_EQ(rte_rcu_qsbr_init(qs, kMaxThreadsSD), 0);
@@ -1380,8 +1390,10 @@ TEST_F(ReloadShutdownFixture, ShutdownDrainsAndUnregistersCleanly) {
 // typical path in main.cpp). Workers are offline+unregistered.
 // shutdown() still runs to completion.
 TEST_F(ReloadShutdownFixture, ShutdownAfterWorkerJoinIsClean) {
+  // M15 C2 — cache-line align per M13 C0 precedent (UBSan fix).
   size_t sz = rte_rcu_qsbr_get_memsize(kMaxThreadsSD);
-  void* qs_raw = std::aligned_alloc(alignof(std::max_align_t), sz);
+  sz = RTE_ALIGN_CEIL(sz, RTE_CACHE_LINE_SIZE);
+  void* qs_raw = std::aligned_alloc(RTE_CACHE_LINE_SIZE, sz);
   auto* qs = static_cast<struct rte_rcu_qsbr*>(qs_raw);
   ASSERT_EQ(rte_rcu_qsbr_init(qs, kMaxThreadsSD), 0);
 
