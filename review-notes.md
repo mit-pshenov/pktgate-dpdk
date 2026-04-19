@@ -2718,6 +2718,129 @@ to `scripts/check-counter-consistency.sh` `is_allowlisted()`
 case per the D33 dual-allowlist rule (memory
 `grabli_d33_manifest_dual_allowlist.md`).
 
+### D44 — Vhost socket lifecycle and cleanup
+
+**Decision.** Pktgate runs `net_vhost` **server-side** — the
+operator supplies an absolute UDS path via the vdev spec
+(`--vdev=net_vhost0,iface=/run/pktgate/vhost-<role>.sock,queues=<n>`),
+pktgate listens, and any DPI consumer (`net_virtio_user` in a
+second DPDK process, or QEMU virtio-net in a VM) connects as
+client. **Client-mode pktgate** (pktgate as the connector side,
+`client=1` in the vdev spec) is a non-goal — user decision
+2026-04-19. Operators whose topology requires a connector stand
+up their own DPDK bridge between pktgate and the consumer.
+
+**Path convention.** Recommended path is
+`/run/pktgate/vhost-<role>.sock`, sharing the runtime directory
+with the existing control socket `/run/pktgate/ctl.sock` (Q6,
+§3a.3). Mode `0600` — UDS filesystem permissions are the only
+access gate, and any consumer with write permission to the path
+participates in the data plane. The path itself is **declarative
+in the EAL cmdline**, not auto-derived from config: D43 option
+(A) stands — operator owns EAL argv, and the config `vdev` entry
+matches at init against the already-registered port by DPDK port
+name. Auto-construction of EAL argv from config (D43 option B)
+remains deferred.
+
+**Cleanup on exit.** Pktgate `unlink()`s the socket path on two
+paths that MUST share a single helper:
+
+- graceful `SIGTERM` / `SIGINT` — the signal handler runs the
+  helper before `rte_eal_cleanup()`;
+- clean `main()` return — the helper runs on the normal-exit
+  path (e.g. reload-init failure, `--exit-after-init` diagnostic
+  mode).
+
+Crash-exit (`SIGKILL`, `SIGSEGV`, `abort()`) leaves the socket
+file on disk; the stale-socket guard on the next boot handles
+it. Both cleanup paths emit a structured stdout observable
+`{"event":"vhost_socket_cleaned","path":"..."}` so tests assert
+on the observable rather than a raw filesystem probe, and
+single-helper discipline closes the D41 silent-gap class (M8 C5
+precedent: one path wired, test hit only that path).
+
+**Stale-socket guard on boot.** Before `rte_eal_init` registers
+the vhost vdev, pktgate `stat()`s the configured path and
+`unlink()`s it if it is a socket-type inode. No liveness probe —
+we do not attempt to detect whether another pktgate instance
+holds the path; that responsibility is owned by systemd via
+`RuntimeDirectory=pktgate` (kernel-managed per-unit runtime dir)
+plus `Restart=on-failure`. Race with a concurrent peer connect
+is an operator error (two pktgate instances configured on the
+same path) and is out of scope — `RestartPreventExitStatus=0`
+in the unit file prevents it in practice.
+
+**Reconnect philosophy.** DPDK `net_vhost` handles peer
+disconnect and reconnect at the PMD level; pktgate does **not**
+own reconnect state. On peer crash or clean disconnect,
+`rte_eth_tx_burst` returns `sent < nb_pkts` (or `0`) exactly as
+it does for a TAP tun-queue full event — the M14 C3 per-port
+counters already capture the disconnect as backpressure:
+`tx_burst_short_total{port}` is the leading indicator, and
+`tx_dropped_total{port}` climbs once `sent == 0`. **No new
+counter family in M15** — the M14 D43 backend-agnostic shape
+covers the vhost case by construction. A distinct peer-connected
+gauge (or peer-events counter) would require introducing gauges
+into the Snapshot encoder (M10 currently emits counters only);
+the blast radius is out of proportion to the operator-visibility
+win, and the decision is explicitly deferred (see
+`scratch/m15-supervisor-handoff.md` §Decisions deferred).
+
+**Hugepage topology.** Pktgate and the DPI consumer share a
+hugepage backing file. The operator guarantees:
+
+- both processes mount the same hugepage filesystem
+  (`/dev/hugepages` conventionally);
+- **distinct `--file-prefix=` values** so EAL per-process
+  runtime dirs under `/run/dpdk/<prefix>/` do not collide —
+  this is standard DPDK multi-process discipline, not a M15
+  invention;
+- the DPI consumer has read/write access to the hugepage
+  backing file (matching uid/gid, or shared group);
+- the DPI consumer runs on the **same NUMA node** as the
+  pktgate workers, so the shared-memory data path is zero-hop.
+
+**Validator.** No new validator invariants in M15. The
+resolver's existing `kPortNotRegistered` and
+`kInsufficientTxQueues` checks (D28 generalised under D43)
+cover a `net_vhost` port identically to `pci` / `net_tap` —
+the PMD family is invisible to the resolver. Stale-socket
+handling runs in the boot path **before** resolver invocation,
+not inside config validation.
+
+**Scope.** Applies to any `net_vhost*` vdev referenced from
+`interface_roles`. Does **not** apply to:
+
+- `net_virtio_user` — this is the consumer-side PMD; pktgate
+  does not register virtio-user itself, and it is named in D44
+  only to identify the other half of the pair.
+- `net_vhost` **client mode** (`client=1` in vdev spec) —
+  non-goal per user decision 2026-04-19.
+- Other vdev families (`net_memif`, `net_af_packet`, and
+  similar) — out of M15 scope. Each would need its own
+  lifecycle sub-section if ever shipped; D43 ensures the
+  data-plane surface is PMD-agnostic, but cleanup / socket /
+  backing-file conventions are per-family.
+
+**Non-overlap with adjacent decisions.** D43 sets the egress-
+port abstraction (PMD-agnostic hot path, `interface_roles` sum
+type, three canonical profiles). D44 names the socket-lifecycle
+policy for the vhost profile only — it does not re-open D43's
+option-(A) EAL-argv decision, does not grow §10.3 counters, and
+does not touch §9.2 hot-reload semantics (vhost socket path
+resolves at init only, consistent with M14's
+`interface_roles`-reload decision). D28's queue-symmetry
+invariant is inherited unchanged via D43.
+
+**Origin.** Consultant session 2026-04-19 preceding M15
+dispatch. Operational plan (C0 design note; C1 resolver
+coverage + boot smoke; C2 cleanup hook + stale guard; C3 paired
+testpmd integration harness; C4 peer-crash chaos + exit gate
++ `m15-exit-port-vhost` tag) lives in
+`scratch/m15-supervisor-handoff.md` pending cycle close.
+`scratch/` is not checked in; the handoff is ephemeral
+scaffolding, while D44 itself is the durable decision record.
+
 ### Q3 / Q5 / Q6 / Q7 / Q9 — doc clarifications bundled with D39/D40
 
 Not standalone decisions; one-paragraph prose fixes surfaced by
@@ -2757,9 +2880,10 @@ the test-architect brigade.
   the flag is undefined; the validator rejects
   `cmd_socket.test_allow_uids` as `unknown field` in release.
 
-*Last updated: 2026-04-19 (D43 — exit port abstraction; Phase 2
-M14 C0). Previously 2026-04-17 (D42 — control-plane HTTP
-hand-rolled, not vendored; decided pre-M10 C3 dispatch);
+*Last updated: 2026-04-19 (D44 — vhost socket lifecycle and
+cleanup; Phase 2 M15 C0). Previously 2026-04-19 (D43 — exit port
+abstraction; Phase 2 M14 C0); 2026-04-17 (D42 — control-plane
+HTTP hand-rolled, not vendored; decided pre-M10 C3 dispatch);
 2026-04-13 (D41 amendment — boot-path wiring clause added after
 M4 C8 populate_ruleset_eal orphan); 2026-04-12 (D41 added after
 M2 silent gap caught in M3 C6 — compile_l2/l4_rules unit-tested

@@ -234,6 +234,15 @@ are reused.
   role. The hot path consumes `uint16_t` port indices through
   `rte_eth_*` and is PMD-agnostic by construction (see §4 intro and
   D43 in `review-notes.md`).
+    - For `net_vhost*` vdevs specifically, the operator supplies an
+      absolute UDS path in the vdev spec (conventionally
+      `/run/pktgate/vhost-<role>.sock`, mode `0600`, sharing the
+      runtime directory with `/run/pktgate/ctl.sock`); pktgate runs
+      server-side and the DPI consumer connects as client. The
+      socket file is `unlink()`ed on graceful exit (SIGTERM / clean
+      `main()` return via a shared helper) and a stale-socket guard
+      on boot removes any leftover inode before vdev registration.
+      See D44 in `review-notes.md` for the full lifecycle and scope.
 - **`sizing`** may be inlined or loaded from a separate file via
   `--sizing-config <file>`. All capacity arrays are sized from it at
   startup. No compile-time ceilings — only a hard compile-time
