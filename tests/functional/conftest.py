@@ -67,6 +67,10 @@ _TAP_IFACES_TO_UNMANAGE = [
     # session. Separate pair keeps the NM keyfile session-scoped and
     # lets the ctest entries run in any order.
     "dtap_f3rl_rx", "dtap_f3rl_tx",
+    # M14 C4 — F14.6 / F14.7 TAP deployment profile smoke. Separate
+    # pair so the test module can run alongside any other dtap_*
+    # functional entry in the same session without sharing taps.
+    "dtap_m14_ing", "dtap_m14_egr",
 ]
 
 

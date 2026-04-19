@@ -194,3 +194,20 @@ set_tests_properties(functional.test_f14_main_resolver PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 120
 )
+
+# M14 C4 — F14.6 TAP visibility smoke + F14.7 slow-consumer drop scrape.
+# Boots pktgate on two net_tap vdevs (dtap_m14_ing / dtap_m14_egr) via
+# the D43 interface_roles selectors, injects with scapy, asserts egress
+# sniff + /metrics scrape of pktgate_tx_dropped_total{port} /
+# pktgate_tx_burst_short_total{port}. Requires root (scapy AF_PACKET
+# inject + tc qdisc). 2 sub-tests × EAL cold start + sniff/throttle
+# settles → 180 s timeout.
+add_test(
+  NAME functional.test_f14_tap_exit
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f14_tap_exit.py"
+)
+set_tests_properties(functional.test_f14_tap_exit PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 180
+)
