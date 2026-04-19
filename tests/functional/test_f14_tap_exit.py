@@ -507,7 +507,22 @@ def test_f14_7_slow_consumer_tx_drop_visible_on_metrics():
         default_behavior="drop",
     )
 
-    qdisc_armed = False
+    # F14.7 throttle recipe. Kernel-side TBF on the tap does NOT
+    # back-propagate to DPDK's `pmd_tx_burst` writev() — net_tap writes
+    # straight into the tun fd, and tc egress qdiscs only kick on the
+    # other side of `tun_net_xmit` (kernel→wire direction), which is
+    # the OPPOSITE side from the one DPDK drives. Empirically confirmed
+    # on dev-debug: TBF 1 kbit/s + 200-pkt burst leaves both counters
+    # at 0.
+    #
+    # Right lever: drop the kernel's tap queue size to 1, then set the
+    # link DOWN. DPDK's writev still targets /dev/net/tun, kernel
+    # tun_net_xmit sees IFF_UP=0 → returns NETDEV_TX_BUSY-equivalent
+    # after one skb is queued. Once the internal tun queue fills
+    # (txqueuelen=1) the writev() returns EAGAIN/-1, tap_write_mbufs
+    # returns -1, pmd_tx_burst breaks the loop, rte_eth_tx_burst returns
+    # num_tx < nb_pkts.
+    shaped = False
     with _F14TapHarness(config, "pktgate_f14_7") as h:
         try:
             assert h.prom_port and h.prom_port > 0, (
@@ -515,21 +530,22 @@ def test_f14_7_slow_consumer_tx_drop_visible_on_metrics():
                 f"stdout={h.stdout_text[-2048:]!r}"
             )
 
-            # Throttle the egress tap kernel-side. TBF: 1 kbit/s avg,
-            # 1 KB burst budget, 50 ms latency cap. Anything beyond
-            # that gets dropped at the qdisc, which back-propagates as
-            # rte_eth_tx_burst returning < nb_tx (or 0).
-            tc_add = subprocess.run(
-                ["tc", "qdisc", "add", "dev", _EGRESS_IFACE, "root",
-                 "tbf", "rate", "1kbit", "burst", "1kb", "latency", "50ms"],
+            # Shrink the egress tap's kernel queue, then down the link.
+            subprocess.run(
+                ["ip", "link", "set", "dev", _EGRESS_IFACE,
+                 "txqueuelen", "1"],
+                capture_output=True,
+            )
+            down_res = subprocess.run(
+                ["ip", "link", "set", "dev", _EGRESS_IFACE, "down"],
                 capture_output=True, text=True,
             )
-            if tc_add.returncode != 0:
+            if down_res.returncode != 0:
                 pytest.fail(
-                    f"tc qdisc add failed (need root + iproute2): "
-                    f"rc={tc_add.returncode} stderr={tc_add.stderr!r}"
+                    f"ip link set down failed: rc={down_res.returncode} "
+                    f"stderr={down_res.stderr!r}"
                 )
-            qdisc_armed = True
+            shaped = True
 
             # Baseline scrape — both per-port counters should be 0
             # on a fresh boot before any traffic is injected.
@@ -602,9 +618,16 @@ def test_f14_7_slow_consumer_tx_drop_visible_on_metrics():
                 f"counters are not bumped on the live tx path."
             )
         finally:
-            if qdisc_armed:
+            if shaped:
+                # Restore link UP + default queue len so the tap is in a
+                # sane state for any subsequent test in the same session.
                 subprocess.run(
-                    ["tc", "qdisc", "del", "dev", _EGRESS_IFACE, "root"],
+                    ["ip", "link", "set", "dev", _EGRESS_IFACE, "up"],
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["ip", "link", "set", "dev", _EGRESS_IFACE,
+                     "txqueuelen", "1000"],
                     capture_output=True,
                 )
 
