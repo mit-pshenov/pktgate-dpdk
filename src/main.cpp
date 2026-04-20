@@ -416,8 +416,15 @@ int main(int argc, char* argv[]) {
   unsigned actual_mbuf_size = (mbuf_data_size > 0) ? mbuf_data_size
                                                     : RTE_MBUF_DEFAULT_BUF_SIZE;
 
+  // Test harness override (M16 C4); env var is never set in production.
+  unsigned mbuf_count = kMbufCount;
+  if (const char* ev = std::getenv("PKTGATE_TEST_MBUF_POOL_SIZE")) {
+    const unsigned v = static_cast<unsigned>(std::atoi(ev));
+    if (v > 0) mbuf_count = v;
+  }
+
   struct rte_mempool* mp = rte_pktmbuf_pool_create(
-      "pktgate_pool", kMbufCount, kMbufCacheSize, 0,
+      "pktgate_pool", mbuf_count, kMbufCacheSize, 0,
       static_cast<std::uint16_t>(actual_mbuf_size),
       static_cast<int>(socket_id));
   if (mp == nullptr) {

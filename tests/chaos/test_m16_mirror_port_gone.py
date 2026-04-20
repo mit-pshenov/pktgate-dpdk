@@ -134,13 +134,20 @@ _INJECT_INTER_S = 0.01  # 100 Hz pacing (actual cadence will slip under
                         # exact 100 pps — see attribution probe below).
 _BREAK_AFTER_PKTS = 300  # mid-stream break: ~3 s into the 10 s stream.
 
-# RED sentinels — impossible thresholds so the RED commit is guaranteed
-# to fail on any real run. GREEN cycle flips these to measured values.
-# They are named constants (not magic numbers) so the RED→GREEN diff is
-# a single-value flip, precedent M15 C3 _RX_THRESHOLD_RED.
-_MIRROR_DROPPED_THRESHOLD_RED = 10**9   # real run bumps by <~300; 1e9 unreachable.
-_SENT_BEFORE_BREAK_UPPER_RED = 1         # real run sends many tens pre-break;
-                                         # asserting `sent < 1` is impossible.
+# GREEN thresholds (measured-realistic) — see commit body for the
+# three stability-run deltas that seeded each floor. Lower bounds were
+# chosen at roughly one-third of observed minimum to keep headroom for
+# sanitiser presets (TSan/ASan can slip pacing and/or pool reclaim by
+# 2-5x vs. dev-debug baseline). Chaos counters are stochastic; always
+# use inequality with generous margin, never equality on chaos deltas.
+_MIRROR_SENT_LOWER_BOUND = 100   # pre-break ~300 packet burst ships
+                                 # many tens of clones; floor at 100
+                                 # well below dev-debug minimum of 298.
+_MIRROR_DROPPED_LOWER_BOUND = 1  # post-break drain-short; observed
+                                 # tens-to-hundreds across presets;
+                                 # floor at 1 to tolerate slow-tap
+                                 # presets where break lands after
+                                 # pool has already drained.
 
 # Attribution-probe threshold: the RX path must sustain at least 80% of
 # the inject rate across the entire test. If RX rate drops below this
@@ -700,35 +707,39 @@ def test_m16_c4_mirror_port_gone_mid_burst():
             f"(clone_failed++). Wrong failure mode."
         )
 
-        # --- sent-before-break probe (RED IMPOSSIBLE THRESHOLD) ---
-        # Pre-break a 300-packet burst should mirror ~300 clones. Asking
-        # for < 1 is impossible — guarantees RED. GREEN will replace the
-        # threshold with something like `mid_mirror_sent >= ~150` once
-        # measured on the dev VM.
+        # --- sent-before-break threshold (chaos observable, lower bound) ---
+        # Pre-break ~300-packet burst should ship many tens of clones.
+        # Measured dev-debug baseline ~298; floor at 100 for margin.
         assert mid_mirror_sent is not None, (
             "mid-stream scrape did not execute — break logic broken."
         )
         mid_sent_delta = mid_mirror_sent - base_mirror_sent
-        assert mid_sent_delta < _SENT_BEFORE_BREAK_UPPER_RED, (
-            f"M16 C4 scenario 1 (RED): expected mid-stream mirror_sent "
-            f"delta < {_SENT_BEFORE_BREAK_UPPER_RED} (impossible; pre-break "
-            f"burst of ~{_BREAK_AFTER_PKTS} should bump sent by many tens "
-            f"or more). Got mid_sent_delta={mid_sent_delta} "
+        assert mid_sent_delta >= _MIRROR_SENT_LOWER_BOUND, (
+            f"M16 C4 scenario 1: expected mid-stream mirror_sent delta "
+            f">= {_MIRROR_SENT_LOWER_BOUND} (pre-break burst of "
+            f"~{_BREAK_AFTER_PKTS} packets should ship many tens of "
+            f"clones). Got mid_sent_delta={mid_sent_delta} "
             f"(mid={mid_mirror_sent} base={base_mirror_sent}). "
-            f"GREEN cycle will flip this to `mid_sent_delta >= <measured>`."
+            f"Threshold floor is 1/3 of observed minimum; a value below "
+            f"this indicates broken mirror staging or a stalled drain."
         )
 
-        # --- dropped threshold (RED IMPOSSIBLE THRESHOLD) ---
-        assert mirror_dropped_delta > _MIRROR_DROPPED_THRESHOLD_RED, (
-            f"M16 C4 scenario 1 (RED): expected "
-            f"mirror_dropped delta > {_MIRROR_DROPPED_THRESHOLD_RED} "
-            f"(impossible). Got delta={mirror_dropped_delta} "
+        # --- dropped threshold (chaos observable, lower bound) ---
+        # Post-break drain-short counting — `mirror_dropped_total` climbs
+        # by an undetermined amount that depends on kernel queue drain
+        # cadence, inject pacing, RX polling. Observed tens-to-hundreds
+        # across presets; floor at 1 tolerates slow-preset corner cases
+        # where the break happens to land after the pool drained.
+        assert mirror_dropped_delta >= _MIRROR_DROPPED_LOWER_BOUND, (
+            f"M16 C4 scenario 1: expected mirror_dropped delta >= "
+            f"{_MIRROR_DROPPED_LOWER_BOUND} after mid-stream link-down "
+            f"(drain-short path must bump at least once). "
+            f"Got delta={mirror_dropped_delta} "
             f"(final={final_mirror_dropped} base={base_mirror_dropped}). "
             f"elapsed_wall={elapsed:.2f}s mid_mirror_sent={mid_mirror_sent} "
             f"mid_rx={mid_rx} final_rx={final_rx} rx_delta={rx_delta} "
             f"final_mirror_sent={final_mirror_sent} "
-            f"final_clone_failed={final_mirror_clone_failed}. "
-            f"GREEN cycle will flip this to `delta >= <measured>`."
+            f"final_clone_failed={final_mirror_clone_failed}."
         )
 
     assert h.returncode == 0, (
