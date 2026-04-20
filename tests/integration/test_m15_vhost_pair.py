@@ -615,10 +615,10 @@ def test_m15_vhost_pair_forwards():
     the data path from kernel tap → DPDK rx → pktgate pipeline →
     vhost TX → virtio-user consumer is end-to-end live.
 
-    RED at HEAD (31ab09b): threshold is set to _RX_THRESHOLD_RED
-    (10_000_000), which is impossible to hit given only
-    _INJECT_COUNT (128) packets are injected. GREEN flips to
-    _RX_THRESHOLD_REAL (100).
+    GREEN (M15 C3): threshold is _RX_THRESHOLD_REAL (100), leaving
+    headroom for small-burst boundary losses or NDP-chatter drops
+    on the tap. RED predecessor used _RX_THRESHOLD_RED (10_000_000)
+    impossible-to-satisfy sentinel; see RED commit body for rationale.
     """
     pkts = []
     for i in range(_INJECT_COUNT):
@@ -646,10 +646,13 @@ def test_m15_vhost_pair_forwards():
         f"pktgate_stdout_tail={h.pktgate_stdout[-1024:]!r}"
     )
 
-    # RED sentinel: impossible to satisfy — GREEN flips to _RX_THRESHOLD_REAL.
-    assert rx >= _RX_THRESHOLD_RED, (
+    # GREEN: threshold is the real minimum — 100 out of 128 injected,
+    # leaving headroom for tap-bringup boundary losses or stray NDP
+    # drops. RED used the 10_000_000 sentinel (see _RX_THRESHOLD_RED
+    # kept as a documented constant so the RED→GREEN diff is legible).
+    assert rx >= _RX_THRESHOLD_REAL, (
         f"testpmd saw only {rx} RX packets via virtio-user on the "
-        f"shared vhost UDS; expected >= {_RX_THRESHOLD_RED}. "
+        f"shared vhost UDS; expected >= {_RX_THRESHOLD_REAL}. "
         f"Injected {_INJECT_COUNT} frames. "
         f"pktgate_rc={h.pktgate_returncode} "
         f"testpmd_rc={h.testpmd_returncode} "
