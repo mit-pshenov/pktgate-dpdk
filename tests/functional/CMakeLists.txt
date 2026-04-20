@@ -212,6 +212,26 @@ set_tests_properties(functional.test_f14_tap_exit PROPERTIES
   TIMEOUT 180
 )
 
+# M16 C3 — F16.2 TAP mirror happy path + F16.3 unresolved target_port
+# reject. Boots pktgate on three net_tap vdevs (dtap_m16_ing /
+# dtap_m16_egress / dtap_m16_mirror) via the D43 interface_roles
+# selectors, injects 50 UDP packets with scapy on the ingress tap,
+# asserts dual AsyncSniffer capture (egress + mirror) sets match
+# inject set AND /metrics scrape of pktgate_mirror_{sent,clone_failed,
+# dropped}_total{port}. F16.3 surfaces the validator's
+# kUnresolvedTargetPort reject path. Requires root (scapy AF_PACKET
+# inject + NM keyfile + sysctl). 2 sub-tests × EAL cold-start + dual
+# sniff settles -> 180 s timeout (matches F14.7 budget).
+add_test(
+  NAME functional.test_f16_mirror_tap
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f16_mirror_tap.py"
+)
+set_tests_properties(functional.test_f16_mirror_tap PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 180
+)
+
 # M15 C1 — F15.1 vhost boot smoke. net_null upstream + net_vhost
 # downstream (server mode); asserts pktgate reaches ready without a
 # peer, emits a port_resolved event naming the vhost port id, and

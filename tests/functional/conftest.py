@@ -135,6 +135,12 @@ _TAP_IFACES_TO_UNMANAGE = [
     # Short name: IFNAMSIZ is 16 incl NUL, so the 15-char budget
     # rules out "dtap_m15_crash_ing" (18).
     "dtap_m15c_ing",
+    # M16 C3 — functional.test_f16_mirror_tap (mirror destination
+    # smoke). Three dtaps: ingress / egress / mirror. All ≤15 chars
+    # (IFNAMSIZ budget, memory grabli_ifnamsiz_16_limit.md). Separate
+    # names from the C4/C5 chaos cycle fixtures so M16 tests run in
+    # any order in a shared session.
+    "dtap_m16_ing", "dtap_m16_egress", "dtap_m16_mirror",
 ]
 
 
