@@ -2471,7 +2471,17 @@ pktgate_lcore_pkt_multiseg_drop_total{lcore}                      counter
 pktgate_lcore_pkt_frag_skipped_total{lcore,af="v4|v6"}            counter
 pktgate_lcore_pkt_frag_dropped_total{lcore,policy="drop",af="v4|v6"} counter
 pktgate_redirect_dropped_total{lcore,port}                        counter
-pktgate_mirror_dropped_total{lcore,port}                          counter
+# D7 (M16 C2) — per-port mirror dispatch counter triplet.
+# sent: clone successfully staged into mirror_tx[port] (stage-time bump).
+# clone_failed: rte_pktmbuf_copy returned null (mempool exhausted);
+#   original still forwards. Stage-time bump.
+# dropped: clone staged but unsent at drain time (short rte_eth_tx_burst)
+#   OR stage-full (buffer at kMirrorBurstMax). Drain-time + stage-full bumps.
+# Labels dropped the `lcore` dimension (per-port rollup already collapses
+# across workers at publisher tick); matches D43 tx_*_per_port shape.
+pktgate_mirror_sent_total{port}                                   counter
+pktgate_mirror_clone_failed_total{port}                           counter
+pktgate_mirror_dropped_total{port}                                counter
 
 pktgate_reload_total{result="success|parse_err|validate_err|compile_err|oom|timeout|pending_full"} counter
 pktgate_reload_latency_seconds                                    histogram
@@ -2875,8 +2885,9 @@ deferred).*
   2026-04-20).** Deep-copy strategy (`rte_pktmbuf_copy`) with TAP
   destination as the canonical deploy profile; `case MIRROR:` in
   `apply_action`, `stage_mirror` + `mirror_drain` modeled on the
-  D16 REDIRECT pattern, and a `pktgate_mirror_{sent,clone_failed,
-  dropped}_total{port}` counter triplet under D33 six-fold
+  D16 REDIRECT pattern, and the counter triplet
+  `pktgate_mirror_sent_total`, `pktgate_mirror_clone_failed_total`,
+  `pktgate_mirror_dropped_total` (all per-port) under D33 six-fold
   lockstep. D41 guard extended to cover `mirror_port` in both
   `observable_fields()` projections. Refcount zero-copy runtime
   path stays dormant: the D26 gate logic

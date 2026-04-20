@@ -9795,7 +9795,7 @@ TEST_F(MirrorDispatchTest, U16_6_StageMirrorBuffersClone) {
 
   // Drain for cleanup — spy "sends" the clone; free staged pointer.
   dataplane::mirror_drain(&ctx);
-  for (std::uint16_t i = 0; i + 1 < spy.seen_mbufs.size(); ++i) {
+  for (std::size_t i = 0; i + 1 < spy.seen_mbufs.size(); ++i) {
     // pkts[0..n-1] in spy.seen_mbufs past index 0 are the clones; the
     // spy holds but does not own. Drain already removed them from
     // mirror_tx; free them here.

@@ -923,6 +923,15 @@ int main(int argc, char* argv[]) {
           view.tx_burst_short_per_port       = worker_ctx.tx_burst_short_per_port;
           view.tx_burst_short_per_port_count = RTE_MAX_ETHPORTS;
 
+          // M16 C2 — D7 per-port mirror dispatch counter arrays.
+          view.mirror_sent_per_port       = worker_ctx.mirror_sent_per_port;
+          view.mirror_sent_per_port_count = RTE_MAX_ETHPORTS;
+          view.mirror_clone_failed_per_port =
+              worker_ctx.mirror_clone_failed_per_port;
+          view.mirror_clone_failed_per_port_count = RTE_MAX_ETHPORTS;
+          view.mirror_dropped_per_port       = worker_ctx.mirror_dropped_per_port;
+          view.mirror_dropped_per_port_count = RTE_MAX_ETHPORTS;
+
           // Walk the currently-active ruleset to build RuleIdent spans
           // + ActiveRuleCounts. The manager's active_ruleset() acquire-
           // loads under RCU; the pointer is valid for the duration of
@@ -1061,6 +1070,26 @@ int main(int argc, char* argv[]) {
                         : 0u;
                 body += format_counter("pktgate_tx_burst_short_total",
                                        lbls, tx_short);
+                // M16 C2 — D7 per-port mirror dispatch triplet.
+                // Same shape / guarding as the D43 tx emit above.
+                const std::uint64_t mir_sent =
+                    pid < snap.mirror_sent_per_port.size()
+                        ? snap.mirror_sent_per_port[pid]
+                        : 0u;
+                body += format_counter("pktgate_mirror_sent_total",
+                                       lbls, mir_sent);
+                const std::uint64_t mir_cf =
+                    pid < snap.mirror_clone_failed_per_port.size()
+                        ? snap.mirror_clone_failed_per_port[pid]
+                        : 0u;
+                body += format_counter("pktgate_mirror_clone_failed_total",
+                                       lbls, mir_cf);
+                const std::uint64_t mir_drop =
+                    pid < snap.mirror_dropped_per_port.size()
+                        ? snap.mirror_dropped_per_port[pid]
+                        : 0u;
+                body += format_counter("pktgate_mirror_dropped_total",
+                                       lbls, mir_drop);
               }
 
               // ---- Per-rule family ---------------------------------

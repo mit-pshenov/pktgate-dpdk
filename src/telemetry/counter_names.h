@@ -153,6 +153,19 @@ inline constexpr CounterName kLcorePktFragDroppedTotal{
 // --- Dispatch / mirror / redirect ------------------------------------
 inline constexpr CounterName kRedirectDroppedTotal{
     "pktgate_redirect_dropped_total", MetricType::Counter};
+// M16 C2 — D7 mirror dispatch counter triplet.
+//   mirror_sent_total         — clone staged into mirror_tx[port]
+//                               (success at STAGE time; a stage-full
+//                               drop does not count here).
+//   mirror_clone_failed_total — rte_pktmbuf_copy returned null;
+//                               original still forwards, no clone.
+//   mirror_dropped_total      — clone staged but unsent at drain
+//                               time (short rte_eth_tx_burst) OR
+//                               stage-time buffer-full drop.
+inline constexpr CounterName kMirrorSentTotal{
+    "pktgate_mirror_sent_total", MetricType::Counter};
+inline constexpr CounterName kMirrorCloneFailedTotal{
+    "pktgate_mirror_clone_failed_total", MetricType::Counter};
 inline constexpr CounterName kMirrorDroppedTotal{
     "pktgate_mirror_dropped_total", MetricType::Counter};
 
@@ -198,7 +211,7 @@ inline constexpr CounterName kLogDroppedTotal{
 //
 // Order is exposition-stable (mirrors §10.3 prose order). Grepping for
 // a name in source returns a single hit in this header.
-inline constexpr std::array<CounterName, 39> kAllCounterNames{
+inline constexpr std::array<CounterName, 41> kAllCounterNames{
     // Rule-match family
     kRulePacketsTotal,
     kRuleBytesTotal,
@@ -230,6 +243,8 @@ inline constexpr std::array<CounterName, 39> kAllCounterNames{
     kLcorePktFragDroppedTotal,
     // Dispatch / mirror / redirect
     kRedirectDroppedTotal,
+    kMirrorSentTotal,
+    kMirrorCloneFailedTotal,
     kMirrorDroppedTotal,
     // Reload / control plane
     kReloadTotal,

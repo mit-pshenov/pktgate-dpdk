@@ -313,6 +313,15 @@ int worker_main(void* arg) {
     // mbufs freed and redirect_dropped_total bumped.
     redirect_drain(ctx);
 
+    // M16 C2 — D7: drain any MIRROR-staged clones at end of burst.
+    // Same shape as redirect_drain — one batched rte_eth_tx_burst per
+    // non-empty mirror port; unsent clones freed and
+    // mirror_dropped_per_port[p] bumped. Mirror and redirect staging
+    // buffers are independent (different RuleAction fields), so drain
+    // order is irrelevant for correctness; we drain redirect first to
+    // match §5.5 text order.
+    mirror_drain(ctx);
+
     // M8 C4 — D12: report quiescent at end of every burst so the
     // reload manager's synchronize path drains promptly. The fence
     // inside rte_rcu_qsbr_quiescent gives TSAN the happens-before

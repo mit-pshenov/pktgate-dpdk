@@ -125,6 +125,79 @@ inline void redirect_drain(WorkerCtx* ctx) {
 }
 
 // -------------------------------------------------------------------------
+// M16 C2 — D7 MIRROR staging + burst-end drain.
+//
+// Shape analogous to stage_redirect / redirect_drain (D16). The
+// *clone* produced by rte_pktmbuf_copy inside apply_action's kMirror
+// arm is staged here; the *original* is forwarded separately via
+// tx_one() to ctx->tx_port_id. So this helper only ever owns clones.
+//
+// stage_mirror policy:
+//   * port >= RTE_MAX_ETHPORTS → free + bump mirror_dropped_per_port[0]
+//     (defensive — caller should have validated the mirror_port
+//     resolution; a 0xFFFF sentinel lands here).
+//   * buffer at kMirrorBurstMax → free new mbuf + bump
+//     mirror_dropped_per_port[port] (head-of-line preservation, same
+//     rationale as stage_redirect).
+//   * otherwise → enqueue and bump mirror_sent_per_port[port]. Sent
+//     counts successful STAGING, not successful TX (drain-short bumps
+//     `dropped` on top of the already-bumped `sent`, so per-port
+//     identity is `sent >= actually_transmitted`).
+//
+// mirror_drain policy:
+//   * one rte_eth_tx_burst call per non-empty staged port (same as
+//     redirect_drain).
+//   * on short burst: free unsent clones + bump
+//     mirror_dropped_per_port[p] by the unsent delta.
+//
+// D1 / M11 C1.5: every counter bump uses relaxed_bump / relaxed_add /
+// relaxed_bump_bucket. Codegen invariant is mov/inc/mov with no
+// `lock` prefix; objdump evidence required at C2 exit-gate per the
+// M15 C2 addendum.
+inline void stage_mirror(WorkerCtx* ctx, std::uint16_t port,
+                         rte_mbuf* clone) {
+  // Defensive: forged / unresolved port index. 0xFFFF is the
+  // RuleAction mirror_port sentinel when the compiler emitted a
+  // mirror without a destination — shouldn't reach here in
+  // practice (validator rejects), but the hot path cannot trust
+  // that.
+  if (port >= RTE_MAX_ETHPORTS) {
+    relaxed_bump_bucket(ctx->mirror_dropped_per_port, 0u);
+    rte_pktmbuf_free(clone);
+    return;
+  }
+  auto& s = ctx->mirror_tx[port];
+  if (s.count >= kMirrorBurstMax) {
+    // Buffer full — drop the new clone (head-of-line preserved).
+    relaxed_bump_bucket(ctx->mirror_dropped_per_port, port);
+    rte_pktmbuf_free(clone);
+    return;
+  }
+  s.pkts[s.count++] = clone;
+  relaxed_bump_bucket(ctx->mirror_sent_per_port, port);
+}
+
+inline void mirror_drain(WorkerCtx* ctx) {
+  for (std::uint16_t p = 0; p < RTE_MAX_ETHPORTS; ++p) {
+    auto& s = ctx->mirror_tx[p];
+    if (s.count == 0) continue;
+    std::uint16_t sent = 0;
+    if (ctx->tx_burst_fn != nullptr) {
+      sent = ctx->tx_burst_fn(p, ctx->queue_id, s.pkts, s.count);
+    }
+    if (sent < s.count) {
+      for (std::uint16_t i = sent; i < s.count; ++i) {
+        rte_pktmbuf_free(s.pkts[i]);
+      }
+      const std::uint64_t unsent =
+          static_cast<std::uint64_t>(s.count - sent);
+      relaxed_add(&ctx->mirror_dropped_per_port[p], unsent);
+    }
+    s.count = 0;
+  }
+}
+
+// -------------------------------------------------------------------------
 // apply_dscp_pcp — D19 TAG semantics (M7 C1).
 //
 // Rewrites DSCP (IPv4 ToS / IPv6 TC high 6 bits) and VLAN PCP (TCI
@@ -492,20 +565,48 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       stage_redirect(ctx, action->redirect_port, m);
       return;
 
-    case compiler::ActionVerb::kMirror:
-      // M16 C1 placeholder arm (review-notes §D7 amendment 2026-04-20).
-      // The compile-path reject is removed in C1 — a mirror rule now
-      // lowers a resolved `action->mirror_port` through the builder
-      // and reaches here. C2 replaces this body with stage_mirror +
-      // stage_tx (original forward) + mirror_drain at burst end. In
-      // C1 no hot-path code lands yet: if a live packet hits a mirror
-      // rule (unit/EAL tests do not inject packets into this arm), we
-      // fall back to the unreachable-counter + free behaviour so the
-      // hot path remains provably safe. `-Wswitch-enum` keeps us
-      // honest when C2 rewrites this arm.
-      relaxed_bump(&ctx->dispatch_unreachable_total);
-      rte_pktmbuf_free(m);
+    case compiler::ActionVerb::kMirror: {
+      // M16 C2 — D7 hot-path mirror dispatch.
+      //
+      // Semantics (review-notes §D7, post-C1 unlock):
+      //   1. Clone the mbuf via rte_pktmbuf_copy(). The clone's
+      //      mempool is inherited from m->pool. If copy returns
+      //      nullptr (mempool exhausted, esp. tiny fixtures), bump
+      //      mirror_clone_failed_per_port[mirror_port] and continue —
+      //      the ORIGINAL must still forward.
+      //   2. Otherwise stage the clone into ctx->mirror_tx[port]
+      //      (stage_mirror bumps mirror_sent_per_port[port]; buffer-
+      //      full drops bump mirror_dropped_per_port[port]).
+      //   3. Forward the ORIGINAL to ctx->tx_port_id via tx_one().
+      //      Mirror does NOT replace egress — every matched packet
+      //      still goes to the primary path; the clone is a side copy.
+      //
+      // D1 / M11 C1.5: counter bumps go through relaxed_bump_bucket;
+      // no `lock`-prefixed RMW on the hot path.
+      rte_mbuf* clone =
+          rte_pktmbuf_copy(m, m->pool, 0, rte_pktmbuf_pkt_len(m));
+      if (clone == nullptr) {
+        // Mempool exhausted (or other copy failure). Bump the
+        // per-port counter bucketed at the mirror destination so the
+        // operator can tell which mirror target is starved. If the
+        // mirror_port sentinel is out-of-range (0xFFFF), bucket at
+        // index 0 — consistent with stage_mirror's defensive policy
+        // and keeps the bump bounded.
+        const std::uint16_t bucket =
+            (action->mirror_port < RTE_MAX_ETHPORTS)
+                ? action->mirror_port
+                : static_cast<std::uint16_t>(0);
+        relaxed_bump_bucket(ctx->mirror_clone_failed_per_port, bucket);
+      } else {
+        stage_mirror(ctx, action->mirror_port, clone);
+      }
+      // Forward the ORIGINAL (same shape as kAllow).
+      const std::uint16_t sent = tx_one(ctx, ctx->tx_port_id, m);
+      if (sent == 0) {
+        rte_pktmbuf_free(m);
+      }
       return;
+    }
 
     default:
       // D25 runtime backstop: unknown verb. U6.45 covers this

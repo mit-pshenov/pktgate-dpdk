@@ -186,6 +186,47 @@ Snapshot build_snapshot(std::uint64_t generation,
             relaxed_load_bucket(view.tx_burst_short_per_port, i);
       }
     }
+
+    // M16 C2 — D7 per-port mirror dispatch. Same pattern as the D43
+    // tx arrays above: grow the rollup vectors, element-wise sum.
+    if (view.mirror_sent_per_port != nullptr &&
+        view.mirror_sent_per_port_count > 0) {
+      if (out.mirror_sent_per_port.size() <
+          view.mirror_sent_per_port_count) {
+        out.mirror_sent_per_port.resize(
+            view.mirror_sent_per_port_count, 0u);
+      }
+      for (std::uint32_t i = 0; i < view.mirror_sent_per_port_count; ++i) {
+        out.mirror_sent_per_port[i] +=
+            relaxed_load_bucket(view.mirror_sent_per_port, i);
+      }
+    }
+    if (view.mirror_clone_failed_per_port != nullptr &&
+        view.mirror_clone_failed_per_port_count > 0) {
+      if (out.mirror_clone_failed_per_port.size() <
+          view.mirror_clone_failed_per_port_count) {
+        out.mirror_clone_failed_per_port.resize(
+            view.mirror_clone_failed_per_port_count, 0u);
+      }
+      for (std::uint32_t i = 0;
+           i < view.mirror_clone_failed_per_port_count; ++i) {
+        out.mirror_clone_failed_per_port[i] +=
+            relaxed_load_bucket(view.mirror_clone_failed_per_port, i);
+      }
+    }
+    if (view.mirror_dropped_per_port != nullptr &&
+        view.mirror_dropped_per_port_count > 0) {
+      if (out.mirror_dropped_per_port.size() <
+          view.mirror_dropped_per_port_count) {
+        out.mirror_dropped_per_port.resize(
+            view.mirror_dropped_per_port_count, 0u);
+      }
+      for (std::uint32_t i = 0; i < view.mirror_dropped_per_port_count;
+           ++i) {
+        out.mirror_dropped_per_port[i] +=
+            relaxed_load_bucket(view.mirror_dropped_per_port, i);
+      }
+    }
   }
 
   // -- Per-rule sums ----------------------------------------------
@@ -339,6 +380,13 @@ std::set<std::string> snapshot_metric_names(const Snapshot& snap) {
   // handling of port_link_up / lcore scalar counters above.
   names.insert("pktgate_tx_dropped_total");
   names.insert("pktgate_tx_burst_short_total");
+
+  // M16 C2 — D7 mirror dispatch counter triplet. Always surfaced
+  // (presence contract, same as D43 tx counters above). Per-port
+  // label cardinality is 0 when no view exposes the arrays.
+  names.insert("pktgate_mirror_sent_total");
+  names.insert("pktgate_mirror_clone_failed_total");
+  names.insert("pktgate_mirror_dropped_total");
 
   return names;
 }

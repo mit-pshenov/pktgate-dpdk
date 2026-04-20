@@ -563,11 +563,14 @@ Scope of the unlock:
 - **Deep-copy strategy only** (`rte_pktmbuf_copy`). `build_ruleset`
   passes `config_zero_copy = false` unconditionally in current
   builds; the refcnt zero-copy runtime path stays dormant.
-- **Counter family `pktgate_mirror_{sent,clone_failed,dropped}
-  _total{port}`** lands under D33 six-fold lockstep;
-  `kAllCounterNames` grows 39 → 42. All three counters use
-  `relaxed_bump` per the D1 telemetry clause (single-writer,
-  no `lock` prefix).
+- **Counter triplet** — `pktgate_mirror_sent_total`,
+  `pktgate_mirror_clone_failed_total`, and the existing
+  `pktgate_mirror_dropped_total` (all per-port) — lands under
+  D33 six-fold lockstep; `kAllCounterNames` grows 39 → 41 (the
+  pre-existing placeholder `pktgate_mirror_dropped_total` is
+  already in the canonical set, so net delta is +2). All three
+  counters use `relaxed_bump` per the D1 telemetry clause
+  (single-writer, no `lock` prefix).
 - **Staging + drain** analogous to D16 REDIRECT: `stage_mirror`
   per-port buffer, `mirror_drain` at burst end, unsent clones
   freed and counted as `mirror_dropped_total`.

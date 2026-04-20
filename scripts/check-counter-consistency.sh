@@ -221,17 +221,11 @@ echo "pass2: ok — 3 compiler counter families verified, ${deferred_count} defe
 #   pktgate_gid            — the daemon's own-gid variable (§10.7 / D38).
 #   pktgate_test           — auxiliary Q9 test user account name.
 #   pktgate_test2          — auxiliary Q9 test user account name.
-#   pktgate_mirror_        — transient placeholder (M16 C1 landed D7
-#                             unlock prose in C0 mentioning the
-#                             `pktgate_mirror_{sent,clone_failed,dropped}
-#                             _total` family; the awk token extractor
-#                             collapses the `{...}` group into the bare
-#                             `pktgate_mirror_` prefix. The three real
-#                             metrics land in §10.3 at M16 C2 when the
-#                             counter wiring ships in src/, at which
-#                             point this allowlist entry is removed.
-#                             See review-notes.md §D7 amendment
-#                             2026-04-20 and the M16 supervisor handoff.
+#
+# (M16 C2 closed the `pktgate_mirror_` transient allowlist: the three
+# §10.3 rows `pktgate_mirror_{sent,clone_failed,dropped}_total` landed
+# in src/telemetry/counter_names.h + design.md §10.3, so the awk
+# extractor now finds them as real metrics on both sides.)
 is_allowlisted() {
   case "$1" in
     pktgate_dpdk|pktgate_dpdk_test_*|pktgate_dpdk_fuzz_*|\
@@ -239,8 +233,7 @@ is_allowlisted() {
     pktgate_rl|pktgate_rl_ctl|pktgate_runtime|pktgate_telemetry|\
     pktgate_ports_ctl|\
     pktgate_uid|pktgate_gid|\
-    pktgate_test|pktgate_test2|\
-    pktgate_mirror_)
+    pktgate_test|pktgate_test2)
       return 0
       ;;
   esac

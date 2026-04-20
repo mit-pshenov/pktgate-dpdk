@@ -72,6 +72,22 @@ struct RedirectBuf {
   rte_mbuf*     pkts[kRedirectBurstMax] = {};
 };
 
+// M16 C2 — D7 MIRROR staging buffer. Same shape and rationale as
+// RedirectBuf (see above). Mirror clones are produced by
+// `rte_pktmbuf_copy` inside apply_action's kMirror arm, staged here,
+// and drained at burst end via `mirror_drain`. Sized identically to
+// the redirect buffer — a worst-case burst that fully mirrors each
+// packet stages exactly one clone per packet. Unsent clones are freed
+// and `mirror_dropped_per_port` is bumped at drain time; stage-full is
+// accounted to `mirror_dropped_per_port` as well (same policy as
+// stage_redirect).
+constexpr std::uint16_t kMirrorBurstMax = 32;
+
+struct MirrorBuf {
+  std::uint16_t count = 0;
+  rte_mbuf*     pkts[kMirrorBurstMax] = {};
+};
+
 // Worker context passed to each lcore via rte_eal_remote_launch.
 struct WorkerCtx {
   std::uint16_t port_id;       // port to RX from
@@ -186,6 +202,38 @@ struct WorkerCtx {
   // cross-CPU RMW, so D1 zero-atomics is preserved.
   std::uint64_t tx_dropped_per_port[RTE_MAX_ETHPORTS]     = {};
   std::uint64_t tx_burst_short_per_port[RTE_MAX_ETHPORTS] = {};
+
+  // M16 C2 — D7 mirror dispatch (hot path: apply_action kMirror arm).
+  //
+  // MirrorBuf[] is the sibling of RedirectBuf[] above — one per-port
+  // staging buffer addressable by RuleAction::mirror_port. Drained
+  // at burst end via mirror_drain(ctx); unsent clones freed +
+  // counted.
+  //
+  // Three per-port counter arrays form the D7 counter triplet
+  // (§10.3, D33 six-fold lockstep):
+  //   mirror_sent_per_port[p]           — clone successfully queued
+  //                                       into mirror_tx[p] (bumped at
+  //                                       stage time, not drain — so
+  //                                       stage-full still counts as
+  //                                       `dropped` not `sent`).
+  //   mirror_clone_failed_per_port[p]   — rte_pktmbuf_copy returned
+  //                                       null (mempool exhausted);
+  //                                       original still forwards,
+  //                                       no clone staged.
+  //   mirror_dropped_per_port[p]        — clone staged but unsent at
+  //                                       drain time (rte_eth_tx_burst
+  //                                       short-burst) OR stage-full
+  //                                       drop (buffer at capacity).
+  //
+  // Fixed-size arrays (RTE_MAX_ETHPORTS = 32) — sparse in practice.
+  // Memory: 32 × 8 B × 3 arrays = 768 B per WorkerCtx, tracks the
+  // D43 precedent. Single-writer per lcore; bumps via relaxed_bump /
+  // relaxed_bump_bucket (D1, M11 C1.5) — no `lock` prefix emitted.
+  MirrorBuf     mirror_tx[RTE_MAX_ETHPORTS]                  = {};
+  std::uint64_t mirror_sent_per_port[RTE_MAX_ETHPORTS]         = {};
+  std::uint64_t mirror_clone_failed_per_port[RTE_MAX_ETHPORTS] = {};
+  std::uint64_t mirror_dropped_per_port[RTE_MAX_ETHPORTS]      = {};
 
   // M9 C2 — rate-limit arena handle. Stable pointer for the entire
   // worker lifetime; the arena lives outside the Ruleset (D10) and

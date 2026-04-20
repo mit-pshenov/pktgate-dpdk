@@ -134,6 +134,18 @@ struct LcoreCounterView {
   const std::uint64_t* tx_burst_short_per_port       = nullptr;
   std::uint32_t        tx_burst_short_per_port_count = 0;
 
+  // M16 C2 — D7 per-port mirror dispatch counter arrays. Same shape
+  // as the D43 tx arrays above (pointer + count, null-friendly). The
+  // aggregator resizes Snapshot::mirror_*_per_port to max(count
+  // across views) and element-wise sums. Indexed by destination port
+  // (RuleAction::mirror_port).
+  const std::uint64_t* mirror_sent_per_port       = nullptr;
+  std::uint32_t        mirror_sent_per_port_count = 0;
+  const std::uint64_t* mirror_clone_failed_per_port       = nullptr;
+  std::uint32_t        mirror_clone_failed_per_port_count = 0;
+  const std::uint64_t* mirror_dropped_per_port       = nullptr;
+  std::uint32_t        mirror_dropped_per_port_count = 0;
+
   // Per-rule counter row for this lcore: layout matches
   // `Ruleset::counter_row(lcore_id)`. `n_slots` is
   // `rs.counter_slots_per_lcore`. Null allowed for fakes that only
@@ -285,6 +297,15 @@ struct Snapshot {
   // {port="N"}` per entry.
   std::vector<std::uint64_t> tx_dropped_per_port;
   std::vector<std::uint64_t> tx_burst_short_per_port;
+
+  // M16 C2 — D7 per-port mirror dispatch rollups. Sum of
+  // LcoreCounterView::mirror_*_per_port[i] across every lcore view.
+  // Same sizing rule as tx_dropped_per_port. Encoder emits
+  // `pktgate_mirror_{sent,clone_failed,dropped}_total{port="N"}` per
+  // entry.
+  std::vector<std::uint64_t> mirror_sent_per_port;
+  std::vector<std::uint64_t> mirror_clone_failed_per_port;
+  std::vector<std::uint64_t> mirror_dropped_per_port;
 
   // C4 — reload + active-ruleset surface.
   ReloadState      reload{};
