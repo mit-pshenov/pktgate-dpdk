@@ -740,10 +740,11 @@ def test_m15_vhost_peer_crash_tx_dropped_climbs():
 
         drop_delta = final_drop - (baseline_drop or 0)
 
-        # RED threshold — impossible to satisfy, forces failure so this
-        # RED commit goes red on dev-debug. GREEN flips this to
-        # `_DROP_THRESHOLD_REAL`.
-        assert drop_delta >= _DROP_THRESHOLD_RED, (
+        # GREEN threshold — strictly positive delta witnesses that the
+        # M14 C3 backend-agnostic counter covers the vhost peer-gone
+        # path by construction. RED predecessor used
+        # `_DROP_THRESHOLD_RED` (10_000_000), impossible to satisfy.
+        assert drop_delta >= _DROP_THRESHOLD_REAL, (
             f"F15.4: SIGKILL of testpmd peer did NOT raise "
             f"pktgate_tx_dropped_total{{port=\"{h.downstream_port_id}\"}} "
             f"above baseline. baseline={baseline_drop} "
