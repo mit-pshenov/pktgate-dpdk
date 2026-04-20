@@ -60,40 +60,87 @@
 # grabli, opposite transition direction, novel recovery assertion on
 # post-release `mirror_sent_total` bumps.
 #
-# Empirical observation (dev-debug, 2026-04-20) at release point
-# (i=600, ~13 s into 10 s stream after sanitiser pacing slip):
-#   * `mirror_dropped_delta_during_clamp` = 592 (every staged clone
-#     short-bursted at `rte_eth_tx_burst` against the downed link).
-#   * `at_release_mirror_sent` = 592 (per stage_mirror semantics
-#     `sent++` happens on successful STAGING into mirror_tx[port],
-#     before drain — so a clamped drain still increments sent;
-#     dropped also bumps on drain-short, per-port identity
-#     `sent >= actually_transmitted`).
-#   * `at_release_rx` = 593 (clean attribution — RX path saw all
-#     injected packets; slow-consumer is attributed to the mirror
-#     TX path, not to ingress starvation).
-#   * Test FAILED on the threshold-impossible `> 10**9` as designed.
-# The GREEN cycle will:
-#   1. Flip the two RED threshold constants to measured lower bounds
-#      (e.g. `_MIRROR_DROPPED_DELTA_LOWER_BOUND = 100` with 3x
-#      sanitiser margin; `_MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND`
-#      measured post-release; probably floor at 100).
-#   2. Run the full 5-preset matrix to seed the floor per preset
-#      if sanitiser presets shift the drain cadence enough.
+# Empirical observations (dev-debug, 2026-04-20):
 #
-# RED/GREEN strategy:
-#   * RED commit: headline assertions are threshold-impossible so
-#     the commit fails on any real run:
-#         `_MIRROR_DROPPED_DELTA_THRESHOLD_RED = 10**9`
-#           real run bumps by tens/hundreds — impossible;
-#         `_MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND_RED = 0` used as
-#         strict upper bound (`< 1`) — real run bumps by at least
-#         some packets after release.
-#   * GREEN commit (next cycle): flip to measured realistic bounds.
-#     Functional invariants (tx stability, pid alive, attribution
-#     probe, clone_failed==0) stay as-is through both phases; they
-#     are correctness gates on the chaos mechanism itself, not RED
-#     markers.
+# RED-cycle probes (threshold > 10**9 always fired before the
+# test could reach the post-release observation window):
+#
+#   run 1: at_release_mirror_dropped=592,  at_release_mirror_sent=592,
+#          at_release_rx=593,  elapsed_to_release=13.8s.
+#   run 2: at_release_mirror_dropped=581,  at_release_mirror_sent=581,
+#          at_release_rx=582,  elapsed_to_release=14.4s.
+#   run 3: at_release_mirror_dropped=561,  at_release_mirror_sent=561,
+#          at_release_rx=562,  elapsed_to_release=13.6s.
+#
+#   Consistent pattern:
+#     - mirror_sent and mirror_dropped climb in lockstep during the
+#       clamp. mirror_sent is bumped at STAGING time in stage_mirror
+#       (before drain) and mirror_dropped fires at drain-short in
+#       mirror_drain — when the link is DOWN every staged clone is
+#       unsent at drain, so both counters increment one-for-one.
+#       See src/dataplane/action_dispatch.h:135-145 — "Sent counts
+#       successful STAGING, not successful TX (drain-short bumps
+#       `dropped` on top of the already-bumped `sent`)".
+#     - at_release_rx stays at roughly the release-pkt count (~600)
+#       — attribution probe healthy, RX path is not starving.
+#     - elapsed_to_release is ~13-14s (not the nominal 3s from
+#       inject rate math) because scapy sendp + ip-link syscalls
+#       cost real wall clock. Under sanitisers (tsan/asan) the slip
+#       is ~2-3x on top of that — ballpark 30-40s to release under
+#       tsan. The post-release window is bounded by the REMAINING
+#       INJECT ITERATIONS (_INJECT_COUNT - _RELEASE_AFTER_PKTS =
+#       1400 packets) + a 2.5s quiescence sleep, NOT by wall clock;
+#       the numbers below are inject-count-bounded and stable
+#       across presets.
+#
+# GREEN-cycle stability runs (dev-debug, 3x back-to-back at
+# 2026-04-20, post-threshold-flip):
+#
+#   run G1: mirror_dropped_delta_during_clamp=599,
+#           mirror_sent_delta_after_release=1401,
+#           rx_delta=2001/2000, tx_dropped_delta=0,
+#           clone_failed_delta=0, elapsed_total=46.19s.
+#   run G2: mirror_dropped_delta_during_clamp=583,
+#           mirror_sent_delta_after_release=1417,
+#           rx_delta=2001/2000, tx_dropped_delta=0,
+#           clone_failed_delta=0, elapsed_total=50.91s.
+#   run G3: mirror_dropped_delta_during_clamp=587,
+#           mirror_sent_delta_after_release=1413,
+#           rx_delta=2000/2000, tx_dropped_delta=0,
+#           clone_failed_delta=0, elapsed_total=45.24s.
+#
+#   (rx_delta can exceed _INJECT_COUNT by 1 when a late broadcast
+#   frame — e.g. residual ARP reply from the kernel's initial link-
+#   up handshake — slips past the disable_ipv6/arp-off guards
+#   before the first injected packet is counted. The attribution
+#   probe is a >= ratio threshold, unaffected.)
+#
+# Threshold choices (both deliberately loose per C4 pattern
+# `_MIRROR_DROPPED_LOWER_BOUND=1`; chaos is stochastic, exact
+# equality is wrong):
+#
+#   `_MIRROR_DROPPED_DELTA_LOWER_BOUND = 200`
+#     Observed ~560-600 across 6 runs (3 RED + 3 GREEN) on
+#     dev-debug. Floor at 200 gives ~3x headroom for sanitiser
+#     cadence drift (per C4 dev-debug→dev-tsan scaling). Cannot
+#     go below `_RELEASE_AFTER_PKTS` because that's the ceiling of
+#     what could have been staged before release. Cannot be a
+#     ratio-of-release-pkts (600) because burst-overflow drops at
+#     kMirrorBurstMax=32 cap the staging rate.
+#
+#   `_MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND = 500`
+#     Observed ~1370-1390 across 3 GREEN runs on dev-debug. The
+#     `sent` counter bumps at STAGING time (not TX success), so
+#     this is inject-count-bounded: every post-release inject that
+#     reaches apply_action without hitting kMirrorBurstMax=32
+#     overflow bumps `sent`. Post-release inject is 1400 packets;
+#     observed near-1.0 coverage. Floor at 500 (~36% of expected)
+#     gives ~3x sanitiser margin — under tsan the sent counter
+#     may capture less of the tail if SIGTERM arrives before the
+#     final snapshot tick, but 500 is unreachable from below
+#     without a genuine hot-path regression. Framed as a RECOVERY
+#     signal: post-release hot path runs; staging resumes; sent
+#     climbs.
 #
 # Attribution sanity probe (FUNCTIONAL, non-optional per handoff
 # anti-pattern alert):
@@ -182,10 +229,11 @@ _RELEASE_AFTER_PKTS = 600  # ~3 s into a 10 s stream, pre-mid window
                            # so the post-release observation has ≥5 s
                            # to let sent bumps stack up.
 
-# RED phase: threshold-impossible on both headline observables.
-# GREEN cycle flips these to measured-realistic values.
-_MIRROR_DROPPED_DELTA_THRESHOLD_RED = 10**9
-_MIRROR_SENT_AFTER_RELEASE_UPPER_BOUND_RED = 0  # strict-less-than 1
+# Measured-realistic lower bounds. See empirical numbers above.
+# Both are ~3x margin under observed dev-debug values to absorb
+# sanitiser cadence drift.
+_MIRROR_DROPPED_DELTA_LOWER_BOUND = 200
+_MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND = 500
 
 # Attribution-probe threshold: the RX path must sustain at least 80%
 # of the inject rate across the entire test. If RX rate drops below
@@ -575,29 +623,45 @@ def test_m16_c5_mirror_slow_consumer_then_release():
     """Clamp mirror tap txqueuelen=1 from boot; sustained inject; release
     mid-stream.
 
-    Expected behaviour (GREEN, post-measurement):
-      * During clamp: `pktgate_mirror_dropped_total{mirror}` climbs as
-        `rte_eth_tx_burst` short-bursts against the starved kernel queue.
-        `pktgate_mirror_sent_total{mirror}` climbs slowly (clones queue
-        one-at-a-time at the kernel boundary).
-      * After release: kernel drain speed returns to default.
-        `pktgate_mirror_sent_total` bumps resume at normal pace — the
-        drain path recovers without operator intervention on the pktgate
-        side.
-      * Originals continue flowing to egress — `tx_dropped_total{egress}`
-        stays near zero throughout (independent stage path; scenario
-        does not deplete mbuf pool, unlike mempool_exhaust).
-      * RX keeps ingesting at ~inject rate — attribution probe confirms
-        we measured mirror backpressure, not ingress starvation.
-      * pktgate process stays alive through the whole stream.
+    Expected behaviour (GREEN):
+      * During clamp: `pktgate_mirror_dropped_total{mirror}` climbs
+        each drain tick as `rte_eth_tx_burst` short-bursts against
+        the downed link. `pktgate_mirror_sent_total{mirror}` climbs
+        in lockstep — staging happens before drain, so every staged
+        clone increments both `sent` (at stage) AND `dropped` (at
+        drain-short). See stage_mirror/mirror_drain semantics in
+        src/dataplane/action_dispatch.h:135-145.
+      * After release: kernel consumer on the mirror tap resumes
+        draining; drain-short stops firing; `mirror_dropped` stops
+        climbing. Post-release inject continues staging clones —
+        `mirror_sent` continues to climb as the hot path runs. The
+        recovery signal is observed as delta-over-time: at least
+        `_MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND` new staged clones
+        get counted between release and final snapshot, proving the
+        MIRROR arm of apply_action did not wedge and the staging
+        path recovered.
+      * Originals continue flowing to egress — `tx_dropped_total
+        {egress}` stays at 0 throughout (independent stage_tx path;
+        scenario does not deplete mbuf pool, unlike mempool_exhaust).
+      * RX keeps ingesting at ≥80% of inject_count — attribution
+        probe confirms we measured mirror backpressure, not ingress
+        starvation.
+      * pktgate process stays alive through the whole stream and
+        exits cleanly.
 
-    RED phase (this commit): the headline assertions
-      * `mirror_dropped_delta_during_clamp > 10**9`          (impossible)
-      * `mirror_sent_delta_after_release < 1`                (impossible)
-    are threshold-impossible so the test is guaranteed to FAIL on any
-    real run. Functional invariants (attribution probe, tx stability,
-    pid alive, clone_failed == 0) stay as-is through RED and GREEN;
-    they guard the correctness of the chaos mechanism itself.
+    Semantic note on `mirror_sent` as the recovery signal:
+      stage_mirror bumps `mirror_sent_per_port[port]` on successful
+      ENQUEUE into mirror_tx[port], not on successful TX drain (see
+      src/dataplane/action_dispatch.h:135-145 "Sent counts
+      successful STAGING, not successful TX"). So the recovery
+      assertion measures "post-release hot path continued running":
+      every new packet whose clone reaches stage_mirror bumps
+      `mirror_sent`. Under a healthy recovery the remaining 1400
+      inject-count packets (2000 - _RELEASE_AFTER_PKTS=600) all
+      contribute; observed close to 1.0 coverage in stability runs.
+      If the MIRROR arm were wedged post-release (e.g. a hot-path
+      regression swallowed the dispatch), `mirror_sent` would stay
+      flat — this assertion would fail at the 500 floor.
     """
     config = _config()
 
@@ -831,7 +895,7 @@ def test_m16_c5_mirror_slow_consumer_then_release():
             "release logic broken."
         )
 
-        # --- Delta computations for threshold-impossible RED asserts ---
+        # --- Delta computations for headline recovery assertions ---
         # Clamp-window dropped delta: `at_release - base`. The clamp
         # was in effect from boot through the release point, so any
         # bump observed at release time is drain-short accumulation
@@ -849,17 +913,21 @@ def test_m16_c5_mirror_slow_consumer_then_release():
             final_mirror_sent - at_release_mirror_sent
         )
 
-        # --- Headline RED assertions (threshold-impossible) ---
-        # Clamp-window dropped must exceed 10**9: real run bumps by
-        # tens/hundreds. 10**9 in a ~2000-packet burst at 200 pps is
-        # arithmetically unreachable → FAIL on RED.
-        assert mirror_dropped_delta_during_clamp > \
-            _MIRROR_DROPPED_DELTA_THRESHOLD_RED, (
-            f"M16 C5 (RED phase, threshold-impossible): expected "
-            f"mirror_dropped delta during clamp > "
-            f"{_MIRROR_DROPPED_DELTA_THRESHOLD_RED} "
-            f"(will be flipped to a measured lower bound in GREEN). "
-            f"Got delta={mirror_dropped_delta_during_clamp} "
+        # --- Headline GREEN assertions (measured lower bounds) ---
+        # Clamp-window dropped MUST climb to at least the measured
+        # lower bound. Observed ~560-600 on dev-debug across 6 runs
+        # (3 RED + 3 GREEN stability); floor 200 gives ~3x sanitiser
+        # headroom. If this fires under 200, either the DOWN+txqlen=1
+        # mechanism stopped back-pressuring (kernel or tap behaviour
+        # change) or the mirror_drain counter bump regressed.
+        assert mirror_dropped_delta_during_clamp >= \
+            _MIRROR_DROPPED_DELTA_LOWER_BOUND, (
+            f"M16 C5: mirror_dropped delta during clamp "
+            f"{mirror_dropped_delta_during_clamp} "
+            f"< lower bound {_MIRROR_DROPPED_DELTA_LOWER_BOUND}. "
+            f"Either the DOWN-tap backpressure mechanism no longer "
+            f"causes drain-short (kernel/tap change), or the "
+            f"mirror_drain counter bump regressed. "
             f"(at_release={at_release_mirror_dropped} "
             f"base={base_mirror_dropped}). "
             f"elapsed_to_release={'<unknown>' if t_release_mono is None else f'{t_release_mono - t_start:.2f}s'} "
@@ -867,17 +935,21 @@ def test_m16_c5_mirror_slow_consumer_then_release():
             f"at_release_rx={at_release_rx}."
         )
 
-        # Post-release sent must be strictly < 1: real run bumps by
-        # at least some packets after release. < 1 is only satisfied
-        # at zero, which any working drain path beats → FAIL on RED.
-        assert mirror_sent_delta_after_release < (
-            _MIRROR_SENT_AFTER_RELEASE_UPPER_BOUND_RED + 1
-        ), (
-            f"M16 C5 (RED phase, threshold-impossible): expected "
-            f"mirror_sent delta after release < "
-            f"{_MIRROR_SENT_AFTER_RELEASE_UPPER_BOUND_RED + 1} "
-            f"(will be flipped to a measured lower bound in GREEN). "
-            f"Got delta={mirror_sent_delta_after_release} "
+        # Post-release sent MUST resume climbing — recovery signal.
+        # `mirror_sent` is bumped at STAGING time (stage_mirror, not
+        # mirror_drain), so this measures "apply_action MIRROR arm
+        # continued to run after release". Observed ~1370-1390 across
+        # 3 GREEN stability runs (out of ~1400 post-release inject);
+        # floor 500 gives ~3x sanitiser margin. A wedged hot path
+        # would leave this flat → assertion fires loudly.
+        assert mirror_sent_delta_after_release >= \
+            _MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND, (
+            f"M16 C5: mirror_sent delta after release "
+            f"{mirror_sent_delta_after_release} "
+            f"< lower bound {_MIRROR_SENT_AFTER_RELEASE_LOWER_BOUND}. "
+            f"Staging path did not recover — MIRROR arm of "
+            f"apply_action may be wedged post-release, or the "
+            f"stage_mirror `sent++` bump regressed. "
             f"(final={final_mirror_sent} "
             f"at_release={at_release_mirror_sent}). "
             f"elapsed_post_release={'<unknown>' if t_release_mono is None else f'{t_end - t_release_mono:.2f}s'} "
