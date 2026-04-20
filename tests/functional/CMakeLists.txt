@@ -232,6 +232,25 @@ set_tests_properties(functional.test_f16_mirror_tap PROPERTIES
   TIMEOUT 180
 )
 
+# M16 C3.5 RED — F16.4_nonlex. Same three-tap shape as F16.2 but role
+# names are chosen so lex rank (== role_idx) diverges from DPDK --vdev
+# cmdline rank (== port_id) for every role, including the mirror
+# target. Surfaces the pre-existing M7 regression
+# (grabli_role_idx_as_port_id_bug.md): `RuleAction.{redirect,mirror}_port`
+# carry compiler role_idx but the hot path passes that value to
+# rte_eth_tx_burst which expects a DPDK port_id. RED on current tree
+# (clones land on the wrong tap); GREEN after M16 C3.5 adds the
+# translation step in populate_ruleset_eal. Same timeout as F16.2.
+add_test(
+  NAME functional.test_f16_mirror_tap_nonlex
+  COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_f16_mirror_tap_nonlex.py"
+)
+set_tests_properties(functional.test_f16_mirror_tap_nonlex PROPERTIES
+  LABELS "functional"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 180
+)
+
 # M15 C1 — F15.1 vhost boot smoke. net_null upstream + net_vhost
 # downstream (server mode); asserts pktgate reaches ready without a
 # peer, emits a port_resolved event naming the vhost port id, and

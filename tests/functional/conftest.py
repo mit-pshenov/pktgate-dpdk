@@ -141,6 +141,12 @@ _TAP_IFACES_TO_UNMANAGE = [
     # names from the C4/C5 chaos cycle fixtures so M16 tests run in
     # any order in a shared session.
     "dtap_m16_ing", "dtap_m16_egress", "dtap_m16_mirror",
+    # M16 C3.5 — functional.test_f16_mirror_tap_nonlex. Same three-tap
+    # shape as C3 but with dtap names distinct so session fixtures
+    # don't collide; role names are lex-chosen so role_idx != port_id
+    # for every role (RED test for the populate_ruleset_eal translation
+    # step). All names 14 chars (IFNAMSIZ budget).
+    "dtap_m16nl_ing", "dtap_m16nl_egr", "dtap_m16nl_mir",
 ]
 
 

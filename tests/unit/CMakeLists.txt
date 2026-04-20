@@ -100,6 +100,24 @@ pktgate_add_test(
   LABELS  "unit;needs-eal"
   LINK    pktgate_dp
 )
+# M16 C3.5 RED — U16.12 + U16.13. role_idx → port_id translation
+# invariant for populate_ruleset_eal. Separate binary with a unique
+# --file-prefix=pktgate_role_port_xlate so /run/dpdk/<prefix>/ does
+# not collide with test_eal_unit or test_d41_eal_smoke. Drives the
+# full parse → compile → build_ruleset → populate_ruleset_eal
+# pipeline with interface_roles declared in non-lex order so that
+# role_idx ≠ DPDK port_id for every role by construction. Asserts
+# rs.l4_actions[*].redirect_port / .mirror_port carry DPDK port_id
+# after populate. RED on current tree (populate_ruleset_eal does
+# not translate the port field). Links pktgate_dp (which pulls in
+# pktgate_rl_ctl transitively for the real RlSlotAllocator wiring).
+pktgate_add_test(
+  NAME    unit.test_role_idx_port_id_translation
+  SOURCES test_role_idx_port_id_translation.cpp
+  LABELS  "unit;needs-eal"
+  LINK    pktgate_dp
+)
+
 # M8 C1: flip U6.43b — g_active now lives in the reload manager
 # (src/ctl/reload.{h,cpp}), not in main.cpp. Defined as a compile-time
 # flag so the test body at tests/unit/test_eal_unit.cpp U6.43b can
