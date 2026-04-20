@@ -146,12 +146,22 @@ _TEST_DST = "11:22:33:44:55:16"
 
 _INJECT_COUNT = 50
 
-# RED sentinel thresholds — impossible to hit with _INJECT_COUNT packets.
-# GREEN flips _SENT_THRESHOLD_RED -> _INJECT_COUNT (exact match).
-_SENT_THRESHOLD_RED = 1000
-# RED sentinel phantom diagnostic string — never appears in real output.
-# GREEN flips to the literal validator diagnostic marker `validate_err`.
+# RED sentinels, preserved as named constants so the RED->GREEN diff is
+# a single-value flip and the historical threshold is legible from the
+# test source (same pattern as M15 C3 _RX_THRESHOLD_RED kept alongside
+# _RX_THRESHOLD_REAL in tests/integration/test_m15_vhost_pair.py).
+_SENT_THRESHOLD_RED = 1000  # pre-C3-GREEN impossible sentinel; see commit
 _REJECT_DIAGNOSTIC_RED = "M16C3_RED_IMPOSSIBLE_STRING_SENTINEL"
+
+# GREEN: exact-match threshold on successful clone staging. 50 out of
+# 50 because the mirror destination tap is idle (no back-pressure) and
+# stage_mirror's kMirrorBurstMax=32 is drained per RX burst, so no
+# buffer-full drops accumulate.
+_SENT_THRESHOLD_REAL = _INJECT_COUNT
+# GREEN: main.cpp's structured validation failure marker
+# (src/main.cpp:321 log_json "validate_err" string). Full line also
+# contains the validator message text which names the offending role.
+_REJECT_DIAGNOSTIC_REAL = "validate_err"
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +697,15 @@ def test_f16_2_mirror_tap_happy_path():
         f"{h.mirror_port_id}\"}} not present in /metrics."
     )
 
-    # RED: the threshold is impossible (_INJECT_COUNT==50 < 1000).
-    # GREEN flips _SENT_THRESHOLD_RED to _INJECT_COUNT and tightens
-    # this to `sent == _INJECT_COUNT` exactly.
-    assert sent == _SENT_THRESHOLD_RED, (
+    # GREEN: exact match. kMirrorBurstMax (32) + one drain per RX
+    # burst handles the 50-packet flow without stage-full drops; the
+    # idle mirror tap accepts all staged clones without short-burst
+    # unsent. If either channel ever produces a loss the clone_failed
+    # / dropped asserts below catch it precisely rather than this
+    # sent counter drifting below _INJECT_COUNT.
+    assert sent == _SENT_THRESHOLD_REAL, (
         f"F16.2: pktgate_mirror_sent_total{{port=\"{h.mirror_port_id}\"}}"
-        f" = {sent}, expected {_SENT_THRESHOLD_RED}. "
+        f" = {sent}, expected {_SENT_THRESHOLD_REAL} (exact). "
         f"mirror_port_id={h.mirror_port_id} "
         f"egress_port_id={h.egress_port_id} "
         f"inject_count={_INJECT_COUNT}. "
@@ -775,11 +788,16 @@ def test_f16_3_mirror_unregistered_port_rejects():
             f"stdout={stdout!r}"
         )
 
-        # RED: phantom substring is impossible to match in real output.
-        # GREEN flips to `validate_err` (the actual marker).
-        assert _REJECT_DIAGNOSTIC_RED in stdout, (
+        # GREEN: the structured validator marker is the real one.
+        # src/main.cpp:321 emits
+        #   `{"error":"validate_err","message":"<validator text>"}`
+        # on any ValidateError path; this is what F14.3 also checks
+        # (tests/functional/test_f14_main_resolver.py:277-282). The
+        # `validate_err` substring proves it's the validator tier,
+        # NOT a parse error or a runtime resolver error.
+        assert _REJECT_DIAGNOSTIC_REAL in stdout, (
             f"F16.3: expected diagnostic marker "
-            f"{_REJECT_DIAGNOSTIC_RED!r} in stdout; got "
+            f"{_REJECT_DIAGNOSTIC_REAL!r} in stdout; got "
             f"stdout={stdout!r}"
         )
         # Always assert that the offending role name surfaces — operator
