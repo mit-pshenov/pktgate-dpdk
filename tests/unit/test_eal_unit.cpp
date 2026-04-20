@@ -9653,4 +9653,460 @@ TEST(U6_43b_GActiveOwnership, OwnedByReloadManagerNotMain_PendingC1) {
 }
 #endif  // M8_C1_DONE
 
+// =========================================================================
+// M16 C2 — D7 mirror hot-path dispatch + counter triplet
+// (U16.6 … U16.9 + F16.1).
+//
+// The REDIRECT pattern (U6.52–U6.55) is the direct template: stage into a
+// per-port buffer on WorkerCtx, drain at burst end via a dedicated
+// helper, free unsent + bump the appropriate counter. Mirror differs
+// in that the ORIGINAL packet is forwarded via tx_one(ctx, tx_port_id,
+// m) and a CLONE (rte_pktmbuf_copy) is staged to action->mirror_port.
+// If rte_pktmbuf_copy returns null (mempool exhausted) the original
+// still forwards and only `mirror_clone_failed_per_port[mirror_port]`
+// bumps. On successful stage `mirror_sent_per_port` bumps; on drain
+// short-burst the unsent clones are freed and
+// `mirror_dropped_per_port[mirror_port]` is bumped by the unsent delta.
+//
+// The spy pattern mirrors TxRedirectSpy — a second global pointer
+// keeps the two test files independent, and per-port return-sent
+// injection lets U16.7 force a short-burst without any PMD.
+// =========================================================================
+
+namespace mirror_test_helpers {
+
+struct TxMirrorCall {
+  std::uint16_t port_id;
+  std::uint16_t queue_id;
+  std::uint16_t nb_pkts;
+  std::uint16_t returned_sent;
+};
+
+struct TxMirrorSpy {
+  std::vector<TxMirrorCall> calls;
+  std::vector<rte_mbuf*>    seen_mbufs;
+  // port_id -> sent count; missing entry = "send all" (return nb_pkts).
+  std::map<std::uint16_t, std::uint16_t> per_port_return_sent;
+};
+
+inline TxMirrorSpy* g_mirror_spy = nullptr;
+
+inline std::uint16_t spy_tx_burst_mirror(std::uint16_t port_id,
+                                         std::uint16_t queue_id,
+                                         rte_mbuf** tx_pkts,
+                                         std::uint16_t nb_pkts) {
+  if (g_mirror_spy == nullptr || tx_pkts == nullptr || nb_pkts == 0) {
+    return 0;
+  }
+  std::uint16_t sent = nb_pkts;
+  auto it = g_mirror_spy->per_port_return_sent.find(port_id);
+  if (it != g_mirror_spy->per_port_return_sent.end()) {
+    sent = it->second;
+  }
+  g_mirror_spy->calls.push_back(
+      TxMirrorCall{port_id, queue_id, nb_pkts, sent});
+  for (std::uint16_t i = 0; i < nb_pkts; ++i) {
+    g_mirror_spy->seen_mbufs.push_back(tx_pkts[i]);
+  }
+  return sent;
+}
+
+// Build a mirror RuleAction targeting `mirror_port`. Egress is
+// ctx->tx_port_id — the dispatch arm forwards the original there and
+// stages the clone on mirror_port.
+inline action::RuleAction make_mirror_action(std::uint16_t mirror_port) {
+  action::RuleAction a{};
+  a.verb        = static_cast<std::uint8_t>(compiler::ActionVerb::kMirror);
+  a.mirror_port = mirror_port;
+  return a;
+}
+
+}  // namespace mirror_test_helpers
+
+class MirrorDispatchTest : public EalFixture {};
+
+// -------------------------------------------------------------------------
+// U16.6 — apply_action(kMirror) stages a clone into mirror_tx[port].
+//
+// The ORIGINAL mbuf forwards via tx_one() on ctx.tx_port_id; a CLONE
+// (rte_pktmbuf_copy) lands at mirror_tx[mirror_port].pkts[0] with
+// count == 1. Spy sees exactly one call — for tx_port_id, carrying the
+// original mbuf; mirror_port has NOT yet been drained (staging only).
+// -------------------------------------------------------------------------
+TEST_F(MirrorDispatchTest, U16_6_StageMirrorBuffersClone) {
+  using namespace mirror_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u16_6_pool", 127, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  // Give the packet a minimal payload so rte_pktmbuf_copy has
+  // something non-degenerate to copy.
+  const std::uint16_t kPayload = 64;
+  auto* data = rte_pktmbuf_append(m, kPayload);
+  ASSERT_NE(data, nullptr);
+  std::memset(data, 0xAA, kPayload);
+
+  TxMirrorSpy spy;
+  g_mirror_spy = &spy;
+
+  constexpr std::uint16_t kEgress = 0;
+  constexpr std::uint16_t kMirror = 3;
+  auto mirror_a = make_mirror_action(kMirror);
+
+  ruleset::Ruleset rs{};
+
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = kEgress;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_mirror;
+
+  dataplane::apply_action(&ctx, rs, m,
+                          dataplane::Disposition::kMatch, &mirror_a);
+
+  // Original forwarded to egress (spy sees 1 call carrying m).
+  ASSERT_EQ(spy.calls.size(), 1u)
+      << "U16.6: original packet must forward via tx_one(egress)";
+  EXPECT_EQ(spy.calls[0].port_id, kEgress);
+  EXPECT_EQ(spy.calls[0].nb_pkts, 1u);
+  ASSERT_EQ(spy.seen_mbufs.size(), 1u);
+  EXPECT_EQ(spy.seen_mbufs[0], m);
+
+  // Clone staged to mirror_tx[mirror_port] — NOT yet transmitted.
+  EXPECT_EQ(ctx.mirror_tx[kMirror].count, 1u)
+      << "U16.6: stage_mirror must bump mirror_tx[port].count to 1";
+  EXPECT_NE(ctx.mirror_tx[kMirror].pkts[0], nullptr)
+      << "U16.6: mirror_tx[port].pkts[0] must hold the clone";
+  EXPECT_NE(ctx.mirror_tx[kMirror].pkts[0], m)
+      << "U16.6: staged pointer must be the CLONE, not the original";
+
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+  EXPECT_EQ(ctx.mirror_clone_failed_per_port[kMirror], 0u);
+  // mirror_sent_per_port[kMirror] must bump on successful stage (U16.9
+  // asserts this contract; U16.6 is tolerant of either "bump at stage"
+  // or "bump after drain" — the GREEN path bumps at stage because the
+  // staging slot is what the spec calls `sent`).
+  EXPECT_EQ(ctx.mirror_sent_per_port[kMirror], 1u)
+      << "U16.6/U16.9: successful stage must bump mirror_sent";
+
+  // Drain for cleanup — spy "sends" the clone; free staged pointer.
+  dataplane::mirror_drain(&ctx);
+  for (std::uint16_t i = 0; i + 1 < spy.seen_mbufs.size(); ++i) {
+    // pkts[0..n-1] in spy.seen_mbufs past index 0 are the clones; the
+    // spy holds but does not own. Drain already removed them from
+    // mirror_tx; free them here.
+    rte_pktmbuf_free(spy.seen_mbufs[i + 1]);
+  }
+  rte_pktmbuf_free(m);  // original (spy holds ref, we own)
+  g_mirror_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U16.7 — mirror_drain short-burst frees unsent clones, bumps
+// mirror_dropped_per_port.
+//
+// Stage 3 clones to mirror port 3; spy returns sent=2 on port 3 during
+// drain. Result: mempool-in_use drops by 1 (one clone freed), buffer
+// reset to 0, mirror_dropped_per_port[kMirror] == 1.
+// -------------------------------------------------------------------------
+TEST_F(MirrorDispatchTest, U16_7_DrainPartialFreesUnsent) {
+  using namespace mirror_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u16_7_pool", 127, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+  const unsigned in_use_before = rte_mempool_in_use_count(mp);
+
+  constexpr std::uint16_t kEgress = 0;
+  constexpr std::uint16_t kMirror = 3;
+  constexpr std::uint16_t kN      = 3;
+
+  rte_mbuf* pkts[kN]{};
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    pkts[i] = rte_pktmbuf_alloc(mp);
+    ASSERT_NE(pkts[i], nullptr);
+    auto* d = rte_pktmbuf_append(pkts[i], 64);
+    ASSERT_NE(d, nullptr);
+    std::memset(d, 0x55, 64);
+  }
+
+  TxMirrorSpy spy;
+  // Egress accepts everything; mirror accepts only 2 of 3.
+  spy.per_port_return_sent[kMirror] = 2;
+  g_mirror_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = kEgress;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_mirror;
+
+  auto mirror_a = make_mirror_action(kMirror);
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    dataplane::apply_action(&ctx, rs, pkts[i],
+                            dataplane::Disposition::kMatch, &mirror_a);
+  }
+
+  EXPECT_EQ(ctx.mirror_tx[kMirror].count, kN)
+      << "U16.7: 3 clones must be staged";
+  // 3 originals forwarded via spy (egress) + 3 clones allocated from
+  // pool but not yet drained. in_use_before + 3 (originals) + 3 (clones).
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before + 2u * kN);
+
+  dataplane::mirror_drain(&ctx);
+
+  // Mirror port call recorded.
+  const TxMirrorCall* mirror_call = nullptr;
+  for (const auto& c : spy.calls) {
+    if (c.port_id == kMirror) mirror_call = &c;
+  }
+  ASSERT_NE(mirror_call, nullptr);
+  EXPECT_EQ(mirror_call->nb_pkts, kN);
+  EXPECT_EQ(mirror_call->returned_sent, 2u);
+  EXPECT_EQ(mirror_call->queue_id, ctx.queue_id)
+      << "U16.7 (D28): TX-queue symmetry — mirror_drain uses ctx->queue_id";
+
+  EXPECT_EQ(ctx.mirror_tx[kMirror].count, 0u);
+  EXPECT_EQ(ctx.mirror_dropped_per_port[kMirror], 1u)
+      << "U16.7: short-burst must bump mirror_dropped_per_port by (n - sent)";
+  EXPECT_EQ(ctx.mirror_clone_failed_per_port[kMirror], 0u);
+
+  // The 1 unsent clone was freed by mirror_drain; 2 "sent" clones
+  // remain alive (spy retains pointers). 3 originals forwarded to
+  // egress, spy retains them too. Net in_use: before + 3 (originals)
+  // + 2 (sent clones) = before + 5.
+  EXPECT_EQ(rte_mempool_in_use_count(mp), in_use_before + 2u * kN - 1u)
+      << "U16.7: exactly 1 unsent clone must be freed";
+
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    rte_pktmbuf_free(pkts[i]);  // originals
+  }
+  // The 2 "sent" clones remain — free via spy.seen_mbufs excluding
+  // originals. Simplest: drop the pool, rely on mempool teardown.
+  g_mirror_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U16.8 — rte_pktmbuf_copy returns null (mempool exhausted)
+// → mirror_clone_failed_per_port[mirror_port] bumps; ORIGINAL still
+// forwards.
+//
+// Allocate every mbuf in a tiny (size=1) mempool so the dispatch
+// arm's rte_pktmbuf_copy call has no mbuf available. The original
+// must still forward to egress; no clone staged; no dropped bump.
+// -------------------------------------------------------------------------
+TEST_F(MirrorDispatchTest, U16_8_MirrorCloneFailed) {
+  using namespace mirror_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  // Size = 1 so the single allocation below exhausts the pool; the
+  // dispatch arm's copy call will then fail with null.
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u16_8_pool", 1, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  auto* m = rte_pktmbuf_alloc(mp);
+  ASSERT_NE(m, nullptr);
+  auto* d = rte_pktmbuf_append(m, 64);
+  ASSERT_NE(d, nullptr);
+
+  // Confirm pool is empty now.
+  EXPECT_EQ(rte_mempool_in_use_count(mp), 1u);
+  EXPECT_EQ(rte_mempool_avail_count(mp), 0u);
+
+  TxMirrorSpy spy;
+  g_mirror_spy = &spy;
+
+  constexpr std::uint16_t kEgress = 0;
+  constexpr std::uint16_t kMirror = 3;
+  auto mirror_a = make_mirror_action(kMirror);
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = kEgress;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_mirror;
+
+  dataplane::apply_action(&ctx, rs, m,
+                          dataplane::Disposition::kMatch, &mirror_a);
+
+  // Original still forwarded to egress.
+  ASSERT_EQ(spy.calls.size(), 1u)
+      << "U16.8: clone failure must not block original forwarding";
+  EXPECT_EQ(spy.calls[0].port_id, kEgress);
+
+  // No clone staged.
+  EXPECT_EQ(ctx.mirror_tx[kMirror].count, 0u)
+      << "U16.8: clone-null path must NOT stage anything";
+
+  // Counter triplet: clone_failed + 1, sent + 0, dropped + 0.
+  EXPECT_EQ(ctx.mirror_clone_failed_per_port[kMirror], 1u)
+      << "U16.8: rte_pktmbuf_copy == null must bump mirror_clone_failed";
+  EXPECT_EQ(ctx.mirror_sent_per_port[kMirror], 0u);
+  EXPECT_EQ(ctx.mirror_dropped_per_port[kMirror], 0u);
+
+  rte_pktmbuf_free(m);
+  g_mirror_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// U16.9 — full-success drain bumps mirror_sent_per_port, no drops.
+//
+// Stage 2 clones to mirror port 3; spy accepts both. After drain:
+// mirror_sent_per_port[kMirror] == 2, mirror_dropped_per_port[kMirror]
+// == 0, mirror_clone_failed_per_port[kMirror] == 0. Contract: sent
+// bumps at stage time (one per successful enqueue), dropped bumps only
+// at drain short-burst time.
+// -------------------------------------------------------------------------
+TEST_F(MirrorDispatchTest, U16_9_MirrorSentBumpsOnFullSuccess) {
+  using namespace mirror_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "u16_9_pool", 127, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  constexpr std::uint16_t kEgress = 0;
+  constexpr std::uint16_t kMirror = 3;
+  constexpr std::uint16_t kN      = 2;
+
+  rte_mbuf* pkts[kN]{};
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    pkts[i] = rte_pktmbuf_alloc(mp);
+    ASSERT_NE(pkts[i], nullptr);
+    auto* d = rte_pktmbuf_append(pkts[i], 64);
+    ASSERT_NE(d, nullptr);
+  }
+
+  TxMirrorSpy spy;
+  g_mirror_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = kEgress;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_mirror;
+
+  auto mirror_a = make_mirror_action(kMirror);
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    dataplane::apply_action(&ctx, rs, pkts[i],
+                            dataplane::Disposition::kMatch, &mirror_a);
+  }
+  EXPECT_EQ(ctx.mirror_sent_per_port[kMirror], kN)
+      << "U16.9: sent bumps at stage time (one per successful enqueue)";
+
+  dataplane::mirror_drain(&ctx);
+
+  EXPECT_EQ(ctx.mirror_tx[kMirror].count, 0u);
+  EXPECT_EQ(ctx.mirror_sent_per_port[kMirror], kN)
+      << "U16.9: sent must not over-bump after a successful drain";
+  EXPECT_EQ(ctx.mirror_dropped_per_port[kMirror], 0u);
+  EXPECT_EQ(ctx.mirror_clone_failed_per_port[kMirror], 0u);
+
+  for (std::uint16_t i = 0; i < kN; ++i) {
+    rte_pktmbuf_free(pkts[i]);
+  }
+  g_mirror_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
+// -------------------------------------------------------------------------
+// F16.1 — one-burst functional integration: multiple mirror rules hit
+// in the same burst; original forwards + clone stages for each.
+//
+// Two mirror actions targeting DIFFERENT mirror ports (kM1, kM2).
+// Dispatch 4 packets: 2 to kM1, 2 to kM2. Each original must forward
+// to egress; each clone must end up in the correct mirror_tx bucket.
+// After drain every counter should match the staged counts exactly.
+// -------------------------------------------------------------------------
+TEST_F(MirrorDispatchTest, F16_1_OneBurstTwoMirrorPorts) {
+  using namespace mirror_test_helpers;
+  int off = eal::register_dynfield();
+  ASSERT_GE(off, 0);
+
+  struct rte_mempool* mp = rte_pktmbuf_pool_create(
+      "f16_1_pool", 255, 0, 0, RTE_MBUF_DEFAULT_BUF_SIZE, 0);
+  ASSERT_NE(mp, nullptr);
+
+  constexpr std::uint16_t kEgress = 0;
+  constexpr std::uint16_t kM1     = 3;
+  constexpr std::uint16_t kM2     = 7;
+
+  auto mk_pkt = [&]() -> rte_mbuf* {
+    auto* p = rte_pktmbuf_alloc(mp);
+    EXPECT_NE(p, nullptr);
+    auto* d = rte_pktmbuf_append(p, 64);
+    EXPECT_NE(d, nullptr);
+    return p;
+  };
+
+  rte_mbuf* a0 = mk_pkt();
+  rte_mbuf* a1 = mk_pkt();
+  rte_mbuf* b0 = mk_pkt();
+  rte_mbuf* b1 = mk_pkt();
+
+  TxMirrorSpy spy;
+  g_mirror_spy = &spy;
+
+  ruleset::Ruleset rs{};
+  dataplane::WorkerCtx ctx{};
+  ctx.tx_port_id  = kEgress;
+  ctx.queue_id    = 0;
+  ctx.tx_burst_fn = &spy_tx_burst_mirror;
+
+  auto a = make_mirror_action(kM1);
+  auto b = make_mirror_action(kM2);
+  dataplane::apply_action(&ctx, rs, a0, dataplane::Disposition::kMatch, &a);
+  dataplane::apply_action(&ctx, rs, a1, dataplane::Disposition::kMatch, &a);
+  dataplane::apply_action(&ctx, rs, b0, dataplane::Disposition::kMatch, &b);
+  dataplane::apply_action(&ctx, rs, b1, dataplane::Disposition::kMatch, &b);
+
+  EXPECT_EQ(ctx.mirror_tx[kM1].count, 2u);
+  EXPECT_EQ(ctx.mirror_tx[kM2].count, 2u);
+  // Originals already forwarded (4 calls on kEgress, one per apply).
+  std::uint16_t egress_calls = 0;
+  for (const auto& c : spy.calls) {
+    if (c.port_id == kEgress) ++egress_calls;
+  }
+  EXPECT_EQ(egress_calls, 4u)
+      << "F16.1: each original must forward via tx_one(egress) at dispatch";
+
+  dataplane::mirror_drain(&ctx);
+
+  // One drain call per non-empty mirror port.
+  std::uint16_t m1_calls = 0, m2_calls = 0;
+  for (const auto& c : spy.calls) {
+    if (c.port_id == kM1) ++m1_calls;
+    if (c.port_id == kM2) ++m2_calls;
+  }
+  EXPECT_EQ(m1_calls, 1u);
+  EXPECT_EQ(m2_calls, 1u);
+
+  EXPECT_EQ(ctx.mirror_sent_per_port[kM1], 2u);
+  EXPECT_EQ(ctx.mirror_sent_per_port[kM2], 2u);
+  EXPECT_EQ(ctx.mirror_dropped_per_port[kM1], 0u);
+  EXPECT_EQ(ctx.mirror_dropped_per_port[kM2], 0u);
+  EXPECT_EQ(ctx.mirror_clone_failed_per_port[kM1], 0u);
+  EXPECT_EQ(ctx.mirror_clone_failed_per_port[kM2], 0u);
+  EXPECT_EQ(ctx.dispatch_unreachable_total, 0u);
+
+  rte_pktmbuf_free(a0);
+  rte_pktmbuf_free(a1);
+  rte_pktmbuf_free(b0);
+  rte_pktmbuf_free(b1);
+  g_mirror_spy = nullptr;
+  rte_mempool_free(mp);
+}
+
 }  // namespace pktgate::test

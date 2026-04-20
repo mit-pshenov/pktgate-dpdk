@@ -109,9 +109,11 @@ using ::pktgate::telemetry::Snapshot;
 // the static source of truth and this list is the runtime mirror. If
 // §10.3 changes, BOTH must be updated in lockstep (D33 invariant).
 //
-// 39 entries as of 2026-04-19 (M14 C3 added pktgate_tx_dropped_total{port}
-// + pktgate_tx_burst_short_total{port} — D43 per-port backpressure
-// signals emitted by pktgate's own tx_one() / redirect_drain() wrappers).
+// 41 entries as of 2026-04-20 (M16 C2 added pktgate_mirror_sent_total
+// + pktgate_mirror_clone_failed_total to the existing
+// pktgate_mirror_dropped_total placeholder — D7 unlock counter
+// triplet now lives as a real per-port family emitted by pktgate's
+// own stage_mirror / mirror_drain helpers).
 // =========================================================================
 const std::vector<std::string>& canonical_manifest() {
   static const std::vector<std::string> names = {
@@ -151,6 +153,12 @@ const std::vector<std::string>& canonical_manifest() {
 
       // Dispatch / mirror / redirect (label: lcore, port)
       "pktgate_redirect_dropped_total",
+      // M16 C2 — D7 unlock counter triplet emitted by stage_mirror +
+      // mirror_drain. sent = clone enqueued; clone_failed =
+      // rte_pktmbuf_copy returned null (mempool exhausted);
+      // dropped = clone queued but rte_eth_tx_burst short at drain.
+      "pktgate_mirror_sent_total",
+      "pktgate_mirror_clone_failed_total",
       "pktgate_mirror_dropped_total",
 
       // Reload / control plane (label: result, layer)
@@ -243,10 +251,12 @@ const std::set<std::string>& justified_zero() {
       "pktgate_lcore_idle_iters_total",
       "pktgate_lcore_cycles_per_burst",
 
-      // D7 Mirror verb drop counter — compiler rejects MIRROR rules in
-      // MVP (D26 MUTATING_VERBS gate), so no runtime producer exists.
-      // Deferred to v2 per D7 prose.
-      "pktgate_mirror_dropped_total",
+      // M16 C2 landing (2026-04-20) removes pktgate_mirror_dropped_total
+      // from the justified-zero list: D7 unlock wired a real producer
+      // via stage_mirror + mirror_drain, and the adversarial snapshot
+      // below bumps the counter non-zero via the per-port array. Sibling
+      // names pktgate_mirror_{sent,clone_failed}_total ship wired from
+      // the same commit; none belong on the exempt list.
   };
   return names;
 }
@@ -301,6 +311,14 @@ struct AdvCountersStorage {
   // snapshot aggregator; Snapshot exposes a sum vector of length 2.
   std::array<std::uint64_t, 2> tx_dropped_per_port{2u, 0u};
   std::array<std::uint64_t, 2> tx_burst_short_per_port{0u, 1u};
+
+  // M16 C2 — D7 mirror counter triplet. Per-port arrays mirroring
+  // (literally) the tx_dropped/tx_burst_short pattern: one entry per
+  // ethdev port index. Adversarial bumps so all three §10.3 names
+  // round-trip non-zero through the aggregator.
+  std::array<std::uint64_t, 2> mirror_sent_per_port{5u, 0u};
+  std::array<std::uint64_t, 2> mirror_clone_failed_per_port{0u, 2u};
+  std::array<std::uint64_t, 2> mirror_dropped_per_port{1u, 0u};
 };
 
 Snapshot build_adversarial_snapshot() {
@@ -358,6 +376,16 @@ Snapshot build_adversarial_snapshot() {
   view.tx_burst_short_per_port       = s.tx_burst_short_per_port.data();
   view.tx_burst_short_per_port_count =
       static_cast<std::uint32_t>(s.tx_burst_short_per_port.size());
+  // M16 C2 — D7 mirror per-port arrays.
+  view.mirror_sent_per_port       = s.mirror_sent_per_port.data();
+  view.mirror_sent_per_port_count =
+      static_cast<std::uint32_t>(s.mirror_sent_per_port.size());
+  view.mirror_clone_failed_per_port       = s.mirror_clone_failed_per_port.data();
+  view.mirror_clone_failed_per_port_count =
+      static_cast<std::uint32_t>(s.mirror_clone_failed_per_port.size());
+  view.mirror_dropped_per_port       = s.mirror_dropped_per_port.data();
+  view.mirror_dropped_per_port_count =
+      static_cast<std::uint32_t>(s.mirror_dropped_per_port.size());
   view.counter_row                       = s.lcore0_row.data();
   view.n_slots = static_cast<std::uint32_t>(s.lcore0_row.size());
 
@@ -435,9 +463,9 @@ TEST(C7_27_CounterInvariant, EveryCanonicalNameHasProducerOrIsJustifiedZero) {
   // consistency.sh Pass 1 output. If this firecheck fails, the manifest
   // and §10.3 have drifted — not the C7.27 concern; re-sync the two
   // first.
-  ASSERT_EQ(canon.size(), 39u)
-      << "manifest size drift vs §10.3 Pass 1 count (39 as of 2026-04-19 "
-         "post-M14 C3). "
+  ASSERT_EQ(canon.size(), 41u)
+      << "manifest size drift vs §10.3 Pass 1 count (41 as of 2026-04-20 "
+         "post-M16 C2). "
          "Either §10.3 grew a new metric or the manifest shrank. Fix "
          "both this TU and check-counter-consistency.sh in lockstep "
          "(D33). Expected justified-zero additions belong in `jz`, not "
