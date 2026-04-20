@@ -92,6 +92,14 @@ struct ActionLowered {
   std::uint8_t dscp{0};
   std::uint8_t pcp{0};
   std::uint16_t redirect_port{0xFFFF};
+  // M16 C1 (D7 unlock, D41 #7): mirror destination role_idx.
+  // Filled for kMirror via the same resolve_role_idx path redirect_port
+  // uses — the mirror destination resolves against interface_roles and
+  // the numeric port_id is lowered into CompiledAction.mirror_port
+  // and, in turn, action::RuleAction.mirror_port by
+  // builder::copy_actions. Sentinel 0xFFFF matches the struct default
+  // when no mirror role is named (non-kMirror verbs keep it).
+  std::uint16_t mirror_port{0xFFFF};
   // M9 C3 (D10, D24, D41): rate-limit payload. Filled for kRateLimit
   // by resolve_action; the builder copies these through to
   // Ruleset::rl_actions[] + RuleAction.rl_index. Default values match
@@ -150,7 +158,17 @@ static ActionLowered resolve_action(
           out.redirect_port = resolve_role_idx(roles, a.role_name);
         } else if constexpr (std::is_same_v<T, config::ActionMirror>) {
           out.verb = ActionVerb::kMirror;
-          // Mirror is compile-error-rejected below; no payload lowered.
+          // M16 C1 (D7 unlock): resolve mirror destination through the
+          // same interface_roles path redirect_port uses. The validator
+          // (src/config/validator.cpp check_action_target_port) has
+          // already rejected unresolved role_names before compile runs,
+          // so the lookup below always returns a real port_id for any
+          // config that reaches here. If a future refactor skips
+          // validation, the 0xFFFF sentinel fallback preserves the
+          // hot-path invariant that verb == kMirror implies a resolved
+          // mirror_port — the dispatch arm (M16 C2) rejects the
+          // sentinel defensively.
+          out.mirror_port = resolve_role_idx(roles, a.role_name);
         } else {
           static_assert(always_false_v<T>,
                         "D41 C1b guard: unhandled config::RuleAction "
@@ -214,6 +232,12 @@ CompileResult compile(const config::Config& cfg,
             action.dscp = lowered.dscp;
             action.pcp = lowered.pcp;
             action.redirect_port = lowered.redirect_port;
+            // M16 C1 (D7 unlock, D41 #7): mirror_port travels alongside
+            // redirect_port through the compiler -> builder pipeline.
+            // Non-kMirror verbs keep the 0xFFFF sentinel from the
+            // ActionLowered default so only kMirror CompiledActions
+            // carry a meaningful port_id.
+            action.mirror_port = lowered.mirror_port;
 
             // M9 C3 (D10, D24, D41): for kRateLimit verbs, obtain a
             // slot via the caller-provided allocator. The allocator
@@ -297,22 +321,18 @@ CompileResult compile(const config::Config& cfg,
   // Ruleset.default_action — see errata §M7 C2b.
   result.default_action = static_cast<std::uint8_t>(cfg.default_behavior);
 
-  // D7: reject mirror action in MVP. Scan all layers for kMirror.
-  auto check_mirror = [](const std::vector<CompiledAction>& actions)
-      -> bool {
-    for (const auto& a : actions) {
-      if (a.verb == ActionVerb::kMirror) return true;
-    }
-    return false;
-  };
-
-  if (check_mirror(result.l2_actions) ||
-      check_mirror(result.l3_actions) ||
-      check_mirror(result.l4_actions)) {
-    result.error = CompileError{
-        CompileErrorCode::kMirrorNotImplemented,
-        "mirror action not implemented in this build"};
-  }
+  // M16 C1 (D7 unlock, review-notes §D7 amendment 2026-04-20):
+  // the previous scan-for-kMirror reject block is removed. Mirror is
+  // now a lowered verb carried through compile -> build -> RuleAction
+  // via the ActionLowered / CompiledAction / action::RuleAction
+  // `mirror_port` chain; the validator still rejects unresolved
+  // role_names before we reach here. Hot-path mirror dispatch lands
+  // in M16 C2 (apply_action kMirror arm + stage_mirror /
+  // mirror_drain helpers). The `CompileErrorCode::kMirrorNotImplemented`
+  // enumerator remains in src/compiler/compiler.h for ABI continuity
+  // but has no emitter site in this build; future mirror-related
+  // compile-time failures (unresolved role that somehow bypassed the
+  // validator, etc.) may re-emit it.
 
   // M4 C0 retrofit (D41) — wire compound stages into the top-level
   // pipeline. Before this cycle M2 shipped with compile_l{2,4}_rules

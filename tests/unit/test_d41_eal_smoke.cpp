@@ -192,6 +192,7 @@ TEST_F(D41EalSmokeFixture, AllObservableFieldsRoundtripThroughEal) {
   // IDs chosen so no layer collides: 1xxx = L2, 2xxx = L3, 3xxx = L4.
   constexpr std::int32_t kL2TagId       = 1001;
   constexpr std::int32_t kL2RedirectId  = 1002;
+  constexpr std::int32_t kL2MirrorId    = 1003;
   constexpr std::int32_t kL3AllowId     = 2001;
   constexpr std::int32_t kL3DropId      = 2002;
   constexpr std::int32_t kL4RateLimitId = 3001;
@@ -215,6 +216,18 @@ TEST_F(D41EalSmokeFixture, AllObservableFieldsRoundtripThroughEal) {
   redir.role_name = "downstream_port";
   auto& l2_redir = append_rule(cfg.pipeline.layer_2, kL2RedirectId, redir);
   l2_redir.src_mac = Mac{{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}};
+
+  // M16 C1 (D7 unlock, D41 #7): MIRROR rule. Exercises the new
+  // `mirror_port` field end-to-end through parse -> compile ->
+  // build_ruleset -> populate_ruleset_eal and pins the D41 guard
+  // extension at the EAL boot-path smoke tier. Before M16 C1 this
+  // config would have compile-errored with kMirrorNotImplemented;
+  // post-C1 it compiles and lowers the resolved role_idx to
+  // action::RuleAction.mirror_port via builder::copy_actions.
+  ActionMirror mirror;
+  mirror.role_name = "downstream_port";
+  auto& l2_mirror = append_rule(cfg.pipeline.layer_2, kL2MirrorId, mirror);
+  l2_mirror.src_mac = Mac{{0xCA, 0xFE, 0xBE, 0xEF, 0xF0, 0x01}};
 
   // ---- L3: ALLOW (10.0.0.0/24) + DROP (192.168.1.0/24) -----------------
   //
@@ -257,7 +270,8 @@ TEST_F(D41EalSmokeFixture, AllObservableFieldsRoundtripThroughEal) {
 
   CompileResult cr = compile(cfg, /*opts=*/{}, rl_alloc);
   ASSERT_FALSE(cr.error.has_value()) << "compile must succeed";
-  ASSERT_EQ(cr.l2_actions.size(), 2u);
+  ASSERT_EQ(cr.l2_actions.size(), 3u)
+      << "L2: TAG + REDIRECT + MIRROR (M16 C1 D7 unlock)";
   ASSERT_EQ(cr.l3_actions.size(), 2u);
   ASSERT_EQ(cr.l4_actions.size(), 2u);
 
@@ -266,7 +280,7 @@ TEST_F(D41EalSmokeFixture, AllObservableFieldsRoundtripThroughEal) {
   // stay null and the Ruleset is only half-populated.
   constexpr unsigned kNumLcores = 1;
   Ruleset rs = build_ruleset(cr, cfg.sizing, kNumLcores);
-  ASSERT_GE(rs.n_l2_rules, 2u);
+  ASSERT_GE(rs.n_l2_rules, 3u);
   ASSERT_GE(rs.n_l3_rules, 2u);
   ASSERT_GE(rs.n_l4_rules, 2u);
 
@@ -317,6 +331,19 @@ TEST_F(D41EalSmokeFixture, AllObservableFieldsRoundtripThroughEal) {
   // REDIRECT role_idx resolves to downstream_port == 1.
   EXPECT_EQ(rs.l2_actions[1].redirect_port, 1u)
       << "REDIRECT downstream_port role idx";
+
+  // M16 C1 (D41 #7): MIRROR verb lowers mirror_port to downstream_port
+  // role_idx (1). The first two L2 rules (TAG + REDIRECT) keep the
+  // 0xFFFF sentinel — catches any future regression that copies
+  // mirror_port from the wrong arm of resolve_action.
+  EXPECT_EQ(rs.l2_actions[2].verb,
+            static_cast<std::uint8_t>(ActionVerb::kMirror));
+  EXPECT_EQ(rs.l2_actions[2].mirror_port, 1u)
+      << "MIRROR downstream_port role idx lowered through EAL boot";
+  EXPECT_EQ(rs.l2_actions[0].mirror_port, 0xFFFFu)
+      << "TAG verb must keep mirror_port sentinel";
+  EXPECT_EQ(rs.l2_actions[1].mirror_port, 0xFFFFu)
+      << "REDIRECT verb must keep mirror_port sentinel";
 
   // L3 verbs land right verb bytes.
   EXPECT_EQ(rs.l3_actions[0].verb,

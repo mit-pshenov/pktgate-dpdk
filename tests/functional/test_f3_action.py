@@ -967,18 +967,22 @@ def test_f3_10_redirect_burst():
 # F3.17 — MIRROR action → compile-time reject (D7)
 # ---------------------------------------------------------------------------
 #
-# MIRROR is parser-accepted (D7: the config schema keeps the field so
-# Phase-2 can flip the gate without a schema break) but compiler-rejected
-# in MVP. main.cpp prints a JSON error on stdout and returns 1 *before*
-# rte_eal_init runs, so this test does not need tap vdevs or hugepages —
-# just launch the binary with a --config that contains a mirror rule and
-# verify (a) non-zero exit, (b) "compile_err" / "mirror" on stdout, (c)
-# no "ready" ever emitted.
+# M16 C1 (D7 unlock, review-notes §D7 amendment 2026-04-20): MIRROR is
+# now a lowered verb through the full compile -> build -> RuleAction
+# pipeline. The compiler no longer emits `compile_err` with
+# `kMirrorNotImplemented` — the scan-for-kMirror reject block in
+# src/compiler/object_compiler.cpp is removed. This test used to verify
+# the MVP-era reject; post-C1 it verifies the OPPOSITE: the binary
+# gets PAST compile() and proceeds to the EAL bring-up stage. (A full
+# functional mirror forwarding smoke lands as M16 C3 F16.2 — a separate
+# pytest with real dtap fixtures.)
 
-def test_f3_17_mirror_compile_reject():
-    """F3.17: a rule with action.type=mirror must be rejected at compile
-    time. The binary exits with status != 0 and emits a JSON
-    compile_err line mentioning mirror / not implemented.
+def test_f3_17_mirror_compile_accepts():
+    """F3.17 (M16 C1): a rule with action.type=mirror must NOT be
+    rejected at compile time. The binary gets past compile() — it
+    may still fail later (no dtap present here, EAL "insufficient
+    ports", etc.), but the specific `compile_err` with mirror-not-
+    implemented message must not appear.
     """
     config = {
         "version": 1,
@@ -1010,10 +1014,6 @@ def test_f3_17_mirror_compile_reject():
         json.dump(config, tmpf)
         tmpf.close()
 
-        # Compile error happens before rte_eal_init — EAL args are only
-        # here to make behaviour deterministic if a regression ever
-        # delays the compiler-reject past EAL init. --no-huge keeps
-        # this launch independent of hugepage availability.
         file_prefix = f"pktgate_f3_17_{time.monotonic_ns() % 10**9:09d}"
         cmd = [
             binary,
@@ -1037,25 +1037,25 @@ def test_f3_17_mirror_compile_reject():
         if os.path.exists(tmpf.name):
             os.unlink(tmpf.name)
 
-    assert proc.returncode != 0, (
-        f"MIRROR must cause non-zero exit; got rc={proc.returncode} "
+    combined = stdout_text + stderr_text
+
+    # M16 C1 invariant: mirror is no longer rejected by compile().
+    # The pre-C1 diagnostic was:
+    #     {"event":"compile_err","message":"mirror action not implemented..."}
+    # Post-C1 that specific event must not appear.
+    assert "compile_err" not in combined, (
+        f"M16 C1 D7 unlock: compile() must NOT reject mirror; got "
         f"stdout={stdout_text!r} stderr={stderr_text!r}"
     )
-
-    combined = stdout_text + stderr_text
-    assert "compile_err" in combined, (
-        f"expected 'compile_err' in output; got stdout={stdout_text!r} "
-        f"stderr={stderr_text!r}"
+    assert "mirror action not implemented" not in combined.lower(), (
+        f"Legacy MIRROR reject message must be gone (M16 C1); got "
+        f"stdout={stdout_text!r} stderr={stderr_text!r}"
     )
-    # The compile-error message body comes from
-    # object_compiler.cpp: "mirror action not implemented in this build"
-    assert "mirror" in combined.lower(), (
-        f"expected 'mirror' in output; got stdout={stdout_text!r} "
-        f"stderr={stderr_text!r}"
-    )
-
-    # No packet actually enters the pipeline → stats_on_exit is never
-    # emitted, and in particular 'ready' is never printed.
-    assert '"ready":true' not in stdout_text and '"ready": true' not in stdout_text, (
-        f"MIRROR reject must abort before ready; stdout={stdout_text!r}"
+    # Positive signal: the binary DID reach at least the EAL-init
+    # stage (eal_init_ok), proving compile() returned without an
+    # error. If compile() had rejected, the binary would have exited
+    # before rte_eal_init.
+    assert "eal_init_ok" in combined, (
+        f"binary must reach eal_init_ok past compile(); got "
+        f"stdout={stdout_text!r} stderr={stderr_text!r}"
     )

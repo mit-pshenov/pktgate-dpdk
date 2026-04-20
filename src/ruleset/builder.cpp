@@ -145,7 +145,13 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       d.execution_tier = static_cast<std::uint8_t>(s.execution_tier);
       d.flags = 0;
       d.redirect_port = s.redirect_port;
-      d.mirror_port = 0xFFFF;
+      // M16 C1 (D7 unlock, D41 #7): mirror_port now flows through the
+      // compiler -> builder pipeline instead of being hardcoded at
+      // 0xFFFF. Non-kMirror verbs keep the sentinel (set by
+      // CompiledAction's default member initialiser); kMirror verbs
+      // carry the resolved role_idx produced by resolve_action +
+      // resolve_role_idx in src/compiler/object_compiler.cpp.
+      d.mirror_port = s.mirror_port;
       d.dscp = s.dscp;
       d.pcp = s.pcp;
       d.rl_index = s.rl_slot;
@@ -319,7 +325,10 @@ Ruleset build_ruleset(const compiler::CompileResult& cr,
       d.execution_tier = static_cast<std::uint8_t>(s.execution_tier);
       d.flags = 0;
       d.redirect_port = s.redirect_port;
-      d.mirror_port = 0xFFFF;
+      // M16 C1 (D7 unlock, D41 #7): mirror_port lowered symmetrically
+      // in the allocator-aware overload — see the zero-arg
+      // copy_actions above for the full rationale.
+      d.mirror_port = s.mirror_port;
       d.dscp = s.dscp;
       d.pcp = s.pcp;
       d.rl_index = s.rl_slot;

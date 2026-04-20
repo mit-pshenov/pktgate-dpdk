@@ -130,7 +130,14 @@ TEST(D41GuardRuntimeRoundtrip, AllVerbsPerLayer) {
 
   Config cfg = make_config();
 
-  // ---- L2: TAG (dscp=46, pcp=5) + REDIRECT(downstream_port). ----
+  // ---- L2: TAG (dscp=46, pcp=5) + REDIRECT(downstream_port) +
+  //         MIRROR(downstream_port). ----
+  //
+  // MIRROR rule added in M16 C1 (D41 #7): exercises the new
+  // `mirror_port` field on both sides of the observable_fields()
+  // projection pair. Before C1 mirror was compile-rejected so the
+  // projection correctly excluded mirror_port; with the C1 unlock
+  // mirror_port is a live lowered field and belongs in the coverage.
   ActionTag tag;
   tag.dscp = 46;
   tag.pcp = 5;
@@ -141,6 +148,13 @@ TEST(D41GuardRuntimeRoundtrip, AllVerbsPerLayer) {
   redir.role_name = "downstream_port";
   auto& l2_redir = append_rule(cfg.pipeline.layer_2, 1102, redir);
   l2_redir.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x12}};
+
+  // MIRROR rule: covers M16 C1 D41 #7 guard extension. role_name
+  // resolves to downstream_port -> role_idx 1.
+  ActionMirror mirror;
+  mirror.role_name = "downstream_port";
+  auto& l2_mirror = append_rule(cfg.pipeline.layer_2, 1103, mirror);
+  l2_mirror.src_mac = Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x13}};
 
   // ---- L3: ALLOW + DROP (compiler still populates l3_actions). ----
   append_rule(cfg.pipeline.layer_3, 2201, ActionAllow{});
@@ -206,6 +220,8 @@ TEST(D41GuardRuntimeRoundtrip, AllVerbsPerLayer) {
               << layer_name << "[" << i << "] pcp";
           EXPECT_EQ(std::get<7>(ca_proj), std::get<7>(ra_proj))
               << layer_name << "[" << i << "] rl_index/rl_slot";
+          EXPECT_EQ(std::get<8>(ca_proj), std::get<8>(ra_proj))
+              << layer_name << "[" << i << "] mirror_port";
         }
       };
 
@@ -216,7 +232,7 @@ TEST(D41GuardRuntimeRoundtrip, AllVerbsPerLayer) {
   // ---- Positive-value checks: every observable field is non-sentinel
   // on at least one rule so a "stay at default" bug (like the pre-M7
   // C2b hardcoded redirect_port=0xFFFF) is catchable. ----
-  ASSERT_GE(rs.n_l2_rules, 2u);
+  ASSERT_GE(rs.n_l2_rules, 3u);
   ASSERT_GE(rs.n_l3_rules, 2u);
   ASSERT_GE(rs.n_l4_rules, 2u);
 
@@ -227,8 +243,23 @@ TEST(D41GuardRuntimeRoundtrip, AllVerbsPerLayer) {
   // REDIRECT resolved role_idx -> 1 (downstream_port).
   EXPECT_EQ(rs.l2_actions[1].redirect_port, 1u) << "REDIRECT role idx";
 
+  // M16 C1 (D41 #7): MIRROR resolved role_idx -> 1 (downstream_port).
+  // The sentinel for non-mirror verbs stays at 0xFFFF; only the MIRROR
+  // rule carries a real resolved port. Catches any future refactor
+  // that accidentally lowers mirror_port in the wrong arm of the
+  // compiler visitor.
+  EXPECT_EQ(rs.l2_actions[0].mirror_port, 0xFFFFu)
+      << "TAG verb must keep mirror_port sentinel";
+  EXPECT_EQ(rs.l2_actions[1].mirror_port, 0xFFFFu)
+      << "REDIRECT verb must keep mirror_port sentinel";
+  EXPECT_EQ(rs.l2_actions[2].verb,
+            static_cast<std::uint8_t>(ActionVerb::kMirror));
+  EXPECT_EQ(rs.l2_actions[2].mirror_port, 1u)
+      << "MIRROR role idx lowered";
+
   // counter_slot is dense per layer: second rule has slot 1.
   EXPECT_EQ(rs.l2_actions[1].counter_slot, 1u);
+  EXPECT_EQ(rs.l2_actions[2].counter_slot, 2u);
   EXPECT_EQ(rs.l3_actions[1].counter_slot, 1u);
   EXPECT_EQ(rs.l4_actions[1].counter_slot, 1u);
 

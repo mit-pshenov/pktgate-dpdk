@@ -493,9 +493,16 @@ inline void apply_action(WorkerCtx* ctx, const ruleset::Ruleset& rs,
       return;
 
     case compiler::ActionVerb::kMirror:
-      // D7 — compiler rejects MIRROR at publish time. Reaching here
-      // means the compiler-reject path was bypassed; treat as
-      // unreachable and free.
+      // M16 C1 placeholder arm (review-notes §D7 amendment 2026-04-20).
+      // The compile-path reject is removed in C1 — a mirror rule now
+      // lowers a resolved `action->mirror_port` through the builder
+      // and reaches here. C2 replaces this body with stage_mirror +
+      // stage_tx (original forward) + mirror_drain at burst end. In
+      // C1 no hot-path code lands yet: if a live packet hits a mirror
+      // rule (unit/EAL tests do not inject packets into this arm), we
+      // fall back to the unreachable-counter + free behaviour so the
+      // hot path remains provably safe. `-Wswitch-enum` keeps us
+      // honest when C2 rewrites this arm.
       relaxed_bump(&ctx->dispatch_unreachable_total);
       rte_pktmbuf_free(m);
       return;

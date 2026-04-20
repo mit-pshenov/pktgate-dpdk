@@ -46,6 +46,18 @@ pktgate_add_test(
   LINK    pktgate_core
 )
 
+# M16 C1 — object compiler mirror unlock (U16.1). DPDK-free unit tier:
+# drives parse/validate/compile on a config carrying `action: mirror`
+# and asserts the resulting CompiledAction carries verb == kMirror +
+# mirror_port resolved to the correct interface_roles index. Pins the
+# D7 unlock + D41 #7 guard extension at the compiler TU.
+pktgate_add_test(
+  NAME    unit.test_object_compiler_mirror
+  SOURCES test_object_compiler_mirror.cpp
+  LABELS  unit
+  LINK    pktgate_core
+)
+
 pktgate_add_test(
   NAME    unit.test_builder
   SOURCES test_builder.cpp

@@ -106,6 +106,35 @@ struct CompiledAction {
   std::uint8_t pcp{0};
   std::uint16_t redirect_port{0xFFFF};
 
+  // M16 C1 (D7 unlock, D41 guard extension): mirror destination port.
+  //
+  // Before M16 C1 the compiler rejected any config carrying `action:
+  // mirror` (object_compiler.cpp::compile scan-for-kMirror block), so
+  // there was no need to carry a `mirror_port` field — the compiler
+  // output never held a kMirror verb in practice. C1 removes that
+  // reject (see review-notes §D7 amendment 2026-04-20 + design.md
+  // §14 phase-plan row); the compiler now emits CompiledAction entries
+  // with `verb == kMirror` and this field holds the resolved port_id
+  // of the mirror destination (same port_resolver path redirect_port
+  // uses — src/compiler/object_compiler.cpp::resolve_role_idx).
+  //
+  // Default 0xFFFF mirrors redirect_port's sentinel convention: an
+  // action whose verb is NOT kMirror keeps the sentinel, and hot-path
+  // dispatch (M16 C2) reads mirror_port only when verb == kMirror.
+  // The validator (src/config/validator.cpp:310-376) rejects mirror
+  // rules whose role_name does not resolve BEFORE compile runs, so
+  // a live CompiledAction with verb == kMirror always has a resolved
+  // mirror_port by construction.
+  //
+  // D41 lockstep: observable_fields(CompiledAction) and
+  // observable_fields(RuleAction) both include `mirror_port` as of
+  // M16 C1, and src/ruleset/builder.cpp copy_actions lowers it in
+  // both build_ruleset overloads. The static_assert pair in
+  // builder.cpp guards the projection drift; the runtime roundtrip
+  // tests (test_d41_guard.cpp + test_d41_eal_smoke.cpp + new
+  // test_object_compiler_mirror.cpp) guard the wiring drift.
+  std::uint16_t mirror_port{0xFFFF};
+
   // M9 C3 (D10, D24, D41): rate-limit fields. When verb == kRateLimit,
   // rl_slot is the slot index obtained from the RateLimitArena via the
   // slot allocator passed to compile() and rl_rate_bps / rl_burst_bytes
@@ -144,10 +173,12 @@ struct CompiledAction {
 //     16-bit slot index under two names — the namespace drift is noted
 //     in scratch/d41-discovery-report.md §1.1 and is not a defect.
 //
-// Fields excluded: dscp/pcp carry through directly; next_layer, flags,
-// mirror_port do not appear on CompiledAction and are dead carriers /
-// MVP-reject sentinels on the action side — see the matching comment
-// in src/action/action.h.
+// Fields excluded: dscp/pcp carry through directly; next_layer and
+// flags are dead carriers on the action side (zero readers in
+// src/dataplane/). `mirror_port` WAS excluded prior to M16 C1 because
+// mirror was compile-rejected (D7); as of M16 C1 the D7 reject is
+// removed and `mirror_port` is a live lowered field on both sides —
+// see the matching comment in src/action/action.h.
 constexpr auto observable_fields(const CompiledAction& ca) {
   return std::tuple{
       static_cast<std::uint32_t>(ca.rule_id),
@@ -158,6 +189,7 @@ constexpr auto observable_fields(const CompiledAction& ca) {
       ca.dscp,
       ca.pcp,
       ca.rl_slot,
+      ca.mirror_port,
   };
 }
 

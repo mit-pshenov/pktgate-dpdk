@@ -1061,49 +1061,83 @@ TEST(RuleTiering, FirstMatchWinsOrder_U3_16) {
 }
 
 // =========================================================================
-// C7 — Mirror reject + D26 strategy
+// C7 — Mirror compile path (D7 unlock M16 C1) + D26 strategy
 // =========================================================================
 
 // -------------------------------------------------------------------------
-// U3.17 Mirror action compile-time reject (D7 MVP)
+// U3.17 Mirror action compiles — D7 unlock (M16 C1)
 //
-// Compiling a ruleset containing `action: mirror` produces a
-// MirrorNotImplemented error at the compile stage. The compiler rejects
-// the mirror verb (D7: mirror not implemented in this build).
+// Before M16 C1 this test asserted that compiling a mirror rule produced
+// a `kMirrorNotImplemented` error. M16 C1 (review-notes §D7 amendment
+// 2026-04-20) removes the compile-path reject in
+// src/compiler/object_compiler.cpp: mirror is now a fully lowered verb
+// that travels through compile → build → RuleAction via the
+// `mirror_port` field (D41 #7 guard extension).
+//
+// This inverted test pins the C1 invariants at the compiler tier:
+//   1. compile() returns no error on a mirror rule.
+//   2. CompiledAction.verb == kMirror for the resulting action.
+//   3. CompiledAction.mirror_port resolves to the interface_roles
+//      index of the target role (same path redirect_port uses).
+//   4. Layers L2 / L3 / L4 all accept mirror rules consistently.
 // -------------------------------------------------------------------------
-TEST(MirrorReject, MirrorNotImplemented_U3_17) {
+TEST(MirrorCompile, CompilesAndResolvesPort_U3_17) {
+  // downstream_port -> role_idx 1 in make_config().
   Config cfg = make_config();
 
   // Add a mirror rule to L4
-  auto& rule = append_rule(cfg.pipeline.layer_4, 9100, ActionMirror{"mirror_port"});
+  auto& rule = append_rule(cfg.pipeline.layer_4, 9100,
+                           ActionMirror{"downstream_port"});
   rule.proto = 6;
   rule.dst_port = 80;
 
   auto result = compile(cfg);
 
-  // The compile must produce a compile error
-  ASSERT_TRUE(result.error.has_value())
-      << "Compiling a mirror rule must produce an error (D7 MVP)";
-  EXPECT_EQ(result.error->code, CompileErrorCode::kMirrorNotImplemented)
-      << "Error code must be kMirrorNotImplemented";
-  EXPECT_NE(result.error->message.find("mirror"), std::string::npos)
-      << "Error message must mention 'mirror'";
+  ASSERT_FALSE(result.error.has_value())
+      << "Compile must succeed now that D7 is unlocked (M16 C1); "
+         "error was: "
+      << (result.error.has_value() ? result.error->message : "");
+  ASSERT_EQ(result.l4_actions.size(), 1u);
+  EXPECT_EQ(result.l4_actions[0].verb, ActionVerb::kMirror);
+  EXPECT_EQ(result.l4_actions[0].mirror_port, 1u)
+      << "mirror_port must resolve to downstream_port role idx";
 
-  // Also verify mirror rules in L2 and L3 layers are rejected
+  // L2 layer mirror compile path.
   Config cfg_l2 = make_config();
-  auto& r2 = append_rule(cfg_l2.pipeline.layer_2, 9101, ActionMirror{"mirror_port"});
+  auto& r2 = append_rule(cfg_l2.pipeline.layer_2, 9101,
+                         ActionMirror{"downstream_port"});
   r2.vlan_id = 100;
   auto result_l2 = compile(cfg_l2);
-  ASSERT_TRUE(result_l2.error.has_value())
-      << "Mirror in L2 must also be rejected (D7)";
-  EXPECT_EQ(result_l2.error->code, CompileErrorCode::kMirrorNotImplemented);
+  ASSERT_FALSE(result_l2.error.has_value());
+  ASSERT_EQ(result_l2.l2_actions.size(), 1u);
+  EXPECT_EQ(result_l2.l2_actions[0].verb, ActionVerb::kMirror);
+  EXPECT_EQ(result_l2.l2_actions[0].mirror_port, 1u);
 
+  // L3 layer mirror compile path.
   Config cfg_l3 = make_config();
-  append_rule(cfg_l3.pipeline.layer_3, 9102, ActionMirror{"mirror_port"});
+  append_rule(cfg_l3.pipeline.layer_3, 9102,
+              ActionMirror{"upstream_port"});
   auto result_l3 = compile(cfg_l3);
-  ASSERT_TRUE(result_l3.error.has_value())
-      << "Mirror in L3 must also be rejected (D7)";
-  EXPECT_EQ(result_l3.error->code, CompileErrorCode::kMirrorNotImplemented);
+  ASSERT_FALSE(result_l3.error.has_value());
+  ASSERT_EQ(result_l3.l3_actions.size(), 1u);
+  EXPECT_EQ(result_l3.l3_actions[0].verb, ActionVerb::kMirror);
+  EXPECT_EQ(result_l3.l3_actions[0].mirror_port, 0u)
+      << "upstream_port role idx is 0";
+}
+
+// -------------------------------------------------------------------------
+// U3.17b MUTATING_VERBS stability across the D7 unlock.
+//
+// M16 C1 does NOT promote MIRROR to a mutating verb — mirror is a
+// deep-copy (C2 landing) operation and the original packet is untouched.
+// The `-Wswitch-enum` on `is_mutating_verb` guards the enum at compile
+// time; this runtime test pins the runtime answer.
+// -------------------------------------------------------------------------
+TEST(MirrorCompile, IsMutatingVerbStable_U3_17b) {
+  EXPECT_FALSE(pktgate::compiler::is_mutating_verb(ActionVerb::kMirror))
+      << "MIRROR must remain non-mutating (D26 baseline); TAG is the "
+         "sole mutating verb. Adding a new mutating verb triggers "
+         "-Wswitch-enum in src/compiler/mirror_strategy.cpp.";
 }
 
 // -------------------------------------------------------------------------

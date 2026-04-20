@@ -57,10 +57,17 @@ static_assert(alignof(RuleAction) == 4, "RuleAction alignment drift (D22)");
 //     sequencing is driven by classify_l{2,3,4} Disposition returns.
 //   * flags      — excluded: dead carrier. Zero readers anywhere
 //     in the tree; reserved stub space for future attribute bits.
-//   * mirror_port — excluded: mirror is compile-rejected (D7); sentinel
-//     is correct for MVP. If D7 ever relaxes and mirror enters the
-//     MVP, re-add to both projections in lockstep and add lowering
-//     in builder::copy_actions.
+//
+// `mirror_port` — INCLUDED as of M16 C1 (D7 unlock + D41 #7 guard
+// extension). Prior to M16 mirror was compile-rejected in the MVP
+// (src/compiler/object_compiler.cpp scan-for-kMirror block) so the
+// field stayed at its 0xFFFF reserved-slot sentinel for every live
+// RuleAction and was correctly excluded from the projection. The
+// M16 C1 unlock removes the reject, adds lowering in
+// object_compiler.cpp::resolve_action + builder.cpp::copy_actions
+// (both overloads), and adds `mirror_port` to both observable_fields
+// tuples in lockstep — this is the D41 #7 guard landing per
+// review-notes §D41 and the M16 supervisor handoff §C1.
 //
 // Types and element count MUST match compiler::observable_fields() —
 // drift triggers `D41 guard: ...` static_assert failures at the TU
@@ -77,6 +84,7 @@ constexpr auto observable_fields(const RuleAction& ra) {
       ra.dscp,
       ra.pcp,
       ra.rl_index,
+      ra.mirror_port,
   };
 }
 
