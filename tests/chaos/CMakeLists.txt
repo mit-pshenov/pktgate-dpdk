@@ -87,3 +87,32 @@ set_tests_properties(chaos.test_m16_mirror_mempool_exhaust PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 200
 )
+
+# M16 C5 — chaos part 3: mirror destination slow consumer + recovery.
+#
+# Three-tap harness boots pktgate with an L4 mirror rule; the mirror
+# tap's kernel txqueuelen is clamped to 1 (link stays UP) so the tun
+# queue drains glacially relative to the inject rate. A sustained
+# 2000-packet / 200 Hz stream piles clones at the kernel boundary;
+# `rte_eth_tx_burst` short-bursts and `pktgate_mirror_dropped_total
+# {port}` climbs. Mid-stream (~3 s in) the clamp is released
+# (txqueuelen restored to 1000) and `pktgate_mirror_sent_total
+# {port}` bumps resume — recovery semantic distinct from port_gone.
+#
+# See memory grabli_tap_tbf_wrong_side.md for why tc tbf/netem on
+# the tap egress side is NOT the correct mechanism (wrong side of
+# /dev/net/tun); txqueuelen=1 with link-up is the textbook
+# slow-consumer recipe for net_tap.
+#
+# Timeout sized for dev-tsan: ~10 s inject + ~2.5 s drain + 15 s
+# boot + 2-5× TSAN slowdown factor. 240 s is comfortable headroom.
+add_test(
+  NAME chaos.test_m16_mirror_slow_consumer
+  COMMAND ${PYTEST_EXECUTABLE} -xvs
+          "${_test_dir}/test_m16_mirror_slow_consumer.py"
+)
+set_tests_properties(chaos.test_m16_mirror_slow_consumer PROPERTIES
+  LABELS "chaos"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 240
+)

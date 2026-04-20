@@ -158,6 +158,13 @@ _TAP_IFACES_TO_UNMANAGE = [
     # mirror_clone_failed_total. Namespaced distinct from
     # port_gone so tests are session-safe back-to-back.
     "dtap_m16m_ing", "dtap_m16m_egr", "dtap_m16m_mir",
+    # M16 C5 — chaos.test_m16_mirror_slow_consumer. Three dtaps;
+    # mirror tap txqueuelen=1 at boot (link UP) constricts kernel
+    # drain, forcing mirror_drain short-bursts; mid-stream release
+    # restores default queue length and sent bumps resume. Distinct
+    # from port_gone's link-down signal; see memory
+    # grabli_tap_tbf_wrong_side.md for recipe rationale.
+    "dtap_m16s_ing", "dtap_m16s_egr", "dtap_m16s_mir",
 ]
 
 
