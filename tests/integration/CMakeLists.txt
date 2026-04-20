@@ -120,3 +120,35 @@ set_tests_properties(integration.c7_27_d33_gate
   PROPERTIES
     LABELS "integration"
     WILL_FAIL FALSE)
+
+# M15 C3 — paired DPDK integration harness.
+#
+# test_m15_vhost_pair.py spawns pktgate (net_vhost server) alongside
+# `dpdk-testpmd` (net_virtio_user client) on a shared UDS and verifies
+# the data-plane round-trip: scapy → net_tap ingress → pktgate pipeline
+# → net_vhost TX → virtio-user consumer. First integration-tier Python
+# pytest entry; CMake needs a find_program(pytest) gate + a generic
+# pytest-based add_test (mirror of tests/functional/CMakeLists.txt).
+#
+# Requires root (scapy AF_PACKET inject + /run/dpdk/ ownership + tap
+# bring-up + NM keyfile write) — ctest is launched under sudo by the
+# preset matrix.
+find_program(PYTEST_EXECUTABLE NAMES pytest pytest-3 py.test)
+if(PYTEST_EXECUTABLE)
+  set(_binary "$<TARGET_FILE:pktgate_dpdk>")
+  set(_test_dir "${CMAKE_CURRENT_SOURCE_DIR}")
+
+  add_test(
+    NAME integration.test_m15_vhost_pair
+    COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_m15_vhost_pair.py"
+  )
+  set_tests_properties(integration.test_m15_vhost_pair PROPERTIES
+    LABELS "integration"
+    ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+    TIMEOUT 240
+  )
+else()
+  message(STATUS
+    "pytest not found — integration.test_m15_vhost_pair will be skipped"
+  )
+endif()

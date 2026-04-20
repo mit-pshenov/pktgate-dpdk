@@ -124,6 +124,11 @@ _TAP_IFACES_TO_UNMANAGE = [
     # pair so the test module can run alongside any other dtap_*
     # functional entry in the same session without sharing taps.
     "dtap_m14_ing", "dtap_m14_egr",
+    # M15 C3 — integration.test_m15_vhost_pair. Single ingress tap
+    # (downstream is a vhost UDS, no egress tap needed). Name-scoped
+    # to the M15 cycle so it doesn't collide with M14 taps in a
+    # shared session run.
+    "dtap_m15_ing",
 ]
 
 
