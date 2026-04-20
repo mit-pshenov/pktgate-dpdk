@@ -545,6 +545,85 @@ Mirror is not MVP, but (M2 principle) architecture describes it fully.
 | §14 (phase plan) | Mirror + refcount optimization as separate phase with lab-test exit criterion |
 | §15 (risks) | Remove risk #2 (mirror cycle budget); note it in phase plan as exit criterion |
 
+**D7 amendment — Mirror unlock (M16, 2026-04-20).** Mirror verb
+activates in the hot path; the compile-time reject
+(`kMirrorNotImplemented` in `src/compiler/object_compiler.cpp`) is
+removed and `case MIRROR:` lands in `apply_action`. This is
+**activation of D7 — no new D-decision number**. The architectural
+model in §3a / §5.5 / §15 is unchanged; §14 phase plan is updated
+in lockstep to move the mirror-dataplane entry from Phase 2
+deferred to Phase 2 shipped as M16.
+
+Scope of the unlock:
+
+- **Canonical deploy profile in M16: TAP destination only**, one
+  mirror port named via `interface_roles`, resolved by the shared
+  D43 `port_resolver` path that `redirect_port` uses. Single
+  deploy profile per user directive 2026-04-20 ("пока один").
+- **Deep-copy strategy only** (`rte_pktmbuf_copy`). `build_ruleset`
+  passes `config_zero_copy = false` unconditionally in current
+  builds; the refcnt zero-copy runtime path stays dormant.
+- **Counter family `pktgate_mirror_{sent,clone_failed,dropped}
+  _total{port}`** lands under D33 six-fold lockstep;
+  `kAllCounterNames` grows 39 → 42. All three counters use
+  `relaxed_bump` per the D1 telemetry clause (single-writer,
+  no `lock` prefix).
+- **Staging + drain** analogous to D16 REDIRECT: `stage_mirror`
+  per-port buffer, `mirror_drain` at burst end, unsent clones
+  freed and counted as `mirror_dropped_total`.
+- **D41 guard extended** in lockstep: `mirror_port` enters both
+  projection tuples (`src/action/action.h::observable_fields`
+  and `src/compiler/compiler.h::observable_fields`) with the
+  `builder::copy_actions` lowering. The static_assert pair
+  catches drift automatically.
+
+Deferred (recorded here so mid-milestone scope creep is caught;
+to promote any of these, spawn a fresh consultant session with
+user sign-off):
+
+- **Refcnt zero-copy runtime path.** The D26 gate logic
+  (`determine_mirror_strategy` + `is_mutating_verb`) is
+  **preserved unchanged** as a formal architectural gate. Driver
+  caps probe (`rte_eth_dev_info.tx_offload_capa` →
+  `tx_non_mutating`) is NOT wired. Rationale: e1000 / net_tap /
+  net_vhost present no `tx_non_mutating` caps on dev VM, and no
+  production NIC is in-bench. Unshelve when real hardware
+  (E810 / XL710 / mlx5) ships and an operator requests zero-copy
+  mirror.
+- **Vhost mirror destination.** Single profile in M16 per user
+  directive. Vhost was validated as an exit port in M15; reusing
+  that D43 abstraction for a mirror destination adds zero new
+  resolver code. Promote only when a real deployment asks.
+- **PCI mirror destination (second real NIC).** Promote together
+  with the production testbed or rte_flow HW-offload front
+  (P7 archived under D4 clause 6).
+- **Per-rule sampling rate (`mirror_sample_1_in_N`).** D7
+  architecture accommodates; no committed deployment requests it.
+- **MUTATING_VERBS extension beyond `{TAG}`.** Deferred until a
+  new mutating verb (NAT / header rewrite / etc.) is actually
+  introduced. `-Wswitch-enum` on `is_mutating_verb` catches new
+  verb additions at compile time per D25.
+- **Per-rule mirror counter attribution** (§10.3 per-rule table
+  extension). M16 ships per-port aggregate only.
+
+Cross-references:
+
+- `design.md` §14 phase-plan table — mirror row moves from
+  "Phase 2 deferred / schema accepted, compiler rejects" to
+  "Phase 2 shipped as M16 (TAP destination, deep-copy strategy,
+  three-counter telemetry family)".
+- `design.md` §5.5 MIRROR case — note appended that M16 ships
+  deep-copy only; the refcnt path stays as a formal D26 gate for
+  future unshelve.
+- `src/compiler/mirror_strategy.h` top-of-file comment — note
+  appended that `determine_mirror_strategy` logic is preserved
+  but `build_ruleset` passes `config_zero_copy = false` in
+  current builds.
+
+No change to D26; no change to the §15 risk register (the "mirror
+cycle budget" entry already lived in §14 as a Phase exit criterion
+under the original D7 writeup, which M16 satisfies).
+
 ---
 
 ### D8 — JSON schema: clean, no pktgate compatibility

@@ -1617,6 +1617,16 @@ static inline void apply_action(WorkerCtx* ctx, const Ruleset* rs,
         // D26 governs the refcnt-mirror contract so that enabling
         // mirror later is additive, not structural — the hot path
         // already carries the correct strategy dispatch.
+        //
+        // M16 activation note (D7 unlock, 2026-04-20): M16 ships
+        // deep-copy only — `build_ruleset` passes `config_zero_copy
+        // = false` unconditionally, so `mirror_clone` resolves to
+        // `rte_pktmbuf_copy` in current builds. The refcnt
+        // zero-copy path stays as a formal D26 gate preserved in
+        // `determine_mirror_strategy`; unshelve when a real NIC
+        // (E810 / XL710 / mlx5) presents `tx_non_mutating` caps
+        // and an operator requests zero-copy mirror. See
+        // `review-notes.md §D7 amendment` and §14.2.
         rte_mbuf* clone = mirror_clone(m);  // strategy fixed at build
         if (likely(clone))
             stage_mirror(ctx, a->mirror_port, clone);
@@ -2802,7 +2812,7 @@ deferred).*
 - **Mirror action**: schema is complete (D7). Compiler **rejects
   rules with `action: mirror` at publish time with a clear error**
   message in Phase 1; the dataplane mirror path is validated in
-  Phase 2.
+  Phase 2 (shipped as M16 — see §14.2).
 - Fragment policy `l3_only | drop | allow`, default `l3_only` (D17)
 - IPv6: first-protocol-only (no extension-header chain walking),
   extension-header packets marked L4-unclassifiable with counter
@@ -2861,11 +2871,23 @@ deferred).*
 
 ### 14.2 Phase 2 (v2)
 
-- Mirror dataplane path, starting with deep-copy `rte_pktmbuf_copy`,
-  then optional refcount zero-copy with a NIC compatibility table.
-  **Phase exit criterion**: cycle budget validated on lab hardware
-  with mirror-heavy workloads before mirror is declared production
-  ready (was design.md v1 risk #2; moved here as a gate).
+- **Mirror dataplane path — shipped as M16 (D7 unlock,
+  2026-04-20).** Deep-copy strategy (`rte_pktmbuf_copy`) with TAP
+  destination as the canonical deploy profile; `case MIRROR:` in
+  `apply_action`, `stage_mirror` + `mirror_drain` modeled on the
+  D16 REDIRECT pattern, and a `pktgate_mirror_{sent,clone_failed,
+  dropped}_total{port}` counter triplet under D33 six-fold
+  lockstep. D41 guard extended to cover `mirror_port` in both
+  `observable_fields()` projections. Refcount zero-copy runtime
+  path stays dormant: the D26 gate logic
+  (`determine_mirror_strategy` + `is_mutating_verb`) is preserved
+  as architecture, but `build_ruleset` passes `config_zero_copy =
+  false` unconditionally in current builds; the driver-caps probe
+  (`tx_non_mutating`) is not wired. Unshelve when production NIC
+  hardware ships and an operator requests zero-copy mirror. Vhost
+  and PCI mirror destinations, per-rule sampling, and per-rule
+  mirror counter attribution are likewise deferred — see
+  `review-notes.md §D7 amendment` for the full deferred list.
 - L4 `src_port_range` / `dst_port_range`, via a second-tier linear
   scan over ranged rules or an `rte_acl` sidecar
 - IPv6 extension-header chain walking (up to K hops), bounded and

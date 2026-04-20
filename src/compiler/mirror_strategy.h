@@ -21,6 +21,14 @@
 //   * D7  — mirror compile-time reject in MVP
 //   * D26 — mirror refcnt-zero-copy compile-time gate
 //   * D25 — -Wswitch-enum coverage of ActionVerb
+//
+// M16 activation note (D7 unlock, 2026-04-20): M16 ships deep-copy
+// only; `determine_mirror_strategy` logic is preserved but
+// `build_ruleset` passes `config_zero_copy=false` in current builds.
+// The refcnt zero-copy runtime path (kRefcntZeroCopy) stays dormant
+// as a formal D26 gate for future unshelve when a real NIC
+// (E810 / XL710 / mlx5) presents `tx_non_mutating` caps. See
+// design.md §5.5 and review-notes §D7 amendment.
 
 #pragma once
 
