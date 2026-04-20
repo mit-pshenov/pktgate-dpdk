@@ -832,6 +832,48 @@ at M11 C1 HEAD; bisect traced to M10 C4, M10 C5's exit-gate claim
 retroactively falsified. Fix approved in this cycle; no push, no
 amend, no tag rewrite.*
 
+### Protocol amendment 2026-04-20 (M15 C2) — full matrix per cycle
+
+The M11 C1.5 protocol required TSAN/ASAN evidence in **exit-gate**
+commit bodies and said nothing about non-exit cycles. M15 C1 closed
+on dev-debug alone under the assumption "zero code change in
+resolver = no preset-specific risk". That assumption held for the
+resolver source, but C1 wired `net_vhost` through `main.cpp`
+Phase 5b — and DPDK 25.11 `lib/vhost/fd_man.c` spawns an
+`fdset_event_dispatch` pthread without a teardown hook. Under
+dev-tsan, `rte_eal_cleanup()` freed the heap while that pthread
+was blocked in `epoll_wait`, producing a deterministic SEGV
+(rc=66). The TSAN signal was absent in dev-debug because the fault
+fell inside non-instrumented DPDK code. The bug was silently
+carried through C1 close and surfaced in C2's matrix prep, exactly
+the class of "hidden by narrow preset coverage" the M11 C1.5
+protocol was written to prevent.
+
+The amendment closes that loophole:
+
+**Every non-report-only cycle closes on the full 5-preset matrix**
+— `{dev-debug, dev-release, dev-asan, dev-ubsan, dev-tsan}` —
+with matrix evidence quoted in the cycle commit body (or in an
+attached evidence file, for cycles whose commit body is already
+verbose). "N/N GREEN on dev-debug alone" is a non-close. The only
+cycles exempt from matrix prep are **report-only** cycles (C0-style
+design notes, zero-diff writer+reviewer brigades) — those carry no
+binary and cannot regress codegen.
+
+**The coverage principle**: "zero code change in component X" does
+not imply "zero live-binary change". Wiring a new vdev, registering
+a new mempool, enabling a new sanitizer path — any of these can
+alter the live binary's runtime shape without touching the source
+file the cycle is nominally about. Proof of absence demands matrix
+evidence, not source-diff review.
+
+*Origin: M15 C2 (2026-04-20). TSan SEGV in `rte_eal_cleanup()`
+under vhost role configs; bypass scoped to vhost-present configs
+landed in M15 C2 under D44 architectural extension. No hot-path
+regression, no retroactive tag rewrite. CLAUDE.md §Рабочий стиль
+carries the one-line rule; this section is the canonical
+rationale.*
+
 ## §M13 — dev-debug gate matrix
 
 M13 gate matrix expanded from `{asan, tsan}` to
