@@ -317,6 +317,24 @@ struct CompileResult {
   // fragment_policy above — see errata §M7 C2b.
   std::uint8_t default_action = 0;
 
+  // M16 C3.5: interface_roles propagated from Config so the EAL-aware
+  // population step (`populate_ruleset_eal`) can translate the compiler-
+  // side `role_idx` stored in `CompiledAction.{redirect,mirror}_port`
+  // to the resolved DPDK port_id before the hot path consumes it.
+  //
+  // Declaration order matters — `resolve_role_idx` uses vector index as
+  // the `role_idx` value. At populate time we walk this vector and look
+  // each selector up via `rte_eth_dev_get_port_by_name`; successful
+  // lookups populate an internal `role_idx → port_id` map and drive the
+  // translation. Unresolvable entries (e.g. PciSelector pointing at a
+  // bus address not bound to vfio-pci in this EAL context) leave the
+  // original role_idx untouched — backward-compat for M4 C0-era EAL
+  // tests that use placeholder PciSelectors.
+  //
+  // Memory `grabli_role_idx_as_port_id_bug.md`, regression class pinned
+  // by U16.12 / U16.13 (unit) and F16.4_nonlex (functional).
+  std::vector<config::InterfaceRole> interface_roles;
+
   // D7: compile error (e.g., mirror not implemented in MVP).
   // When set, the result is invalid — the caller must not use the
   // compiled structures.

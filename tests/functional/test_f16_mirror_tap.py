@@ -43,34 +43,21 @@
 #   (15) — all ≤15 characters (one byte for NUL terminator). Memory
 #   anchor: grabli_ifnamsiz_16_limit.md.
 #
-# role_idx -> port_id alignment (hot-path invariant for MIRROR ONLY):
-#   `RuleAction.mirror_port` carries the COMPILER role_idx (lex-sorted
-#   nlohmann ordering of `interface_roles` keys). The hot-path drain
-#   calls `tx_burst_fn(p, ...)` where `p == mirror_port`. For the clone
-#   to land on the actual DPDK mirror port, role_idx for the MIRROR
-#   ROLE must equal its DPDK port_id (other roles' role_idx is never
-#   used by the hot path — main.cpp looks up upstream_port /
-#   downstream_port by NAME via the resolver, not by idx).
+# role_idx -> port_id translation (M16 C3.5 fix landed):
+#   Pre-C3.5: `RuleAction.mirror_port` carried the compiler role_idx
+#   (lex-sorted nlohmann ordering of `interface_roles` keys) straight
+#   to `rte_eth_tx_burst(port, ...)`. The F16.2 config therefore had to
+#   force the mirror role's lex rank to equal its DPDK port_id
+#   (`zz_mirror_port` -> lex idx 2 -> net_tap2 -> port_id 2).
 #
-#   DPDK assigns port_ids in --vdev cmdline order. Alignment recipe:
-#     --vdev cmdline order:
-#       net_tap0 iface=dtap_m16_ing    -> port 0 (ingress, scapy inject)
-#       net_tap1 iface=dtap_m16_egress -> port 1 (egress original)
-#       net_tap2 iface=dtap_m16_mirror -> port 2 (mirror clones)
-#     interface_roles:
-#       upstream_port    (u) -> vdev net_tap0 -> port_id 0 (worker RX)
-#       downstream_port  (d) -> vdev net_tap1 -> port_id 1 (worker TX)
-#       zz_mirror_port   (z) -> vdev net_tap2 -> port_id 2 (mirror dst)
-#     lex ordering of role KEYS (nlohmann default ordering):
-#       d=0, u=1, z=2
-#   Mirror-target role name is `zz_mirror_port` specifically so its
-#   lex rank (2) matches the --vdev cmdline rank of the mirror TAP
-#   (net_tap2 -> port_id 2). downstream_port / upstream_port role_idx
-#   values (0 / 1) are irrelevant on the hot path — they differ from
-#   their resolver port_ids (1 / 0 respectively) but the worker uses
-#   port_ids via lookup_role(), not role_idx. Anchor:
-#   grabli_nlohmann_json_order.md + tests/functional/test_f3_action.py
-#   :383-400.
+#   Post-C3.5: `populate_ruleset_eal` walks `rs.l{2,3,4}_actions[]` and
+#   translates `{redirect,mirror}_port` from role_idx to the live DPDK
+#   port_id via `rte_eth_dev_get_port_by_name`, so the role name can be
+#   anything. Natural ordering is used below (`mirror_port`) — no
+#   lex-rank workaround required. Memory
+#   `grabli_role_idx_as_port_id_bug.md` (FIXED in M16 C3.5). The
+#   non-lex regression twin lives at
+#   `tests/functional/test_f16_mirror_tap_nonlex.py`.
 #
 # RED/GREEN strategy:
 #   RED commit asserts an impossible threshold (`sent == 1000` on 50
@@ -207,12 +194,13 @@ def _tap_iface_up(iface: str, timeout: float = 5.0) -> bool:
     return False
 
 
-def _config_happy(mirror_role: str = "zz_mirror_port") -> dict:
+def _config_happy(mirror_role: str = "mirror_port") -> dict:
     """Happy-path config: three roles + one L4 ALLOW rule with mirror.
 
-    Role layout keeps role_idx == port_id per the module-level comment
-    (F3.9 pattern). `mirror_role` names the role the rule mirrors into;
-    defaults to `zz_mirror_port` (lex idx 2).
+    Post-M16 C3.5: role names are natural — `populate_ruleset_eal`
+    translates role_idx to DPDK port_id, so lex-rank alignment is no
+    longer required. `mirror_role` names the role the rule mirrors
+    into; defaults to `mirror_port`.
     """
     return {
         "version": 1,
@@ -223,11 +211,11 @@ def _config_happy(mirror_role: str = "zz_mirror_port") -> dict:
             # Resolver: downstream_port -> net_tap1 -> port_id 1
             # (worker TX, egress original forwards here).
             "downstream_port": {"vdev": "net_tap1"},
-            # Resolver: zz_mirror_port -> net_tap2 -> port_id 2
-            # (mirror destination). Its lex rank (2) == port_id (2) —
-            # this is the only role whose role_idx / port_id identity
-            # is load-bearing on the hot path (mirror_tx[] index).
-            "zz_mirror_port":  {"vdev": "net_tap2"},
+            # Resolver: mirror_port -> net_tap2 -> port_id 2
+            # (mirror destination). Post-C3.5 the populate step maps
+            # role_idx to this port_id via rte_eth_dev_get_port_by_name
+            # — no lex-rank alignment required.
+            "mirror_port":     {"vdev": "net_tap2"},
         },
         "default_behavior": "drop",
         "pipeline": {
@@ -493,14 +481,14 @@ class _F16MirrorHarness:
         self.prom_port = _extract_prom_port(self._lines)
         # Pull per-role port_ids from main.cpp's port_resolved events.
         # Fallback: vdev cmdline order -> port_ids 0/1/2 (upstream on
-        # net_tap0, downstream on net_tap1, zz_mirror_port on net_tap2).
+        # net_tap0, downstream on net_tap1, mirror_port on net_tap2).
         self.egress_port_id = (
             _resolved_port_id(self._lines, "downstream_port")
         )
         if self.egress_port_id is None:
             self.egress_port_id = 1
         self.mirror_port_id = (
-            _resolved_port_id(self._lines, "zz_mirror_port")
+            _resolved_port_id(self._lines, "mirror_port")
         )
         if self.mirror_port_id is None:
             self.mirror_port_id = 2
@@ -603,7 +591,7 @@ def test_f16_2_mirror_tap_happy_path():
     """Mirror verb end-to-end on net_tap profile.
 
     Fifty UDP packets matched by an L4 `action: mirror, target_port:
-    zz_mirror_port` rule: the ORIGINAL lands on `dtap_m16_egress`
+    mirror_port` rule: the ORIGINAL lands on `dtap_m16_egress`
     (worker.cpp forwards matched frames via tx_one to tx_port_id =
     downstream_port), and a CLONE lands on `dtap_m16_mirror` (D7
     dispatch + stage_mirror + mirror_drain). Counter witness:

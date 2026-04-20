@@ -24,15 +24,19 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <rte_errno.h>
+#include <rte_ethdev.h>
 #include <rte_fib.h>
 #include <rte_fib6.h>
 #include <rte_hash.h>
 #include <rte_ip6.h>
 #include <rte_jhash.h>
 
+#include "src/action/action.h"
 #include "src/compiler/rule_compiler.h"
+#include "src/ctl/port_resolver.h"
 
 namespace pktgate::ruleset {
 
@@ -69,6 +73,76 @@ std::uint64_t pack_l3_next_hop(const L3CompoundEntry& entry) {
                 "L3CompoundEntry must fit FIB next_hop slot");
   std::memcpy(&nh, &entry, sizeof(entry));
   return nh;
+}
+
+// -------------------------------------------------------------------------
+// M16 C3.5 — role_idx → DPDK port_id translation.
+//
+// Regression class: `RuleAction.{redirect,mirror}_port` carry the
+// compiler's `resolve_role_idx` lex-rank, but the hot path passes them
+// straight to `rte_eth_tx_burst(port, ...)` which expects a DPDK port_id.
+// Works only when role name lex-order coincides with the DPDK vdev
+// cmdline enumeration. Fix lands here because this is the first stage
+// that has access to both the CompileResult (role table) and an
+// initialised EAL (rte_eth_dev_get_port_by_name). The compiler stays
+// DPDK-free; D41 projections are unchanged (translation happens AFTER
+// the byte-identical lowering already covered by the static_assert pair
+// in `src/ruleset/builder.cpp`). Memory
+// `grabli_role_idx_as_port_id_bug.md`.
+//
+// Build a map `role_idx -> port_id` by walking `interface_roles` in
+// declaration order (the same order `resolve_role_idx` uses) and
+// looking each selector up via `rte_eth_dev_get_port_by_name`. If a
+// lookup fails, the slot is left at kNoPortId (0xFFFF) and the matching
+// RuleAction field keeps its pre-populate role_idx — backward-compat for
+// M4 C0-era unit tests whose configs use placeholder PciSelectors that
+// never registered with EAL (test_d41_eal_smoke, test_eal_unit).
+constexpr std::uint16_t kNoPortId = 0xFFFFu;
+
+std::vector<std::uint16_t> build_role_port_map(
+    const std::vector<config::InterfaceRole>& roles) {
+  std::vector<std::uint16_t> map(roles.size(), kNoPortId);
+  for (std::size_t i = 0; i < roles.size(); ++i) {
+    const std::string port_name =
+        ctl::port_name_from_selector(roles[i].selector);
+    std::uint16_t pid = 0;
+    if (rte_eth_dev_get_port_by_name(port_name.c_str(), &pid) == 0) {
+      map[i] = pid;
+    }
+  }
+  return map;
+}
+
+// Translate one port field carried by a RuleAction from compiler
+// role_idx semantics to live DPDK port_id semantics. No-op if:
+//   * The field is already the reserved sentinel (0xFFFF — "no target").
+//   * The role_idx is out of bounds for the role table (defensive).
+//   * The looked-up port_id for that role_idx is kNoPortId (selector
+//     did not resolve under this EAL instance).
+void translate_port_field(std::uint16_t& field,
+                          const std::vector<std::uint16_t>& role_port_map) {
+  if (field == 0xFFFFu) return;
+  if (field >= role_port_map.size()) return;
+  const std::uint16_t pid = role_port_map[field];
+  if (pid == kNoPortId) return;
+  field = pid;
+}
+
+// Walk an L{2,3,4}_actions arena and translate redirect_port / mirror_port
+// for verbs that consume them. Safe on zero-length arenas.
+void translate_layer_actions(action::RuleAction* actions,
+                             std::uint32_t n_rules,
+                             const std::vector<std::uint16_t>& role_port_map) {
+  if (actions == nullptr) return;
+  for (std::uint32_t i = 0; i < n_rules; ++i) {
+    auto& ra = actions[i];
+    const std::uint8_t verb = ra.verb;
+    if (verb == static_cast<std::uint8_t>(compiler::ActionVerb::kRedirect)) {
+      translate_port_field(ra.redirect_port, role_port_map);
+    } else if (verb == static_cast<std::uint8_t>(compiler::ActionVerb::kMirror)) {
+      translate_port_field(ra.mirror_port, role_port_map);
+    }
+  }
 }
 
 }  // namespace
@@ -314,6 +388,27 @@ EalPopulateResult populate_ruleset_eal(Ruleset& rs,
           }
         }
       }
+    }
+  }
+
+  // ---- M16 C3.5: role_idx -> DPDK port_id translation -------------------
+  //
+  // Walk the L{2,3,4}_actions arenas and translate
+  // `RuleAction.{redirect,mirror}_port` from compiler role_idx to the
+  // resolved DPDK port_id. This is the first site in the boot pipeline
+  // with both CompileResult in hand (cr.interface_roles) and a live EAL
+  // (rte_eth_dev_get_port_by_name). Translation is best-effort: roles
+  // whose selectors don't resolve keep the original role_idx (backward
+  // compat for placeholder-PCI unit tests). Hot-path pre-conditions
+  // (verb enum, sentinel semantics, ordering) are unchanged — the
+  // translation only overwrites `{redirect,mirror}_port` for
+  // kRedirect / kMirror verbs that successfully resolved.
+  {
+    const auto role_port_map = build_role_port_map(cr.interface_roles);
+    if (!role_port_map.empty()) {
+      translate_layer_actions(rs.l2_actions, rs.n_l2_rules, role_port_map);
+      translate_layer_actions(rs.l3_actions, rs.n_l3_rules, role_port_map);
+      translate_layer_actions(rs.l4_actions, rs.n_l4_rules, role_port_map);
     }
   }
 

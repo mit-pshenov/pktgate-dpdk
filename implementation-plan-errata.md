@@ -945,9 +945,72 @@ Canonical decision body: `review-notes.md §D41` + Amendment
 
 ---
 
-*Last updated: 2026-04-18 (D41 class closure — C1/C1b/C2 guard
-trilogy landed; three-axis coverage struct-drift + variant-drift
-+ orphan boot-path). Preceded by §Design.md bugs section removal —
-sole entry L4CompoundEntry size mismatch closed in design.md
-Round-2 batch revision commit `b0a3928`, finding F1+F6;
+## §M16 C3.5 — role_idx → port_id semantic drift fix (M7 regression)
+
+Latent bug present since M7 action dispatch: compiler lowered
+`resolve_role_idx` lex rank into `CompiledAction.redirect_port`,
+builder copied byte-identical into `RuleAction.redirect_port`,
+and the hot path passed that value directly to
+`rte_eth_tx_burst(port_id, ...)`. Worked only by coincidence when
+role-name lex order happened to match DPDK port enumeration. M16
+C2 extended the same bug to `mirror_port`. M16 C3 worker papered
+over it by forcing the mirror role to sort last (`zz_mirror_port`
+hack); memory anchor `grabli_role_idx_as_port_id_bug.md`.
+
+**Fix (M16 C3.5):** two-phase lowering of the port field.
+Compiler stores `role_idx`, builder copies verbatim, but
+`populate_ruleset_eal` walks `rs.l{2,3,4}_actions[]` after arenas
+are built and translates the field from `role_idx` to the
+resolved DPDK `port_id` via `rte_eth_dev_get_port_by_name(
+role.selector.name)`. Translation is confined to verbs
+`kRedirect` and `kMirror`; `0xFFFF` sentinel is preserved; roles
+whose selector doesn't resolve under the current EAL (placeholder
+PCI BDFs used in unit tests) leave the field unchanged at
+`role_idx` — backward-compat invariant for pre-M16 tests
+(notably `test_d41_eal_smoke.cpp`).
+
+**Plumbing:** `CompileResult` gains `interface_roles` (copy of
+`Config.interface_roles`); `populate_ruleset_eal` takes that
+input and builds a `role_idx → port_id` map in its anonymous
+namespace, then applies it in three layer walks. Helper
+`translate_port_field` is DRY across redirect + mirror. Doc
+comments on `RuleAction.{redirect,mirror}_port` describe the
+pre-populate vs post-populate dual semantic.
+
+**Tests GREEN:** RED commit `4d2b12a` (U16.12, U16.13, F16.4
+nonlex); natural `mirror_port` role name reinstated in
+`test_f16_mirror_tap.py` (`zz_` hack removed). D41 guard
+(`test_d41_guard.cpp` + `test_d41_eal_smoke.cpp`) continues
+passing — placeholder PCI selectors don't resolve, field stays
+at role_idx as the smoke test asserts.
+
+**Matrix evidence:** full 5-preset run per 2026-04-20 full-matrix
+amendment. dev-debug, dev-asan, dev-ubsan carry a pre-existing
+`functional.test_f7_inotify` flake (passes in isolation, fails
+under full-matrix inotify timing pressure); unrelated to C3.5
+codegen. dev-release and dev-tsan: 56/56 clean. No new atomics on
+hot path (translation is build-time, not dispatch-time); no
+tsan.supp growth (stays 16 lines); D33 canonical counter set
+unchanged at 41.
+
+Canonical anchors: `src/compiler/compiler.h::CompileResult`
+(new field), `src/compiler/object_compiler.cpp::compile` (propagation),
+`src/ruleset/builder_eal.cpp::populate_ruleset_eal` (translate
+walk + anon helpers), `src/action/action.h::RuleAction`
+(doc-comment dual semantic), memory
+`grabli_role_idx_as_port_id_bug.md` (now FIXED-with-SHA).
+
+*Origin: M16 C3 supervisor handoff debt; M16 C3.5 general-purpose
+worker + Pattern A supervision, 2026-04-20.*
+
+---
+
+*Last updated: 2026-04-20 (M16 C3.5 — role_idx → port_id
+translation fix; M7 latent bug closed, mirror C2/C3 paper-over
+reversed, natural role names restored). Preceded by 2026-04-18
+D41 class closure — C1/C1b/C2 guard trilogy landed; three-axis
+coverage struct-drift + variant-drift + orphan boot-path.
+Preceded by §Design.md bugs section removal — sole entry
+L4CompoundEntry size mismatch closed in design.md Round-2 batch
+revision commit `b0a3928`, finding F1+F6;
 `static_assert(sizeof(L4CompoundEntry) == 10)` now lives in §4.1.*

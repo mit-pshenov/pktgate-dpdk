@@ -274,7 +274,8 @@ if(NOT PKTGATE_FUZZ)
   # unordered_map symbols into pktgate_dp does not violate the
   # hot-path-zero-atomic invariant on the math archive.
   target_link_libraries(pktgate_dp PUBLIC
-      PkgConfig::DPDK pktgate_core pktgate_rl_ctl pktgate_runtime)
+      PkgConfig::DPDK pktgate_core pktgate_rl_ctl pktgate_runtime
+      pktgate_ports_ctl)
   pktgate_apply_warnings(pktgate_dp)
   pktgate_apply_sanitizer(pktgate_dp)
 endif()

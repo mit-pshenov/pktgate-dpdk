@@ -30,8 +30,22 @@ struct alignas(4) RuleAction {
   std::uint8_t  next_layer;      // 0=terminal | 3 | 4
   std::uint8_t  execution_tier;  // SW | HW (D4)
   std::uint8_t  flags;
-  std::uint16_t redirect_port;   // egress port idx (or 0xFFFF)
-  std::uint16_t mirror_port;
+  // M16 C3.5 dual semantic: `redirect_port` / `mirror_port` carry
+  // TWO different values across the build→populate pipeline. The
+  // compiler (src/compiler/object_compiler.cpp::resolve_role_idx) fills
+  // them with the `role_idx` — the declaration rank of the role name
+  // within `Config.interface_roles`. `populate_ruleset_eal`
+  // (src/ruleset/builder_eal.cpp) then walks the action arenas and
+  // translates each field to the live DPDK `port_id` via
+  // `rte_eth_dev_get_port_by_name`. Pre-populate: role_idx.
+  // Post-populate: DPDK port_id consumed by `rte_eth_tx_burst` on the
+  // hot path. Selectors that don't resolve under the current EAL (e.g.
+  // placeholder PCI BDFs in unit tests) leave the field unchanged at
+  // role_idx — backward-compat for pre-M16 tests. Sentinel `0xFFFF` is
+  // preserved across translation and means "no target" in both phases.
+  // Memory `grabli_role_idx_as_port_id_bug.md` (FIXED in M16 C3.5).
+  std::uint16_t redirect_port;   // pre-populate: role_idx; post-populate: DPDK port_id (0xFFFF sentinel preserved)
+  std::uint16_t mirror_port;     // pre-populate: role_idx; post-populate: DPDK port_id (0xFFFF sentinel preserved)
   std::uint8_t  dscp;            // 6-bit DSCP target (for TAG)
   std::uint8_t  pcp;             // 3-bit PCP (for TAG)
   std::uint16_t rl_index;        // index into rs->rl_actions[] (ruleset-scoped handle)

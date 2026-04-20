@@ -321,6 +321,16 @@ CompileResult compile(const config::Config& cfg,
   // Ruleset.default_action — see errata §M7 C2b.
   result.default_action = static_cast<std::uint8_t>(cfg.default_behavior);
 
+  // M16 C3.5 (grabli_role_idx_as_port_id_bug.md): propagate
+  // interface_roles through CompileResult. Declaration order is the
+  // semantic the compiler exposes via resolve_role_idx — storing the
+  // vector here lets `populate_ruleset_eal` translate role_idx values
+  // in `RuleAction.{redirect,mirror}_port` to live DPDK port_ids via
+  // `rte_eth_dev_get_port_by_name` without re-threading `config::Config`
+  // all the way through the builder. The copy is O(roles.size()) at
+  // compile time — a handful of entries in every realistic config.
+  result.interface_roles = cfg.interface_roles;
+
   // M16 C1 (D7 unlock, review-notes §D7 amendment 2026-04-20):
   // the previous scan-for-kMirror reject block is removed. Mirror is
   // now a lowered verb carried through compile -> build -> RuleAction
