@@ -129,6 +129,12 @@ _TAP_IFACES_TO_UNMANAGE = [
     # to the M15 cycle so it doesn't collide with M14 taps in a
     # shared session run.
     "dtap_m15_ing",
+    # M15 C4 — integration.test_m15_vhost_peer_crash. Separate ingress
+    # tap so C3 and C4 tests can cohabitate in a shared session without
+    # racing on each other's bring-up. Downstream is a vhost UDS.
+    # Short name: IFNAMSIZ is 16 incl NUL, so the 15-char budget
+    # rules out "dtap_m15_crash_ing" (18).
+    "dtap_m15c_ing",
 ]
 
 

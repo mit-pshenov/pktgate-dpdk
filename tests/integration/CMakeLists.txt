@@ -147,8 +147,24 @@ if(PYTEST_EXECUTABLE)
     ENVIRONMENT "PKTGATE_BINARY=${_binary}"
     TIMEOUT 240
   )
+
+  # M15 C4 — peer-crash chaos (F15.4). Extends the C3 pair harness with
+  # a mid-burst SIGKILL of the virtio-user consumer; asserts pktgate
+  # survives and tx_dropped_total{port=<vhost_id>} climbs. No new
+  # counter families — the M14 C3 backend-agnostic family covers
+  # vhost peer-gone by construction.
+  add_test(
+    NAME integration.test_m15_vhost_peer_crash
+    COMMAND ${PYTEST_EXECUTABLE} -xvs "${_test_dir}/test_m15_vhost_peer_crash.py"
+  )
+  set_tests_properties(integration.test_m15_vhost_peer_crash PROPERTIES
+    LABELS "integration;chaos"
+    ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+    TIMEOUT 240
+  )
 else()
   message(STATUS
-    "pytest not found — integration.test_m15_vhost_pair will be skipped"
+    "pytest not found — integration.test_m15_vhost_pair + "
+    "integration.test_m15_vhost_peer_crash will be skipped"
   )
 endif()
