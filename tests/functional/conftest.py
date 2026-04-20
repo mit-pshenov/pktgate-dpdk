@@ -147,6 +147,17 @@ _TAP_IFACES_TO_UNMANAGE = [
     # for every role (RED test for the populate_ruleset_eal translation
     # step). All names 14 chars (IFNAMSIZ budget).
     "dtap_m16nl_ing", "dtap_m16nl_egr", "dtap_m16nl_mir",
+    # M16 C4 — chaos.test_m16_mirror_port_gone. Three dtaps; mid-stream
+    # the mirror tap's link is brought down to force rte_eth_tx_burst
+    # short-burst drains on the mirror drain path. Separate dtap names
+    # from the C3 / C3.5 / C5 cycles so all of them co-exist in one
+    # shared session. All names 13 chars (IFNAMSIZ budget).
+    "dtap_m16c_ing", "dtap_m16c_egr", "dtap_m16c_mir",
+    # M16 C4 — chaos.test_m16_mirror_mempool_exhaust. Three dtaps;
+    # tiny mbuf pool forces rte_pktmbuf_copy to return null, bumping
+    # mirror_clone_failed_total. Namespaced distinct from
+    # port_gone so tests are session-safe back-to-back.
+    "dtap_m16m_ing", "dtap_m16m_egr", "dtap_m16m_mir",
 ]
 
 

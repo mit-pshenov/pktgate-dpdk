@@ -45,3 +45,45 @@ set_tests_properties(chaos.test_x1_reload_storm PROPERTIES
   ENVIRONMENT "PKTGATE_BINARY=${_binary}"
   TIMEOUT 300
 )
+
+# M16 C4 — chaos part 1: mirror destination link-down mid-burst.
+#
+# Three-tap harness boots pktgate with an L4 mirror rule. A sustained
+# 1000-packet / 100 Hz stream is injected on the ingress tap; ~300
+# packets in, the mirror destination's kernel-side link is brought
+# down via `ip link set dtap_m16c_mir down` with txqueuelen=1. The
+# drain side of the D16 mirror staging now sees rte_eth_tx_burst
+# short-bursting frames, bumping `pktgate_mirror_dropped_total{port}`.
+# Originals continue flowing on the independent egress stage path.
+#
+# Timeout sized for dev-tsan: ~10 s inject + ~2.5 s drain + 15 s
+# boot + 2-5× TSAN slowdown factor. 200 s is comfortable headroom.
+add_test(
+  NAME chaos.test_m16_mirror_port_gone
+  COMMAND ${PYTEST_EXECUTABLE} -xvs
+          "${_test_dir}/test_m16_mirror_port_gone.py"
+)
+set_tests_properties(chaos.test_m16_mirror_port_gone PROPERTIES
+  LABELS "chaos"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 200
+)
+
+# M16 C4 — chaos part 2: mirror mempool exhaustion.
+#
+# Tiny mbuf pool forces rte_pktmbuf_copy to fail on a fast 1000-packet
+# burst, bumping `pktgate_mirror_clone_failed_total{port}`. Mempool
+# sizing is controlled via PKTGATE_TEST_MBUF_POOL_SIZE (test-only env
+# var); the knob is NOT yet wired in src/main.cpp — the RED commit
+# pytest.skips with an explicit reason, and the GREEN cycle lands the
+# one-line env override + flips the threshold-impossible assertions.
+add_test(
+  NAME chaos.test_m16_mirror_mempool_exhaust
+  COMMAND ${PYTEST_EXECUTABLE} -xvs
+          "${_test_dir}/test_m16_mirror_mempool_exhaust.py"
+)
+set_tests_properties(chaos.test_m16_mirror_mempool_exhaust PROPERTIES
+  LABELS "chaos"
+  ENVIRONMENT "PKTGATE_BINARY=${_binary}"
+  TIMEOUT 200
+)

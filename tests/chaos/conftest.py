@@ -25,3 +25,7 @@ _spec.loader.exec_module(_mod)
 
 # Re-export the pytest fixture so chaos tests can request it by name.
 pktgate_process = _mod.pktgate_process
+# M16 C4 — chaos.test_m16_mirror_* need the session-scoped NM keyfile
+# fixture too; re-export it the same way pktgate_process is re-exported.
+# Without this the chaos tests see "fixture 'nm_unmanaged_tap' not found".
+nm_unmanaged_tap = _mod.nm_unmanaged_tap
