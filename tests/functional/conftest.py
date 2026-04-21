@@ -48,6 +48,71 @@ def pktgate_eal_driver_args():
     return []
 
 
+# ---------------------------------------------------------------------------
+# Preset detection + sanitiser-aware scaling helpers (Post-M16 debt C1)
+# ---------------------------------------------------------------------------
+#
+# Recurring F7.3 (and neighbour F7.2/F7.6) flakes under the full 5-preset
+# matrix traced to a hard-coded 4.0 s settle deadline in
+# tests/functional/test_f7_inotify.py::_final_reload_count. Under dev-tsan
+# the inotify → debounce → deploy chain routinely straddles that window
+# when the VM is busy with back-to-back matrix runs; solo reruns are
+# 100% GREEN because the binary is not competing for CPU/IO.
+#
+# Fix: detect the active preset via the PKTGATE_BINARY env var (set by
+# CMake; path format `.../build/dev-<preset>/pktgate_dpdk`) and scale the
+# polling deadline by a preset-specific multiplier. The wait is an upper
+# bound — no-op when the event arrives early — so scaling up on slower
+# presets costs nothing on fast ones and removes the known flake class.
+#
+# Memory: grabli_f7_inotify_settle_flake.md (closed by this cycle).
+
+# Multipliers chosen from empirical matrix observations: dev-tsan binaries
+# run ~2-5× slower end-to-end through the control-plane reload chain under
+# full-matrix back-to-back load; dev-asan/ubsan 1.5-3×; dev-debug is
+# instrumentation-free but -O0 + no NDEBUG; dev-release is baseline.
+_PRESET_DEADLINE_MULTIPLIERS = {
+    "dev-tsan":    4.0,
+    "dev-asan":    3.0,
+    "dev-ubsan":   3.0,
+    "dev-debug":   1.5,
+    "dev-release": 1.0,
+}
+
+
+def pktgate_test_preset():
+    """Return the active preset name (e.g. "dev-tsan") or None.
+
+    Inferred from the path component of $PKTGATE_BINARY, which CMake sets
+    to `${CMAKE_BINARY_DIR}/pktgate_dpdk` — i.e. `build/<preset>/pktgate_dpdk`.
+    Returns None if the env var is unset (ad-hoc pytest invocation) or the
+    path does not match any known preset.
+    """
+    env_path = os.environ.get("PKTGATE_BINARY", "")
+    if not env_path:
+        return None
+    # Scan for "build/<preset>/" segment.
+    parts = env_path.split(os.sep)
+    for i, part in enumerate(parts):
+        if part == "build" and i + 1 < len(parts):
+            candidate = parts[i + 1]
+            if candidate in _PRESET_DEADLINE_MULTIPLIERS:
+                return candidate
+    return None
+
+
+def pktgate_test_deadline_scale():
+    """Return a float multiplier to apply to sanitiser-sensitive test
+    timeouts (e.g. polling deadlines for inotify→deploy chains).
+
+    Default 1.0 when the preset is unknown (conservative — caller's base
+    deadline is unchanged)."""
+    preset = pktgate_test_preset()
+    if preset is None:
+        return 1.0
+    return _PRESET_DEADLINE_MULTIPLIERS.get(preset, 1.0)
+
+
 def _strip_legacy_driver_flag(eal_args):
     """Remove any inline `-d <path>` pair that predates the opt-in helper.
 

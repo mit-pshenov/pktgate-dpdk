@@ -22,6 +22,8 @@ import time
 
 import pytest
 
+from conftest import pktgate_test_deadline_scale
+
 
 DPDK_DRIVER_DIR = os.environ.get(
     "DPDK_DRIVER_DIR", "/home/mit/Dev/dpdk-25.11/build/drivers/"
@@ -320,11 +322,25 @@ def _final_reload_count(port, baseline_reload, baseline_gen,
     then return the final (reload_n, gen_n). Different from
     wait_for_reload_bump — this one lets the debounce+deploy chain
     fully settle, even if the final count is > baseline+1 (F7.5 bound)
-    or == baseline (F7.3 negative assertion)."""
+    or == baseline (F7.3 negative assertion).
+
+    Deadline is scaled by the active preset via `pktgate_test_deadline_scale()`
+    (see conftest.py for rationale: dev-tsan ×4.0, dev-asan/ubsan ×3.0,
+    dev-debug ×1.5, dev-release ×1.0). Closes the recurring F7.2/F7.3/F7.6
+    flake class under full 5-preset matrix back-to-back load
+    (grabli_f7_inotify_settle_flake.md, Post-M16 debt C1)."""
+    scale = pktgate_test_deadline_scale()
     last_reload = baseline_reload
     last_gen = baseline_gen
     last_change = time.monotonic()
-    deadline = time.monotonic() + max(4.0, settle_s + 3.0)
+    # Base floor 8.0 s (was 4.0 s before Post-M16 C1) — even dev-debug on
+    # the idle VM has been observed to take 8-9 s through boot + open +
+    # partial write + close + deploy under full-matrix back-to-back load.
+    # Multiplied by `scale` so sanitiser builds get proportionally more
+    # headroom. Upper bound only: early return on settle, so no cost to
+    # fast runs.
+    base_deadline = max(8.0, settle_s + 6.0)
+    deadline = time.monotonic() + base_deadline * scale
     while time.monotonic() < deadline:
         reload_n, gen_n = scrape_reload_counters(port)
         if reload_n is None:

@@ -1003,11 +1003,55 @@ walk + anon helpers), `src/action/action.h::RuleAction`
 *Origin: M16 C3 supervisor handoff debt; M16 C3.5 general-purpose
 worker + Pattern A supervision, 2026-04-20.*
 
+## Post-M16 Debt C1 — f7_inotify settle hardening (2026-04-21)
+
+Recurring first-pass flake on `functional.test_f7_inotify` F7.2 /
+F7.3 / F7.6 during M16 exit-gate full-matrix runs traced to a
+hard-coded 4.0 s polling deadline in
+`tests/functional/test_f7_inotify.py::_final_reload_count`. Under
+full 5-preset back-to-back load the inotify → debouncer → validator
+→ compile → swap chain routinely straddled that window on dev-debug
+as well as the sanitiser presets (not a tsan-only race — the matrix
+load itself stretches the control plane independently of
+instrumentation). Isolated reruns were 100% GREEN, matching the
+`grabli_f7_inotify_settle_flake.md` signature.
+
+Fix: tests-only change (zero `src/` diff). New conftest.py helper
+`pktgate_test_deadline_scale()` infers the active preset from the
+`PKTGATE_BINARY` path segment (`build/<preset>/pktgate_dpdk`) and
+returns a multiplier — dev-tsan ×4.0, dev-asan/ubsan ×3.0, dev-debug
+×1.5, dev-release ×1.0, unknown ×1.0. `_final_reload_count`
+multiplies its polling deadline by that scale, and the base floor
+was bumped from 4.0 s → 8.0 s (observed dev-debug F7.3 walltime of
+8.57 s under matrix load — the old floor was too tight even with a
+1.5× multiplier). Deadline is an upper bound — the helper returns
+early as soon as the quiescence window fires — so scaling costs
+nothing on fast happy-path runs.
+
+Acceptance: 3 × 5-preset matrix (15 runs total, all `ctest -j 1 -L
+'unit|functional|smoke|integration|chaos'`). f7_inotify 15/15 GREEN
+first-pass; overall 14/15 at 59/59, one run (R1 dev-asan) at 58/59
+on the orthogonal F2.25 ICMPv6 NDP flake (`grabli_f2_25_icmpv6_ndp_flake.md`,
+explicitly deferred in `scratch/post-m16-debt-handoff.md §Scope
+OUT`; debt-C2 candidate, not C1 scope). `scripts/check-counter-consistency.sh`
+remains exit 0 with `kAllCounterNames=41` untouched; no tsan.supp /
+lsan.supp growth; no `xfail` decorators.
+
+Canonical anchors: `tests/functional/conftest.py` (new helpers
+`pktgate_test_preset` + `pktgate_test_deadline_scale`),
+`tests/functional/test_f7_inotify.py::_final_reload_count` (scale
++ base-floor bump), memory `grabli_f7_inotify_settle_flake.md` (now
+CLOSED-with-SHA).
+
+*Origin: Post-M16 debt handoff C1; worker dispatch 2026-04-21.*
+
 ---
 
-*Last updated: 2026-04-20 (M16 C3.5 — role_idx → port_id
+*Last updated: 2026-04-21 (Post-M16 debt C1 — f7_inotify settle
+hardening; deadline scaled by preset + base floor 4→8 s, zero src
+diff). Preceded by 2026-04-20 M16 C3.5 role_idx → port_id
 translation fix; M7 latent bug closed, mirror C2/C3 paper-over
-reversed, natural role names restored). Preceded by 2026-04-18
+reversed, natural role names restored. Preceded by 2026-04-18
 D41 class closure — C1/C1b/C2 guard trilogy landed; three-axis
 coverage struct-drift + variant-drift + orphan boot-path.
 Preceded by §Design.md bugs section removal — sole entry
