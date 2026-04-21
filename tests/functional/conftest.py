@@ -266,6 +266,106 @@ def nm_unmanaged_tap():
             pass
 
 
+# ---------------------------------------------------------------------------
+# Post-M16 debt C2 — kernel IPv6 NDP preempt for dtap_* functional ifaces
+# ---------------------------------------------------------------------------
+#
+# F2.25 (test_f2_25_l4_icmpv6_match) flakes under full 5-preset matrix:
+# rule 4009 asserts matched_packets==1 for ICMPv6 type=135 (NS), but
+# occasionally observes 2 because the kernel's IPv6 ndisc subsystem emits
+# its own Neighbor Solicitation on the dtap_* iface inside the scapy
+# inject/capture window. The NM-unmanaged keyfile fixture above suppresses
+# DHCP, but kernel NDP (RFC 4861 ndisc.c) is independent of NM — it fires
+# on any UP iface with IPv6 enabled.
+#
+# Initial scope was tsan-only; on 2026-04-21 the flake reappeared on
+# dev-asan during Post-M16 debt C1 acceptance (58/59 R1). Blast radius
+# expanded → user-authorised mitigation.
+#
+# Fix: session-scoped global kill-switch on IPv6 for the pytest session.
+# `net.ipv6.conf.default.disable_ipv6` applies as the default for all
+# future netdevs — every dtap the pktgate_dpdk binary opens inherits
+# disable_ipv6=1 declaratively (same shape as the NM keyfile). `conf.all`
+# additionally turns IPv6 off on already-existing ifaces. Per-iface
+# sysctl (as the handoff template originally suggested) does NOT work
+# here: dtap_* netdevs are created by the DPDK binary under test, *after*
+# pytest_sessionstart, so a per-iface write at session setup would hit
+# "No such file or directory".
+#
+# Dev VM scope (M1 — VM is a sandbox): touching `conf.all` on the host
+# is acceptable. On CI/prod this would be surprising, but the fixture
+# lives in tests/functional and runs only during pytest sessions. The
+# session finalizer restores the prior values (not just reset-to-0) so
+# a host that already had IPv6 disabled for its own reasons is not
+# silently re-enabled when the test run ends.
+#
+# Autouse=True (vs. the NM fixture's autouse=False): NDP emission can
+# hit *any* dtap_* iface with IPv6 on, not only F2 taps. A global
+# switch is the same rationale as `conf.default`: one knob applied
+# session-wide beats iface-specific pytestmark'ы на каждом модуле.
+#
+# Memory: grabli_f2_25_icmpv6_ndp_flake.md, grabli_nm_unmanaged_tap.md.
+
+_IPV6_SYSCTL_KEYS = (
+    "net.ipv6.conf.default.disable_ipv6",
+    "net.ipv6.conf.all.disable_ipv6",
+)
+
+
+def _read_sysctl(key):
+    """Return the current sysctl value as a string, or None on failure."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", key],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return out.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _write_sysctl(key, value):
+    """Best-effort `sysctl -w key=value`. Returns True on success."""
+    try:
+        subprocess.run(
+            ["sudo", "sysctl", "-w", f"{key}={value}"],
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def kernel_ipv6_ndp_preempt():
+    """Session-scoped global IPv6 disable on host to stop kernel NDP
+    emission on dtap_* functional-test interfaces.
+
+    See module-level rationale block above. Idempotent: captures the
+    prior sysctl values at setup and restores them at teardown (so a
+    host that independently runs with IPv6 disabled is not silently
+    re-enabled when the session ends).
+    """
+    # Capture pre-session state per-key. If readback fails for a key,
+    # skip write-and-restore for that key — best-effort on non-root CI.
+    saved = {}
+    for key in _IPV6_SYSCTL_KEYS:
+        prior = _read_sysctl(key)
+        if prior is None:
+            continue
+        ok = _write_sysctl(key, "1")
+        if ok:
+            saved[key] = prior
+    yield
+    # Restore in original order; silent on failure (teardown is
+    # best-effort — host reboot would clear these anyway).
+    for key, prior in saved.items():
+        _write_sysctl(key, prior)
+
+
 def find_binary():
     """Find the pktgate_dpdk binary. Prefers PKTGATE_BINARY env var (set by
     CMake) so ctest runs the binary matching the active preset."""
