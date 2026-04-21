@@ -1045,6 +1045,67 @@ CLOSED-with-SHA).
 
 *Origin: Post-M16 debt handoff C1; worker dispatch 2026-04-21.*
 
+## Post-M16 Debt C2 — F2.25 NDP sysctl preempt (2026-04-21)
+
+Recurring flake on `functional.test_f2_25_l4_icmpv6_match`: rule 4009
+asserts `matched_packets == 1` for ICMPv6 type=135 (Neighbor
+Solicitation), but under full 5-preset matrix load the kernel's own
+`ndisc` subsystem emits NS packets on the `dtap_*` iface inside the
+scapy inject/capture window and the assertion sees 2. Originally
+tsan-only (M13 C2), reappeared on dev-asan in D41 C1 run (2026-04-18,
+single retry-green) and Post-M16 debt C1 acceptance R1 (2026-04-21,
+same pattern). Blast radius `tsan → asan` reconfirmed → mitigation
+dispatched. The existing NM-unmanaged keyfile (`grabli_nm_unmanaged_tap.md`)
+suppresses DHCP, but kernel NDP (RFC 4861 `ndisc.c`) is independent of
+NetworkManager — it fires on any UP iface with IPv6 enabled.
+
+Fix: tests-only change (zero `src/` diff). New session-scoped,
+`autouse=True` fixture `kernel_ipv6_ndp_preempt` in
+`tests/functional/conftest.py` sets
+`net.ipv6.conf.default.disable_ipv6=1` and `conf.all.disable_ipv6=1`
+at session start, restoring the prior values at teardown.
+`conf.default` applies as the default for all future netdevs — every
+`dtap_*` created by the DPDK binary under test inherits
+`disable_ipv6=1` declaratively, same shape as the NM keyfile.
+`conf.all` covers already-existing ifaces. Per-iface sysctl (as the
+handoff template originally proposed) does NOT work here: `dtap_*`
+netdevs are created by the DPDK binary *after* `pytest_sessionstart`,
+so a per-iface write at setup time would fail with ENOENT. User-
+authorised divergence from handoff template 2026-04-21. Scope is dev
+VM only (M1 sandbox); prod NICs (E810/XL710/mlx5) do not use TAP
+vdevs, so the flake does not exist on production hardware.
+
+Acceptance (evidence protocol per M11 C1.5 + M10 C5):
+
+- Pre-fix baseline: **5 back-to-back full-matrix runs** (25 preset-runs
+  total); 2 F2.25 fails (run 4 dev-release + run 5 dev-debug) = 8%
+  occurrence rate per preset-run, 40% per run.
+- Post-fix stability: **3 back-to-back full-matrix runs** (15 preset-
+  runs); **0 F2.25 fails** (C2 GREEN gate met).
+- `./scripts/check-counter-consistency.sh` exit 0, kAllCounterNames=41
+  unchanged. `tests/tsan.supp` and `tests/lsan.supp` unchanged (F2.25
+  is not a sanitizer-class issue).
+- Per-preset postfix R3 tallies: dev-debug 95% / dev-release 92% /
+  dev-asan 93% / dev-ubsan 97% / dev-tsan 92%. None of the FAILED
+  lists contain `test_f2_l4` (F2.25's module).
+- Orthogonal flakes surfaced during the 8-run matrix sweep (U7_X2
+  shutdown-join, F8.13 slow_reader, F7.2 atomic_rename, F16.2 mirror
+  happy path, F16 nonlex, chaos.x1_reload_storm, F3 action/ratelimit,
+  integration.test_reload, one test_boot) observed at same-or-higher
+  frequency in baseline vs postfix → NOT introduced by C2; saved to
+  memory `grabli_c2_baseline_orthogonal_flakes.md` for follow-up
+  supervisor/consultant triage.
+
+Canonical anchors: `tests/functional/conftest.py` (+100 LoC:
+`_IPV6_SYSCTL_KEYS`, `_read_sysctl` / `_write_sysctl` helpers,
+`kernel_ipv6_ndp_preempt` session fixture with prior-value restore),
+memory `grabli_f2_25_icmpv6_ndp_flake.md` (now CLOSED-with-SHA).
+
+*Origin: Post-M16 debt handoff C2; worker dispatch 2026-04-21
+(general-purpose agent did edit + launched baseline loop; supervisor
+ran 8 full-matrix runs via ssh + bash loop on dev VM + closed
+evidence).*
+
 ---
 
 *Last updated: 2026-04-21 (Post-M16 debt C1 — f7_inotify settle
