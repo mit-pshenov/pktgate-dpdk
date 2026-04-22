@@ -62,26 +62,38 @@ pre-freeze, если изменим формат, version станет 2.
 | `vdev` | `"net_tap0,iface=dtap0"` / `"net_vhost0,iface=/run/pktgate/vhost.sock"` | TAP / vhost-user profiles. Аргументы должны совпадать с `--vdev=` в EAL argv. |
 | `name` | `"net_vhost0"` | Lookup по имени порта после probe'а. Use case редкий, обычно достаточно `vdev`. |
 
-`dst_subnet` / `interface` в rules — это **unresolved references**, валидатор
-мэппит их на entry из `interface_roles` / `objects.subnets`; dangling ref →
-`kUnresolvedInterfaceRef` / `kUnresolvedObject`.
-
 ## pipeline и rules
 
 Pipeline содержит три массива — `layer_2`, `layer_3`, `layer_4`. Каждый
 массив — упорядоченный список rules. Порядок **значимый**: first-match-wins
 внутри слоя.
 
-### Правила layer transition (D22, валидатор)
+### Правила layer transition
 
-Pipeline — строго L2 → L3 → L4, без backward/same/skip:
+Pipeline — строго L2 → L3 → L4, без backward/same/skip. `next_layer` —
+**явная advancement-директива**:
 
-- `layer_2` rule может завершиться (ALLOW/DROP/…) или идти на L3 (`next_layer: "l3"`).
-- `layer_3` rule может завершиться или идти на L4 (`next_layer: "l4"`).
-- `layer_4` rule всегда терминальный.
-- Неправомерный `next_layer` (например, `"l3"` на L3 rule) → `kInvalidLayerTransition`.
+- Если поле **отсутствует** — rule **терминальный** на своём слое. Action
+  применяется, пакет не идёт дальше. Это касается и `action: allow` —
+  без `next_layer: "l3"` L2-ALLOW **не** передаёт пакет на L3.
+- `layer_2` rule может нести `next_layer: "l3"` → продолжить в L3.
+- `layer_3` rule может нести `next_layer: "l4"` → продолжить в L4.
+- `layer_4` rule всегда терминальный; любой `next_layer` → `kInvalidLayerTransition`.
+- Неправомерный `next_layer` (например, `"l3"` на L3 rule или `"l4"` на L2)
+  → `kInvalidLayerTransition`.
 
-Если `next_layer` не указан — default зависит от слоя: L2→L3, L3→L4, L4 — всегда terminal.
+**Типичная ошибка**: L2-rule с `action: allow` и без `next_layer` при
+`default_behavior: drop` — пакет смэтчится, allow применится (терминально),
+и **дальше не пойдёт**, но и не дропнется — см. invariant в `src/dataplane/classify_l2.cpp`.
+Если L2-слой используется только для selectivity фильтра, а матч должен
+делаться на L3/L4 — либо ставить `next_layer: "l3"` на L2-ALLOW, либо не
+писать L2-правило вообще.
+
+### Validation references
+
+`dst_subnet` / `interface` в rules — **unresolved references**; валидатор
+мэппит их на entry из `interface_roles` / `objects.subnets`. Dangling ref →
+`kUnresolvedInterfaceRef` / `kUnresolvedObject`.
 
 ### Общая структура rule
 
@@ -252,10 +264,10 @@ Per-lcore bucket означает ~10-20% aggregate rate error при skewed RSS
 ```
 
 Non-terminal mirror: пакет копируется на `target_port`, оригинал продолжает
-pipeline (в M16 — deep-copy, не refcnt zero-copy; D26 compile-time gate).
-Back-pressure на slow consumer'е: после ~1k accumulated тиков на mirror TX
-ring дропается копия (не оригинал), бамп `pktgate_mirror_dropped_total`. См.
-`docs/observability.md`.
+pipeline. В Phase 2 — deep-copy; refcnt zero-copy — post-MVP (см.
+`docs/limitations.md`). Back-pressure на slow consumer'е: после ~1k
+accumulated тиков на mirror TX ring дропается копия (не оригинал), бамп
+`pktgate_mirror_dropped_total`. См. `docs/observability.md`.
 
 ## default_behavior
 

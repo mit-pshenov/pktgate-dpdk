@@ -59,7 +59,7 @@ cmake --preset dev-release
 cmake --build build/dev-release -j
 
 # Binary:
-ls -la build/dev-release/pktgate
+ls -la build/dev-release/pktgate_dpdk
 ```
 
 CMake presets (`CMakePresets.json`):

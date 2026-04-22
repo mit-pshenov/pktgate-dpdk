@@ -33,7 +33,11 @@ publisher tick (zero atomics, D1-clean).
 ## Семейство port (9)
 
 Per-port stats, включая DPDK-level RX/TX и собственные backpressure
-counter'ы pktgate'а (D43).
+counter'ы pktgate'а. `pktgate_tx_dropped_total` и
+`pktgate_port_tx_dropped_total` — **два имени не опечатка**: первое
+считается pktgate-wrapper'ом вокруг `rte_eth_tx_burst`, второе — PMD-level
+drop, репортуемый самим DPDK в `rte_eth_stats`. В stable state числа
+совпадают; расхождение — сигнал что hook не покрыл какой-то TX path.
 
 | Name | Type | Labels | Семантика / триггер внимания |
 |---|---|---|---|
@@ -121,8 +125,13 @@ funnel'ятся сюда.
 
 ## Recommended alerts
 
+Правила ниже используют **только** exposed-метрики Phase 1 — скопировать
+в Prometheus rules и они сработают сразу. Alerts, которые зависят от
+exposed: no метрик (lcore latency histogram, mempool gauge'и), вынесены
+отдельным блоком «Deferred alerts» ниже.
+
 ```yaml
-# Prometheus rules примеры.
+# Prometheus rules примеры (Phase 1 — только exposed метрики).
 
 - alert: PktgatePortDown
   expr: pktgate_port_link_up == 0
@@ -136,20 +145,29 @@ funnel'ятся сюда.
   annotations:
     summary: "RX drops on port {{ $labels.port }} > 10 pps sustained"
 
+- alert: PktgateTxBackpressure
+  expr: rate(pktgate_tx_burst_short_total[1m]) / rate(pktgate_port_tx_packets_total[1m]) > 0.1
+  for: 2m
+  annotations:
+    summary: "TX burst short ratio > 10% on port {{ $labels.port }} (peer too slow)"
+
 - alert: PktgateReloadFailing
   expr: rate(pktgate_reload_total{result!="success"}[5m]) > 0
   for: 2m
   annotations:
     summary: "Reloads failing (kind={{ $labels.result }})"
 
-- alert: PktgateLatencyBudget
-  expr: |
-    histogram_quantile(0.99,
-      rate(pktgate_lcore_cycles_per_burst_bucket[5m])
-    ) * 1e9 / pktgate_tsc_hz > 500000
-  for: 2m
+- alert: PktgateReloadLatencyHigh
+  expr: pktgate_reload_latency_seconds > 1
+  for: 1m
   annotations:
-    summary: "p99 burst latency > 500µs (N2 SLO breach)"
+    summary: "Last reload took >1s (QSBR settle slow or worker stuck)"
+
+- alert: PktgatePublisherLag
+  expr: (pktgate_active_generation - pktgate_publisher_generation) > 0
+  for: 30s
+  annotations:
+    summary: "publisher behind active generation by {{ $value }} — publisher stuck"
 
 - alert: PktgateMirrorBackpressure
   expr: rate(pktgate_mirror_dropped_total[5m]) > 0
@@ -157,17 +175,54 @@ funnel'ятся сюда.
   annotations:
     summary: "Mirror peer slow — clones dropped on {{ $labels.target_port }}"
 
-- alert: PktgateMempoolExhaustion
-  expr: pktgate_mempool_free / (pktgate_mempool_in_use + pktgate_mempool_free) < 0.1
-  for: 1m
+- alert: PktgateRedirectDropping
+  expr: rate(pktgate_redirect_dropped_total[5m]) > 0
+  for: 2m
   annotations:
-    summary: "mempool <10% free — dataplane drops imminent"
+    summary: "redirect TX ring full on {{ $labels.target_port }} — target underprovisioned"
 
 - alert: PktgateUnreachableBranch
   expr: increase(pktgate_lcore_dispatch_unreachable_total[5m]) > 0
   for: 0s
   annotations:
     summary: "software bug — dispatch unreachable branch hit on lcore {{ $labels.lcore }}"
+
+- alert: PktgatePktTruncated
+  expr: rate(pktgate_lcore_pkt_truncated_total[5m]) > 0
+  for: 5m
+  annotations:
+    summary: "truncated frames on lcore {{ $labels.lcore }} — check upstream MTU/cables"
+```
+
+### Deferred alerts (требуют Phase 2 wiring)
+
+Метрики ниже объявлены в manifest'е, но **не** эмитятся в Phase 1
+`/metrics` (см. `exposed: no` в таблицах выше). Alerts-шаблоны даны для
+совместимости с будущим wiring'ом; **в текущем build'е эти expr вернут
+no-data**.
+
+```yaml
+# НЕ ГОТОВО в Phase 1 — включать после phase 2 wiring.
+
+# Требует lcore_cycles_per_burst histogram emit (manifest-only).
+# Также нужен pktgate_tsc_hz gauge — сейчас tsc_hz кэшируется в WorkerCtx,
+# метрикой не экспонируется. Альтернатива: забрать tsc_hz через
+# dpdk-telemetry.py /eal/tsc_hz и использовать как константу recording-правила.
+- alert: PktgateLatencyBudget
+  expr: |
+    histogram_quantile(0.99,
+      rate(pktgate_lcore_cycles_per_burst_bucket[5m])
+    ) * 1e9 / on() group_left() tsc_hz > 500000
+  for: 2m
+  annotations:
+    summary: "p99 burst latency > 500µs (N2 SLO breach)"
+
+# Требует mempool gauge emit (DPDK telemetry /mempool/info работает сейчас).
+- alert: PktgateMempoolExhaustion
+  expr: pktgate_mempool_free / (pktgate_mempool_in_use + pktgate_mempool_free) < 0.1
+  for: 1m
+  annotations:
+    summary: "mempool <10% free — dataplane drops imminent"
 ```
 
 ## PromQL cookbook
@@ -185,13 +240,26 @@ rate(pktgate_rule_drops_total[5m]) /
 ignoring(rule_id) group_left sum(rate(pktgate_rule_packets_total[5m]))
 ```
 
-Per-lcore load balance (должен быть ровный при symmetric RSS):
+RX-to-TX pipe efficiency (должен быть ~1 при идеальной пропускной):
 
 ```promql
-rate(pktgate_lcore_packets_total[1m])
+rate(pktgate_port_tx_packets_total[1m]) /
+rate(pktgate_port_rx_packets_total[1m])
 ```
 
-Skew > 20% между lcore'ами → RSS key не симметричный или hot flow на одной очереди.
+Доля фрагментированного трафика (bump `drop`-политикой можно проверить
+побочный эффект без перезапуска):
+
+```promql
+rate(pktgate_lcore_pkt_frag_skipped_total[5m]) +
+rate(pktgate_lcore_pkt_frag_dropped_total[5m])
+```
+
+**Per-lcore load balance** (RSS-симметрия): `pktgate_lcore_packets_total`
+в Phase 1 не wired — fallback через `pktgate_rule_packets_total` по
+rule_id не работает (rule_id агрегирует через lcore'ы). До Phase 2 —
+использовать `perf stat -e instructions` per-thread или DPDK telemetry
+`/eal/lcore_list`.
 
 ## Формат экспорта
 
@@ -222,6 +290,6 @@ TSC-based bucket'ы для `lcore_cycles_per_burst` — bounds в cycles, не
 - [ ] `rate(pktgate_port_rx_dropped_total[5m]) == 0` — нет backpressure
 - [ ] `pktgate_active_generation > 0` и `pktgate_publisher_generation == pktgate_active_generation`
 - [ ] `pktgate_lcore_dispatch_unreachable_total == 0` — no software bug hits
-- [ ] `pktgate_mempool_in_use < 0.7 * mempool_size` — запас под burst'ы
+- [ ] mempool fill (через `dpdk-telemetry.py /mempool/info,pktgate_mbuf_pool`; gauge в `/metrics` — Phase 2)
 
 Если один из пунктов красный — смотреть `docs/troubleshooting.md`.

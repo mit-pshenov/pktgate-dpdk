@@ -93,7 +93,7 @@ journalctl -u pktgate -f -o cat | jq .
 ### PKTGATE_DPDK_DRIVER_DIR
 
 Если DPDK установлен из двух источников (source build + дистрибутивный
-пакет одновременно) — в EAL upraвляется через env var:
+пакет одновременно) — в EAL управляется через env var:
 
 ```ini
 Environment=PKTGATE_DPDK_DRIVER_DIR=/opt/dpdk-25.11/build/drivers

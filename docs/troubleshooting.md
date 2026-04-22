@@ -365,15 +365,17 @@ journalctl -u pktgate -o cat -n 30 | tail -20
 
 ### После SIGKILL не стартует заново: `Cannot init memory`
 
-**Причина.** Stale `/var/run/dpdk/<file-prefix>/` от убитого процесса — shared memory mapping'и не освобождены.
+**Причина.** Stale `/run/dpdk/<file-prefix>/` от убитого процесса — shared memory mapping'и не освобождены.
 
 **Fix.**
 
 ```bash
-sudo rm -rf /var/run/dpdk/pktgate/
-# Для dev VM могут быть и другие:
 sudo sh -c 'rm -rf /run/dpdk/pktgate*'
 ```
+
+На системах с отдельным `/var/run` (не symlink на `/run`) — то же под
+`/var/run/dpdk/`. На современной Fedora / Debian / Ubuntu `/var/run` —
+symlink, достаточно одной команды под `/run/dpdk/`.
 
 Затем `systemctl start pktgate`.
 

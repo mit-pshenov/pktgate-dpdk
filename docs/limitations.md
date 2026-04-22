@@ -178,8 +178,10 @@ SI conversion нужна `tsc_hz` (DPDK выставляет при init; мож
 восстанавливается как `cycles / tsc_hz`.
 
 TSC assumed constant и invariant — стандарт для производительных Intel
-CPUs последних 10 лет. На виртуализированных VM'ках (особенно без
-hw-assisted TSC) показания могут плавать; dev VM — именно такой случай.
+CPUs последних 10 лет. На bare-metal Xeon (таргет production-deploy'ев)
+показания стабильны. На виртуализированных VM'ках (особенно без
+hw-assisted TSC) показания могут плавать; dev VM проекта — именно такой
+случай.
 
 ### mbuf pool sizing
 
@@ -193,6 +195,12 @@ Override через env:
 ```bash
 PKTGATE_TEST_MBUF_POOL_SIZE=32767 systemctl start pktgate
 ```
+
+**Замечание.** Имя переменной исторически несёт префикс `TEST_` (введена
+под test harness в M16 C4, `src/main.cpp:419`), но в коде нет проверки на
+test/prod mode — переменная читается одинаково в любом контексте. На
+production ставить можно; переименовать без breaking CI-тестов нельзя,
+поэтому имя зафиксировано. Если в unit'е — через `Environment=` в `[Service]`.
 
 ## Known bugs / quirks
 

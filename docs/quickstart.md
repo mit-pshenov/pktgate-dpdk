@@ -61,7 +61,7 @@ drop`. Две TAP vdev в роли upstream/downstream — `dpdk-devbind.py` н�
 ## Запуск
 
 ```bash
-sudo /usr/local/bin/pktgate_dpdk \
+sudo build/dev-release/pktgate_dpdk \
     --config /etc/pktgate/config.json \
     -l 0,1 \
     -n 4 \
@@ -69,6 +69,9 @@ sudo /usr/local/bin/pktgate_dpdk \
     --vdev=net_tap1,iface=dtap_qs_down \
     --file-prefix=pktgate_qs
 ```
+
+(Путь `/usr/local/bin/pktgate_dpdk` — для установленного бинаря;
+install-шаги и systemd-layout — в `docs/operations.md`.)
 
 `pktgate_dpdk` забирает свои флаги (`--config`, опционально
 `--workers <N>`, `--mbuf-size <bytes>`, `--ctl-sock <path>`,
@@ -132,3 +135,6 @@ sudo pkill -TERM pktgate
 SIGTERM → graceful drain → exit. TAP-интерфейсы исчезают вместе с
 процессом; vhost UDS чистится автоматически (`vhost_socket_cleaned`
 event на stdout перед exit'ом).
+
+Hot reload (inotify / UDS / DPDK telemetry), systemd unit, `--ctl-sock`
+аргумент — out of scope для quickstart'а; см. `docs/operations.md`.
