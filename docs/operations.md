@@ -182,13 +182,12 @@ echo "reload $(cat /etc/pktgate/config.json | tr -d '\n')" | \
 # Reply: "ok <generation>\n" или "err <kind>:<msg>\n"
 ```
 
-**Важное предупреждение по security.** В shipped build'е (Phase 1
-closed, M11 scope-trimmed) cmd_socket **не проверяет SO_PEERCRED** —
-`allow_gids` парсится и валидируется, но **не enforcing'ится** в
-runtime. Authentication держится на filesystem permissions UDS-путя:
-`RuntimeDirectoryMode=0750` + owner/group root даёт root-only доступ.
-Post-phase1 debt item — дописать peercred enforcement (см.
-`docs/limitations.md`).
+**Важное предупреждение по security.** В Phase 1 shipped build'е
+cmd_socket **не проверяет SO_PEERCRED** — `allow_gids` парсится и
+валидируется, но **не enforcing'ится** в runtime. Authentication
+держится на filesystem permissions UDS-путя: `RuntimeDirectoryMode=0750`
++ owner/group root даёт root-only доступ. Post-phase1 debt item —
+дописать peercred enforcement (см. `docs/limitations.md`).
 
 **3. DPDK telemetry** (встроен, всегда включён):
 
@@ -350,9 +349,9 @@ Runtime events:
 - `cmd_socket_reload_ok` / `cmd_socket_reload_failed` (в future build'ах)
 
 Watchdog-стиль runtime events (`worker_stall_detected`, `mirror_slow_consumer`)
-относятся к M12 watchdog/HA и в Phase 1 build'е **не** эмиттятся (M12
-deferred; back-pressure mirror'а виден через `pktgate_mirror_dropped_total`,
-см. `docs/observability.md`).
+относятся к watchdog/HA-функциональности и в Phase 1 build'е **не**
+эмиттятся (watchdog/HA deferred; back-pressure mirror'а виден через
+`pktgate_mirror_dropped_total`, см. `docs/observability.md`).
 
 Shutdown events:
 
@@ -417,5 +416,5 @@ Ruleset config не меняется при upgrade бинаря. Если ко�
 новый бинарь подхватил свежий config без midway-inconsistency'и.
 
 Downtime per host: ~5-15s с учётом EAL re-init. Для HA — нужен второй
-хост в bypass / load-balancer pair (M12 watchdog / HA deferred
-post-MVP, см. `docs/limitations.md`).
+хост в bypass / load-balancer pair (watchdog / HA deferred post-MVP,
+см. `docs/limitations.md`).

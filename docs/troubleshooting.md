@@ -256,7 +256,7 @@ curl -s http://127.0.0.1:9090/metrics | grep -E 'tx_(dropped|burst_short)'
 
 ### `mirror_dropped_total` растёт
 
-**Причина.** Mirror slow consumer — pktgate M16 back-pressure threshold (1k accumulated ticks) сработал, дропаем **клоны** (оригинал форвардится всегда).
+**Причина.** Mirror slow consumer — pktgate mirror back-pressure threshold (1k accumulated ticks) сработал, дропаем **клоны** (оригинал форвардится всегда).
 
 **Fix.** Это design intent — origin traffic защищён. Если хотите все копии — поднимите mirror peer'у capacity. Если mirror для компliance (и mustn't be lossy) — pre-filter на L4 чтобы mirror'ить только узкую часть трафика.
 
@@ -346,7 +346,7 @@ dpdk-telemetry.py --file-prefix pktgate   # в REPL: /eal/lcore_list
 ```
 
 **Fix.**
-- Hang'нутый worker — рестарт процесса (нет in-build watchdog'а, M12 deferred).
+- Hang'нутый worker — рестарт процесса (нет in-build watchdog'а, watchdog/HA deferred — см. `docs/limitations.md`).
 - Systematic timeout'ы — проверить CPU pinning (может scheduler перебрасывает worker'а), `isolcpus` в grub.
 
 ---
