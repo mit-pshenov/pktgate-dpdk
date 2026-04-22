@@ -128,9 +128,12 @@ sudo hping3 -S -p 443 -c 1 10.99.0.99 -I dtap_qs_up
 ## Остановить
 
 ```bash
-sudo pkill -TERM pktgate
+sudo pkill -TERM -x pktgate_dpdk
 # Или: systemctl stop pktgate.service (если унит установлен — см. operations.md)
 ```
+
+(`-x` — exact match по имени процесса, чтобы substring'ом случайно не
+зацепить сторонний `pktgate*` script рядом.)
 
 SIGTERM → graceful drain → exit. TAP-интерфейсы исчезают вместе с
 процессом; vhost UDS чистится автоматически (`vhost_socket_cleaned`

@@ -85,7 +85,9 @@ journalctl -u pktgate -f -o cat | jq .
   вместо пробы всех PCI устройств — быстрее boot, меньше шанс
   подцепить чужую NIC.
 - **`--file-prefix`**: обязателен если на хосте крутится несколько
-  DPDK процессов, иначе конфликт на `/var/run/dpdk/<prefix>/`.
+  DPDK процессов, иначе конфликт на `/run/dpdk/<prefix>/` (на
+  современных Fedora / Debian / Ubuntu `/var/run` — symlink на `/run`,
+  так что оба пути равнозначны; ниже везде используется `/run/dpdk/`).
 - **Не скипайте `After=network-online.target`** — vhost vdev'у иногда
   нужен готовый networking namespace, а PCI NIC'ам — все DHCP/link
   settlements.
@@ -190,7 +192,7 @@ Post-phase1 debt item — дописать peercred enforcement (см.
 
 **3. DPDK telemetry** (встроен, всегда включён):
 
-DPDK exposes Unix socket `/var/run/dpdk/<file-prefix>/dpdk_telemetry.v2`;
+DPDK exposes Unix socket `/run/dpdk/<file-prefix>/dpdk_telemetry.v2`;
 pktgate регистрирует команду `/pktgate/reload` с JSON payload.
 
 ```bash
@@ -311,8 +313,9 @@ systemd-supervised long-running daemon. Подробнее — `docs/limitations
 
 - `systemctl stop pktgate` → SIGTERM → graceful (~500ms-2s).
 - `systemctl kill -s KILL pktgate` → SIGKILL → **mbuf leak** в shmfs.
-  Next start подхватит stale `/var/run/dpdk/<prefix>/` и откажется
-  init'ить. Чистить: `sudo rm -rf /var/run/dpdk/<prefix>/`.
+  Next start подхватит stale `/run/dpdk/<prefix>/` и откажется
+  init'ить. Чистить: `sudo rm -rf /run/dpdk/<prefix>/`
+  (см. `docs/troubleshooting.md`).
 - `TimeoutStopSec=30s` в unit'е — после тридцати секунд systemd сам
   сделает SIGKILL. Видели случаи где vhost teardown залипал дольше,
   если peer не отвечает; при vhost-профиле stoptimeout можно опустить

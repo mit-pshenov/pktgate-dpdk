@@ -135,7 +135,7 @@ Pipeline — строго L2 → L3 → L4, без backward/same/skip. `next_lay
 | `ethertype` | int | `[0, 65535]` (0x0800 IPv4, 0x86DD IPv6, 0x8100 VLAN, 0x88A8 QinQ) | L2 |
 | `vlan_id` | int | `[0, 4095]` | L2 |
 | `pcp` | int | `[0, 7]` | L2 |
-| `next_layer` | enum | `"l2" \| "l3" \| "l4"` | L2/L3 |
+| `next_layer` | enum | `"l3" \| "l4"` (`"l2"` парсится, но validator всегда reject'ит — same/backward запрещено) | L2/L3 |
 | `dst_subnet` | string | ref в `objects.subnets` | L3 |
 | `proto` | int | `[0, 255]` (6=TCP, 17=UDP, 1=ICMP, 58=ICMPv6) | L3/L4 |
 | `dst_port` | int | `[0, 65535]` | L4 |
@@ -264,10 +264,11 @@ Per-lcore bucket означает ~10-20% aggregate rate error при skewed RSS
 ```
 
 Non-terminal mirror: пакет копируется на `target_port`, оригинал продолжает
-pipeline. В Phase 2 — deep-copy; refcnt zero-copy — post-MVP (см.
-`docs/limitations.md`). Back-pressure на slow consumer'е: после ~1k
-accumulated тиков на mirror TX ring дропается копия (не оригинал), бамп
-`pktgate_mirror_dropped_total`. См. `docs/observability.md`.
+pipeline. В текущем build'е — deep-copy (`rte_pktmbuf_copy`); refcnt
+zero-copy — post-MVP (см. `docs/limitations.md`). Back-pressure на slow
+consumer'е: после ~1k accumulated тиков на mirror TX ring дропается
+копия (не оригинал), бамп `pktgate_mirror_dropped_total`. См.
+`docs/observability.md`.
 
 ## default_behavior
 
@@ -413,8 +414,8 @@ Dangling reference → `kUnresolvedObject` на этапе валидатора.
 
 ## cmd_socket
 
-Настройки UDS control-socket (hot reload через signal + `allow_gids`
-SO_PEERCRED auth, D38).
+Настройки UDS control-socket (hot reload через `reload <json>\n` —
+см. `docs/operations.md` §UDS cmd_socket).
 
 ```json
 "cmd_socket": {
@@ -422,11 +423,18 @@ SO_PEERCRED auth, D38).
 }
 ```
 
-- `allow_gids` — массив integer GID'ов, которым разрешено писать reload-команды
-  в socket. Элемент `[0, 2^32-1]`, negative → `kOutOfRange`.
+- `allow_gids` — массив integer GID'ов, которым будет разрешено писать
+  reload-команды в socket после того, как runtime enforcement SO_PEERCRED
+  будет wired. Элемент `[0, 2^32-1]`, negative → `kOutOfRange`.
 - **Отсутствие ключа** (поле `null`) — означает «resolve at daemon init»;
-  M11 валидация defer'ит решение, парсер не вызывает `getgid()` / `getgrnam()`.
+  валидатор откладывает резолв до daemon init'а (парсер не вызывает
+  `getgid()` / `getgrnam()`).
 - Пустой массив `[]` — никто не может писать команды (только root или owner).
+
+**Security disclosure.** В Phase 1 build'е `allow_gids` **парсится и
+валидируется, но runtime enforcement не wired** — authentication
+держится на filesystem permissions UDS-пути (`RuntimeDirectoryMode=0750`
++ root:root owner). Подробнее — `docs/limitations.md` §SO_PEERCRED.
 
 Path UDS и прочие transport-params сейчас в CLI (`--ctl-sock`), а не в
 config. Подробнее про hot reload — `docs/operations.md`.

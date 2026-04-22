@@ -45,7 +45,7 @@ drop, репортуемый самим DPDK в `rte_eth_stats`. В stable state
 | `pktgate_port_tx_packets_total` | C | `port` | TX pps на NIC. Attention: RX − TX − drops должен сходиться; gap → silent loss. |
 | `pktgate_port_rx_bytes_total` | C | `port` | RX объём. |
 | `pktgate_port_tx_bytes_total` | C | `port` | TX объём. |
-| `pktgate_port_rx_dropped_total` | C | `port` | Dropped at NIC RX ring (mempool exhaustion, overrun). Attention: **любой** ненулевой рост — backpressure на dataplane. Проверять `mempool_in_use`, `lcore_cycles_per_burst`. |
+| `pktgate_port_rx_dropped_total` | C | `port` | Dropped at NIC RX ring (mempool exhaustion, overrun). Attention: **любой** ненулевой рост — backpressure на dataplane. В Phase 1 (mempool-gauge + cycles-histogram — exposed: no) диагностика через DPDK telemetry: `dpdk-telemetry.py /mempool/info,pktgate_mbuf_pool` + `/ethdev/stats,<port>`. |
 | `pktgate_port_tx_dropped_total` | C | `port` | PMD'ом отказано в TX (ring full при переднем процессе). Attention: sustained → peer consumer медленнее line rate. |
 | `pktgate_port_link_up` | G | `port` | `1` если link up, `0` иначе. Alert: `== 0` дольше 10s. |
 | `pktgate_tx_dropped_total` | C | `port` | pktgate's own wrapper зарегистрировал unsent пакет после `rte_eth_tx_burst`. D43 — тот же физический drop, что `port_tx_dropped`, но измерен до/после PMD hook'ов для cross-check. |
@@ -115,13 +115,23 @@ funnel'ятся сюда.
 
 ## SLO mapping (N1-N5 из input.md)
 
-| SLO | Target | Key metric |
+Phase 1 сейчас emit'ит N1, N3, N5 напрямую. N2 и N4 — частично (см.
+пояснения после таблицы).
+
+| SLO | Target | Phase 1 Key metric |
 |---|---|---|
-| N1 — throughput | 40 Gbps per site | `rate(port_rx_bytes[1m])` + `rate(port_tx_bytes[1m])` |
-| N2 — p99 latency | ≤500 µs overhead | `histogram_quantile(0.99, rate(lcore_cycles_per_burst_bucket[5m]))` × nanos-per-cycle |
-| N3 — packet loss | <0.01% | `rate(port_rx_dropped[5m]) / rate(port_rx_packets[5m])` |
-| N4 — reload latency | ≤500 ms | `histogram_quantile(0.99, rate(reload_latency_seconds_bucket[10m]))` |
+| N1 — throughput | 40 Gbps per site | `rate(pktgate_port_rx_bytes_total[1m])` + `rate(pktgate_port_tx_bytes_total[1m])` |
+| N2 — p99 latency | ≤500 µs overhead | **Phase 2**: `histogram_quantile(0.99, rate(pktgate_lcore_cycles_per_burst_bucket[5m])) / tsc_hz * 1e9`. В Phase 1 — bench-only (M10/M15), не live scrape. |
+| N3 — packet loss | <0.01% | `rate(pktgate_port_rx_dropped_total[5m]) / rate(pktgate_port_rx_packets_total[5m])` |
+| N4 — reload latency | ≤500 ms | `max_over_time(pktgate_reload_latency_seconds[10m]) < 0.5` (gauge на last-observed в Phase 1). Histogram-форма с `_bucket` — Phase 2 wiring. |
 | N5 — availability | 99.9% | `pktgate_port_link_up == 1` + `up{job="pktgate"}` |
+
+**Про N2 и N4 в Phase 1.** `lcore_cycles_per_burst` объявлена как
+Histogram в manifest'е, но emit-path в `/metrics` ещё не wired;
+latency-бюджет валидируется через bench-артефакты M10/M15, а не через
+live scrape. `reload_latency_seconds` эмиттится как gauge (значение
+последнего успешного reload'а) — для alert'а достаточно сравнения
+`> 0.5`, percentile-формула не применима до Phase 2.
 
 ## Recommended alerts
 
@@ -278,7 +288,8 @@ pktgate_active_generation 42
 
 Histogram'ы пишут `_bucket{le="..."}`, `_count`, `_sum` по стандарту.
 TSC-based bucket'ы для `lcore_cycles_per_burst` — bounds в cycles, не
-в секундах (умножать на nanos/cycle для SI).
+в секундах (умножать на nanos/cycle для SI). Относится к Phase 2
+wiring'у — в Phase 1 build'е histogram не эмиттится (exposed: no).
 
 ## Checklist после новой инсталляции
 

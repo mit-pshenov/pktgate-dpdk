@@ -216,19 +216,24 @@ curl -s http://127.0.0.1:9090/metrics | grep pktgate_rule_packets_total
 
 **Причина.** Mempool exhausted, или RX ring переполняется (lcore не справляется).
 
-**Диагностика.**
+**Диагностика.** В Phase 1 mempool-gauge и lcore-cycles histogram
+помечены exposed: no в `docs/observability.md`; смотреть их через DPDK
+telemetry:
 
 ```bash
-curl -s http://127.0.0.1:9090/metrics | grep -E 'mempool_(in_use|free)|cycles_per_burst'
+dpdk-telemetry.py --file-prefix pktgate
+# В REPL:
+/mempool/info,pktgate_mbuf_pool     # mempool fill (count, available)
+/ethdev/stats,0                     # per-port rx/tx stats (drops)
 ```
 
 **Fix.**
 
 | Симптом | Мера |
 |---|---|
-| `mempool_in_use` растёт к пределу | Увеличить `PKTGATE_TEST_MBUF_POOL_SIZE` env или default size в коде |
-| `cycles_per_burst p99 > 500µs` | Worker overloaded — больше lcore'ов через `--workers N` |
-| Idle ratio низкий, cycles low | RX ring config underprovisioned, нужен DPDK tuning |
+| Mempool `available` стремится к нулю в `/mempool/info` | Увеличить `PKTGATE_TEST_MBUF_POOL_SIZE` env или default size в коде |
+| `/ethdev/stats` `q_errors` растёт | Worker overloaded — больше lcore'ов через `--workers N`, проверить CPU pinning |
+| RX pps высокий, CPU idle | RX ring config underprovisioned, нужен DPDK tuning (nb_rxd/queues) |
 
 ---
 
@@ -331,9 +336,13 @@ worker lcore застрял или PMD hang'ается.
 # pending_free_depth > 0 sustained → старые ruleset'ы копятся:
 curl -s http://127.0.0.1:9090/metrics | grep reload_pending_free_depth
 
-# Worker живой?
-curl -s http://127.0.0.1:9090/metrics | grep pktgate_lcore_packets_total
-# Если какой-то lcore застыл (counter не растёт) → он виновник
+# Worker живой? pktgate_lcore_packets_total в Phase 1 exposed: no —
+# прокси через per-rule counter (выбираем rule, по которому точно
+# идёт трафик) плюс DPDK eal lcore list:
+curl -s http://127.0.0.1:9090/metrics | grep 'pktgate_rule_packets_total'
+dpdk-telemetry.py --file-prefix pktgate   # в REPL: /eal/lcore_list
+# Если по rule, на который точно льётся трафик, counter не растёт —
+# один из worker'ов застыл.
 ```
 
 **Fix.**
