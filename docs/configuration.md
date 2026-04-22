@@ -264,8 +264,9 @@ ring дропается копия (не оригинал), бамп `pktgate_mi
 ```
 
 Terminal verdict для пакетов, прошедших **все** слои pipeline без матча.
-`allow` — passthrough на downstream; `drop` — mbuf free + бамп
-`pktgate_default_behavior_drop_total`.
+`allow` — passthrough на downstream; `drop` — mbuf free. В обоих случаях
+бампится `pktgate_default_action_total{action="allow"}` или
+`pktgate_default_action_total{action="drop"}` соответственно.
 
 В проде — практически всегда `drop` (zero-trust pre-filter перед DPI).
 

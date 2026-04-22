@@ -60,9 +60,11 @@ dev-окружении (PCI NIC проекту недоступна):
 Что не работает:
 - Автоматический restart hang'нутого worker lcore'а.
 - Kernel-route bypass если pktgate поломался (`pktgate_bypass_active`
-  gauge присутствует как placeholder).
-- Active-standby failover между двумя pktgate инстансами (`--standby`
-  flag есть в CLI-spec но no-op).
+  имя зарезервировано в counter manifest, но не wired в /metrics endpoint).
+- Active-standby failover между двумя pktgate инстансами. В design.md
+  (D5 anti-patterns раздел) закреплены constraints для будущей HA; в
+  Phase 1 scope это не отгружалось, CLI-flag'а `--standby` в argv parser
+  нет.
 
 **Workaround до v2:** systemd `Restart=on-failure` + external
 health-checker (Prometheus alert → PagerDuty). Downtime при полном
@@ -200,29 +202,21 @@ PKTGATE_TEST_MBUF_POOL_SIZE=32767 systemctl start pktgate
 pthread на `rte_eal_cleanup()`, что приводит к SEGV in cleanup path.
 Pktgate обходит conditional bypass'ом — cleanup **пропускается** когда в
 pipeline'е есть vhost role. Kernel освобождает resources за процессом
-корректно, это не memory leak в OS terms. Подробности — CLAUDE.md
-memory `grabli_dpdk_vhost_fdset_teardown_race.md`.
-
-### F7 inotify settle-window flake
-
-Под нагруженным test matrix'ом close-after-write события иногда
-миссятся — тест F7.3 flaky (~5% failure rate). Isolated rerun всегда
-GREEN, production hot reload не затронут. Post-phase1 debt —
-polling-settle harden (см. `grabli_f7_inotify_settle_flake.md`).
+корректно, это не memory leak в OS terms.
 
 ### IFNAMSIZ silent truncation на net_tap
 
 Имена TAP интерфейсов > 15 байт silent truncated Linux kernel'ом,
 net_tap vdev после этого теряется из DPDK port list'а → "insufficient
-ports" на boot'е. Budget iface name ≤ 13 chars с запасом на суффикс.
-Детали — `grabli_ifnamsiz_16_limit.md`.
+ports" на boot'е. Budget iface name ≤ 13 chars с запасом на суффикс
+(DPDK добавляет префикс типа `_qinq`/`_ingress` при multi-queue setup'е).
 
 ## Что делать если hit'нули limitation
 
 1. **Проверить, что это именно limitation, а не bug.** Читать
    `docs/troubleshooting.md` — там 90% симптомов на известные корнеры.
-2. **Grep CLAUDE.md memory** — `/home/user/.claude/projects/-home-user-pktgate-dpdk/memory/`.
-   Там 60+ известных grabli с workaround'ами.
+2. **Проверить `implementation-plan-errata.md`** — closures и workaround'ы
+   по закрытым debt item'ам живут там, с привязкой к commit'ам.
 3. **Для prod-grade deployment'ов** — provide feedback через PR /
    issue'сы с конкретным use case'ом. Архитектурный growth есть (D4
    rte_flow, D7 mirror zero-copy, M12 HA) — в roadmap'е, вопрос

@@ -1,8 +1,18 @@
 # Observability
 
-Prometheus `/metrics` reference. 41 счётчика, сгруппированы по семействам
-(rule / port / lcore / dispatch / reload / system / watchdog). Источник
-истины — `src/telemetry/counter_names.h` (константы `kAllCounterNames`).
+Prometheus `/metrics` reference. Counter manifest (41 имени, source of
+truth — `src/telemetry/counter_names.h` константа `kAllCounterNames`)
+сгруппирован по семействам (rule / port / lcore / dispatch / reload /
+system / watchdog).
+
+**Manifest vs exposed.** `kAllCounterNames` — это D33-invariant set:
+каждый name там имеет row в design.md §10.3 и закреплён D33-гейтом на
+consistency. Но **не все 41 имени wired в /metrics endpoint** в Phase 1
+build'е — под ~9 именами зарезервированы slot'ы в manifest'е, но
+producer site в `main.cpp` BodyFn ещё не добавлен (или вообще не будет
+— watchdog/bypass относятся к M12, который deferred). Таблицы ниже
+помечают такие row'ы как **exposed: no** — оператор не увидит их в
+scrape'е.
 
 Metric type column: **C** = Counter (monotonic), **G** = Gauge
 (instantaneous), **H** = Histogram.
@@ -44,9 +54,9 @@ Per-lcore counter'ы, labeled `lcore`. Каждый worker держит свою
 
 | Name | Type | Labels | Семантика / триггер внимания |
 |---|---|---|---|
-| `pktgate_lcore_packets_total` | C | `lcore` | Пакетов обработано этим worker'ом. Sanity: sum по всем lcore ≈ sum(`port_rx_packets`). |
-| `pktgate_lcore_cycles_per_burst` | H | `lcore` | TSC cycles / burst. SLO-критический. Buckets рассчитаны чтобы p99 < 500µs (N2 требование). Attention: p99 > 500µs → latency overhead outside budget. |
-| `pktgate_lcore_idle_iters_total` | C | `lcore` | Итераций RX loop'а с `rx_burst=0`. Высокий idle ratio = lightly loaded lcore; низкий → close to saturation. |
+| `pktgate_lcore_packets_total` | C | `lcore` | **exposed: no** — в manifest, producer site в Phase 1 не wired. |
+| `pktgate_lcore_cycles_per_burst` | H | `lcore` | **exposed: no** — в manifest как histogram, но emit path в Phase 1 не wired. SLO-критический (N2 ≤500 µs p99) — пока backport не сделан, latency бюджет валидируется только по M10/M15 bench'ам, не live-scrape. |
+| `pktgate_lcore_idle_iters_total` | C | `lcore` | **exposed: no** — в manifest, producer site в Phase 1 не wired. |
 | `pktgate_lcore_l4_skipped_ipv6_extheader_total` | C | `lcore` | IPv6 пакет с extension header → L4 matcher пропустил (D20 first-protocol-only). Attention: неожиданный growth → трафик использует ESP/AH/HbH, нужно расширять ext-header scope. |
 | `pktgate_lcore_l4_skipped_ipv6_fragment_nonfirst_total` | C | `lcore` | Non-first IPv6 fragment с `fragment_policy=l3_only` — L4 match пропущен. См. `docs/configuration.md` §fragment_policy. |
 | `pktgate_lcore_tag_pcp_noop_untagged_total` | C | `lcore` | Action `tag` с заданным `pcp` применился к пакету без VLAN тега → no-op (некуда писать). Не ошибка, но сигнал что rule таргетит не ту трафик. |
@@ -74,27 +84,30 @@ funnel'ятся сюда.
 | Name | Type | Labels | Семантика / триггер внимания |
 |---|---|---|---|
 | `pktgate_reload_total` | C | `result=success \| parse_error \| validate_error \| compile_error \| build_eal_error \| timeout \| internal_error` | Успех / тип ошибки reload'а. Alert: `result="parse_error"` growing → ops pushed bad config. |
-| `pktgate_reload_latency_seconds` | H | — | Время от deploy() до publish (включая QSBR synchronize). p99 norm <100ms. Attention: >1s → QSBR timeout, worker stuck. |
+| `pktgate_reload_latency_seconds` | G | — | Latency последнего reload'а (от deploy() до publish, включая QSBR synchronize), в секундах. Manifest type — Histogram, но в Phase 1 wired как gauge on last-observed value. Norm <100 ms. Attention: >1 s → QSBR timeout, worker stuck. |
 | `pktgate_reload_pending_free_depth` | G | — | Количество отложенных освобождений (timeout path). Norm = 0. Sustained >0 → worker died mid-reload или live-lock. |
 | `pktgate_active_generation` | G | — | Generation живого ruleset'а (monotonic increment on successful reload). Exposition — для debugging. |
 | `pktgate_active_rules` | G | `layer` | Количество rules в каждом слое текущего generation'а. |
-| `pktgate_cmd_socket_rejected_total` | C | `reason` | cmd_socket запрос отклонён (bad verb, auth fail в future peercred build). |
+| `pktgate_cmd_socket_rejected_total` | C | `reason` | **exposed: no** — в manifest, producer site в Phase 1 не wired (cmd_socket SO_PEERCRED enforcement тоже deferred, см. `docs/limitations.md`). |
 | `pktgate_publisher_generation` | G | — | Последняя generation которую publisher thread **видел**. Invariant: `publisher_generation == active_generation` после QSBR settle. Growing gap → publisher stuck. |
 
 ## Системные gauge'и (2)
 
 | Name | Type | Labels | Семантика / триггер внимания |
 |---|---|---|---|
-| `pktgate_mempool_in_use` | G | — | mbuf'ов выдано NIC RX ring'ам. Attention: растёт к capacity → underprovisioned mempool, `rx_dropped` скоро начнёт бампаться. |
-| `pktgate_mempool_free` | G | — | Free mbuf'ы. Invariant: `in_use + free ≈ mempool_size`. |
+| `pktgate_mempool_in_use` | G | — | **exposed: no** — в manifest, producer site в Phase 1 не wired. Для оперативного мониторинга mempool'а использовать DPDK telemetry: `dpdk-telemetry.py /mempool/info,pktgate_mbuf_pool`. |
+| `pktgate_mempool_free` | G | — | **exposed: no** — см. выше, тот же fallback через DPDK telemetry. |
 
 ## Watchdog / bypass / log (3)
 
-| Name | Type | Labels | Семантика / триггер внимания |
+Все три row'а зарезервированы в manifest'е для Phase 2+ и **в /metrics
+не emit'ятся** в Phase 1 build'е.
+
+| Name | Type | Labels | Семантика (когда будет wired) |
 |---|---|---|---|
-| `pktgate_watchdog_restarts_total` | C | — | Count рестартов worker thread'а watchdog'ом (**M12 deferred** — в Phase 1 build присутствует как zero placeholder). |
-| `pktgate_bypass_active` | G | — | `1` если pktgate в bypass mode (kernel-route через ВТ host). **M12 deferred**. |
-| `pktgate_log_dropped_total` | C | — | JSON events dropped в ring-buffer fallback (если stdout writer залипнет). Baseline zero. |
+| `pktgate_watchdog_restarts_total` | C | — | **exposed: no** — M12 deferred. Count рестартов worker thread'а watchdog'ом. |
+| `pktgate_bypass_active` | G | — | **exposed: no** — M12 deferred. `1` если pktgate в bypass mode (kernel-route в обход DPDK). |
+| `pktgate_log_dropped_total` | C | — | **exposed: no** — JSON-лог ring-buffer fallback ещё не wired. |
 
 ## SLO mapping (N1-N5 из input.md)
 

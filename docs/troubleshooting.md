@@ -174,7 +174,12 @@ ls -la /run/pktgate/vhost.sock
 ```
 
 **Fix**.
-- TAP: `sudo ip link set dtap0 up` на хосте; возможно NetworkManager перехватил — см. `grabli_nm_unmanaged_tap.md` в памяти для session-scoped unmanaged keyfile.
+- TAP: `sudo ip link set dtap0 up` на хосте; если NetworkManager пытается DHCP'ить TAP — пометить имя как unmanaged через keyfile в `/etc/NetworkManager/conf.d/`:
+  ```
+  [keyfile]
+  unmanaged-devices=interface-name:dtap*
+  ```
+  + `sudo systemctl reload NetworkManager`.
 - vhost: проверить что peer стартанул и коннект к socket'у (testpmd / QEMU логи).
 - PCI: link up? cable? SFP?
 
