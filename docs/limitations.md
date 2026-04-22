@@ -204,13 +204,15 @@ production ставить можно; переименовать без breaking
 
 ## Known bugs / quirks
 
-### `eal_cleanup_skipped` при shutdown с vhost role
+### `rte_eal_cleanup()` skip при shutdown с vhost role
 
 **Известная DPDK 25.11 issue.** `net_vhost` не join'ит fdset_event_dispatch
 pthread на `rte_eal_cleanup()`, что приводит к SEGV in cleanup path.
 Pktgate обходит conditional bypass'ом — cleanup **пропускается** когда в
 pipeline'е есть vhost role. Kernel освобождает resources за процессом
-корректно, это не memory leak в OS terms.
+корректно, это не memory leak в OS terms. Отдельного event'а про skip
+не эмиттится: `{"event":"eal_cleanup"}` пишется в обоих режимах (см.
+`docs/operations.md` §Vhost caveat).
 
 ### IFNAMSIZ silent truncation на net_tap
 

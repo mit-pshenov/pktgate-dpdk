@@ -355,7 +355,7 @@ curl -s http://127.0.0.1:9090/metrics | grep pktgate_lcore_packets_total
 journalctl -u pktgate -o cat -n 30 | tail -20
 ```
 
-Если виден `workers_exit` но не `eal_cleanup` → vhost teardown race, норма (см. `eal_cleanup_skipped` event).
+`{"event":"eal_cleanup"}` эмиттится всегда — даже при vhost-профиле, когда сам `rte_eal_cleanup()` пропускается (см. `docs/operations.md` §Vhost caveat). Если виден `workers_exit` но не `eal_cleanup` — worker lcore застрял в cleanup path ещё до eal-стадии.
 
 Если `workers_exit` **не** появляется — worker lcore застрял на PMD. Поднимаем `strace -p <pid>` на worker thread'ах.
 

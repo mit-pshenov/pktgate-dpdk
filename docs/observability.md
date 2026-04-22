@@ -28,7 +28,7 @@ publisher tick (zero atomics, D1-clean).
 | `pktgate_rule_packets_total` | C | `rule_id` | Пакет смэтчился на rule и applied action. Baseline counter — строят flame chart на rule_id. |
 | `pktgate_rule_bytes_total` | C | `rule_id` | Суммарный объём в байтах. Attention: резкий perf shift между packets/bytes ratio → сигнатура traffic drift'а. |
 | `pktgate_rule_drops_total` | C | `rule_id` | Drop по action этого rule'а (action=drop или rate-limit дропнул через cap). Attention: skyrocket → DDoS или rate-limit'а не хватает. |
-| `pktgate_default_action_total` | C | — | Пакет не смэтчил ни одного rule во всех слоях → applied `default_behavior`. Attention: если `default_behavior=drop` и counter растёт быстрее baseline — дыра в rulesets. |
+| `pktgate_default_action_total` | C | `action="allow" \| "drop"` | Пакет не смэтчил ни одного rule во всех слоях → applied `default_behavior`; label отражает реальный verdict. Attention: если `default_behavior=drop` и `action="drop"` растёт быстрее baseline — дыра в rulesets. |
 
 ## Семейство port (9)
 

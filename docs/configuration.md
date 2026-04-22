@@ -292,11 +292,19 @@ Terminal verdict для пакетов, прошедших **все** слои p
 extension header, non-first). L4 header у non-first фрагмента отсутствует,
 так что L4 matching невозможен — что с ним делать:
 
-| Значение | Семантика | Когда |
+| Значение | Семантика для non-first фрагмента | Когда |
 |---|---|---|
-| `l3_only` (default) | Матчится только до L3 включительно; L4 rules пропускаются, дальше default_behavior | По умолчанию — консервативно, не дропает |
-| `drop` | Все non-first fragments → drop, бамп `pkt_frag_dropped_total` | Paranoid mode |
-| `allow` | Non-first fragments проходят default path без L4 matching | Lenient, только если uplink doверен |
+| `l3_only` (default) | **Skip L4 only.** L3 matching работает (`dst_subnet` whitelist применим); выставляется `SKIP_L4` flag на dynfield; pure-L3 rule всё ещё может terminate. | По умолчанию — консервативно, но позволяет L3-whitelist'у работать. |
+| `drop` | Terminal drop на L3-стадии, бамп `pktgate_lcore_pkt_frag_dropped_total`. | Paranoid mode: untrusted uplink, любой fragmented UDP payload подозрителен. |
+| `allow` | **Skip L2+L3+L4 целиком** → `kTerminalPass` на L3-стадии → применяется `default_behavior`. L3 matching **не** происходит. | Только когда реально нужно пропустить fragmented payload независимо от адресации. |
+
+**Важно про `allow`.** Несмотря на имя, `allow` **не** мягче `l3_only`:
+при `default_behavior: drop` pktgate дропнет non-first fragment ровно так
+же, как `drop`-полиси (разница только в counter: `pkt_frag_*` не
+бампнутся, будет только `pktgate_default_action_total{action="drop"}`).
+Fragment пройдёт насквозь только при `default_behavior: allow` — и тогда
+**любой** non-first fragment пройдёт, даже если его L3-адрес не в
+whitelist'е. Для whitelist'а фрагментов по подсети используйте `l3_only`.
 
 **First-fragment** (non-first = 0) полностью матчится, включая L4 — TCP/UDP
 header в первом фрагменте присутствует.
@@ -348,8 +356,14 @@ kind для operator-facing diagnostics).
 `prom_port` — optional, не часть 10 required-полей. `0` → OS-assigned
 ephemeral port (функциональные тесты используют чтобы избегать collision).
 
-Валидатор делает pre-flight memory-budget check (D37): суммарный расход
-hashes + FIB + rl_arena < process RSS limit, иначе `kSizingMemoryBudget`.
+Валидатор делает pre-flight memory-budget check (D37) в три шага:
+
+- `kBudgetPerRuleExceeded` — одно правило expand'ится во > ceiling
+  entries (prevention: upstream rule explosion на wildcards).
+- `kBudgetAggregateExceeded` — суммарная expansion > sizing cap
+  соответствующего pool'а.
+- `kBudgetHugepage` — оценочный RSS hashes + FIB + rl_arena
+  превышает доступные hugepages.
 
 ## objects.subnets
 
@@ -566,12 +580,16 @@ EAL init:
 | `kAmbiguousAction` | Action type discriminator отсутствует или в action есть не-whitelisted поле для данного type |
 | `kSizingBelowMin` | `rules_per_layer_max < 16` |
 | `kDuplicateRuleId` | Два rules с одним `id` в scope pipeline (валидатор) |
+| `kKeyCollision` | Два L2-правила с идентичным compound key (D15) — валидатор |
 | `kUnresolvedInterfaceRef` | `rule.interface` не нашлось в `interface_roles` (валидатор) |
 | `kUnresolvedObject` | `rule.dst_subnet` не нашлось в `objects.subnets` (валидатор) |
 | `kUnresolvedTargetPort` | `action.target_port` не нашлось в `interface_roles` (валидатор) |
 | `kInvalidLayerTransition` | `next_layer` нарушает L2→L3→L4 monotonicity (валидатор) |
+| `kBudgetPerRuleExceeded` | Одно правило expand'ится в entries > per-rule ceiling (D37 pre-flight) |
+| `kBudgetAggregateExceeded` | Суммарный expansion превышает sizing cap соответствующего pool'а (D37) |
+| `kBudgetHugepage` | Оценочный RSS hashes + FIB + rl_arena > доступные hugepages (D37) |
 
 Валидация делится на **parser** (structural, single pass, без cross-ref) и
-**validator** (cross-ref resolution, L2→L3→L4 order, memory budget). Parser
-errors surface'ят конкретный ключ; validator errors — конкретное правило
-(`rule id=NNN`).
+**validator** (cross-ref resolution, L2→L3→L4 order, memory budget, key
+collision). Parser errors surface'ят конкретный ключ; validator errors —
+конкретное правило (`rule id=NNN`).

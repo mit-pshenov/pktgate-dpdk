@@ -194,8 +194,11 @@ DPDK exposes Unix socket `/var/run/dpdk/<file-prefix>/dpdk_telemetry.v2`;
 pktgate регистрирует команду `/pktgate/reload` с JSON payload.
 
 ```bash
-# DPDK ships dpdk-telemetry.py — хелпер для telemetry socket'а.
-# Payload — JSON config одной строкой:
+# DPDK ships dpdk-telemetry.py — REPL-хелпер для telemetry socket'а.
+# Стандартная invocation — интерактив; stdin-pipe работает, но синтаксис
+# зависит от версии (DPDK 25.11 принимает команду одной строкой).
+# Флаг, указывающий file-prefix, на некоторых сборках называется `-f`,
+# на других `--file-prefix` — проверять через `dpdk-telemetry.py -h`.
 echo '/pktgate/reload,{"version":1,...}' | \
     /usr/local/bin/dpdk-telemetry.py --file-prefix pktgate
 ```
@@ -293,11 +296,11 @@ Typical total time: <500ms на TAP, <2s на vhost-user с peer'ом.
 `fdset_event_dispatch` pthread не join'ится корректно из
 `rte_eal_cleanup()`, и процесс может упасть в SEGV. Pktgate
 обходит это conditional bypass'ом — когда в pipeline есть хоть один
-vhost role, **`rte_eal_cleanup()` пропускается**. Event на stdout:
-
-```json
-{"event":"eal_cleanup_skipped","reason":"vhost_role_present"}
-```
+vhost role, **`rte_eal_cleanup()` пропускается**. Отдельного маркерного
+события про skip нет: `{"event":"eal_cleanup"}` эмиттится в любом
+случае (cleanup был или пропущен). Различить два режима можно по
+pipeline-конфигу (наличие vhost role) или по `stats_on_exit`-snapshot'у
+перед cleanup'ом.
 
 Процесс всё равно exit'ится с кодом 0, resources GC'ятся OS'ом. Это не
 утечка памяти — kernel освобождает hugepages/mempool/sockets корректно,
@@ -312,8 +315,8 @@ systemd-supervised long-running daemon. Подробнее — `docs/limitations
   init'ить. Чистить: `sudo rm -rf /var/run/dpdk/<prefix>/`.
 - `TimeoutStopSec=30s` в unit'е — после тридцати секунд systemd сам
   сделает SIGKILL. Видели случаи где vhost teardown залипал дольше,
-  если peer не отвечает; если в логах `eal_cleanup_skipped` систематически,
-  stoptimeout можно опустить до 10s.
+  если peer не отвечает; при vhost-профиле stoptimeout можно опустить
+  до 10s, поскольку `rte_eal_cleanup()` всё равно пропускается.
 
 ## Log channel (stdout)
 
@@ -342,8 +345,11 @@ Runtime events:
 
 - `inotify_reload_ok` / `inotify_reload_failed`
 - `cmd_socket_reload_ok` / `cmd_socket_reload_failed` (в future build'ах)
-- `worker_stall_detected` (if worker не tick'ает N циклов)
-- `mirror_slow_consumer` (back-pressure триггер)
+
+Watchdog-стиль runtime events (`worker_stall_detected`, `mirror_slow_consumer`)
+относятся к M12 watchdog/HA и в Phase 1 build'е **не** эмиттятся (M12
+deferred; back-pressure mirror'а виден через `pktgate_mirror_dropped_total`,
+см. `docs/observability.md`).
 
 Shutdown events:
 
@@ -361,10 +367,11 @@ post-mortem без scrape'а `/metrics`.
 ## Capacity & sizing tuning
 
 `sizing` в config.json контролирует ёмкости pool'ов (см.
-`docs/configuration.md` §sizing). Если видите `kSizingMemoryBudget` на
-deploy — снижайте `rules_per_layer_max` / `l4_entries_max`, либо
-добавьте hugepages. Pre-flight budget check (D37) делается до publish'а,
-так что процесс не рухнёт in-flight.
+`docs/configuration.md` §sizing). Если видите `kBudgetPerRuleExceeded` /
+`kBudgetAggregateExceeded` / `kBudgetHugepage` на deploy — снижайте
+`rules_per_layer_max` / `l4_entries_max`, либо добавьте hugepages.
+Pre-flight budget check (D37) делается до publish'а, так что процесс
+не рухнёт in-flight.
 
 ### Hugepage recomputation
 
@@ -379,9 +386,20 @@ echo 2048 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 # /etc/default/grub: GRUB_CMDLINE_LINUX="... default_hugepagesz=1G hugepagesz=1G hugepages=4"
 ```
 
-Мониторить: `pktgate_mempool_inuse_count` (должен стремиться к stable
-plateau), `pktgate_reload_validate_budget_hugepage_total` (бамп =
-pre-flight reject'нул reload по памяти).
+Мониторить:
+
+- `rate(pktgate_port_rx_dropped_total[5m])` — если ненулевой под burst'ами
+  при текущем mbuf-pool sizing'е, надо либо расширять pool
+  (`PKTGATE_TEST_MBUF_POOL_SIZE`, см. `docs/limitations.md`), либо
+  добавлять hugepages.
+- `rate(pktgate_reload_total{result="validate_error"}[5m])` — поднимется,
+  если следующий reload попал на `kBudgetHugepage` / `kBudgetAggregateExceeded`.
+  Точный kind виден в `{"event":"inotify_reload_failed","kind":"validate_error","error":"..."}`
+  в journald.
+- Mempool fill-level — через DPDK telemetry
+  `dpdk-telemetry.py /mempool/info,pktgate_mbuf_pool` (Prometheus-метрика
+  `pktgate_mempool_in_use` объявлена в manifest'е, но emit в /metrics
+  относится к Phase 2 — см. `docs/observability.md`).
 
 ## Upgrade workflow
 
